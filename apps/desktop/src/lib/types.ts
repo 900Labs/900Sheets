@@ -31,3 +31,20 @@ export interface HistoryEntry {
   oldValue: string
   newValue: string
 }
+
+export interface CellFormat {
+  bold?: boolean
+  italic?: boolean
+  underline?: boolean
+  strikethrough?: boolean
+  font_size?: number
+  font_name?: string
+  font_color?: string
+  bg_color?: string
+  h_align?: 'left' | 'center' | 'right' | 'general'
+  v_align?: 'top' | 'middle' | 'bottom'
+  wrap_text?: boolean
+  number_format?: string
+}
+
+export type CellFormatMap = Record<string, CellFormat>
