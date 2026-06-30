@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "apps/desktop/src-tauri",
+    "crates/sheets-core",
+    "crates/sheets-formula",
+    "crates/sheets-xlsx",
+    "crates/sheets-csv",
+    "crates/sheets-json",
+    "crates/sheets-chart",
+    "crates/sheets-pivot",
+    "crates/sheets-validation",
+    "crates/sheets-i18n",
+    "crates/sheets-print",
+    "crates/sheets-advanced",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["900 Labs"]
+repository = "https://github.com/900Labs/900Sheets"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+chrono = { version = "0.4", features = ["serde"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

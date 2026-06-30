@@ -1,0 +1,13 @@
+[package]
+name = "sheets-advanced"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+sheets-core = { path = "../sheets-core" }
+sheets-formula = { path = "../sheets-formula" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
