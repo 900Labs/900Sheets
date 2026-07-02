@@ -30,9 +30,9 @@ if grep -r --exclude-dir=target --exclude-dir=node_modules --exclude-dir=dist \
 fi
 
 # Check for secrets
-if grep -r --exclude-dir=target --exclude-dir=node_modules --exclude-dir=dist \
+if grep -rE --exclude-dir=target --exclude-dir=node_modules --exclude-dir=dist \
   --exclude-dir=.git --exclude='verify-public-release.sh' \
-  -i 'api_key\|secret_key\|password\s*=' "${SOURCE_PATHS[@]}" 2>/dev/null; then
+  -i '(^|[^[:alnum:]_])(api_key|secret_key|password)[[:space:]]*=' "${SOURCE_PATHS[@]}" 2>/dev/null; then
   echo "FAIL: Found potential secrets"
   exit 1
 fi

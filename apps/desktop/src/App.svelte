@@ -33,14 +33,16 @@
   let currentFilePath: string | null = $state(null)
   let cellFormats: CellFormatMap = $state({})
   type MenuKey = 'file' | 'edit' | 'view' | 'insert' | 'format' | 'data' | 'tools' | 'help'
-  type PanelKey = 'functions' | 'find' | 'chart' | 'pivot' | 'validation' | 'conditional' | 'print' | 'protection' | 'comment' | 'goalSeek' | 'shortcuts' | 'about'
+  type PanelKey =
+    | 'functions' | 'find' | 'chart' | 'pivot' | 'validation' | 'conditional' | 'print' | 'protection'
+    | 'comment' | 'goalSeek' | 'filter' | 'namedRanges' | 'structure' | 'templates' | 'shortcuts' | 'about'
   type MenuAction =
-    | 'newWorkbook' | 'openXlsx' | 'importCsv' | 'importJson' | 'saveXlsx' | 'exportCsv' | 'exportJson' | 'exportPdf'
+    | 'newWorkbook' | 'templates' | 'openXlsx' | 'importCsv' | 'importJson' | 'saveXlsx' | 'exportCsv' | 'exportJson' | 'exportPdf'
     | 'undo' | 'redo' | 'cut' | 'copy' | 'paste' | 'delete' | 'findReplace'
-    | 'toggleFormulaBar' | 'toggleGridlines' | 'toggleCompact' | 'zoomIn' | 'zoomOut' | 'zoomReset'
-    | 'functions' | 'addSheet' | 'comment' | 'chart' | 'pivot'
+    | 'toggleFormulaBar' | 'toggleGridlines' | 'toggleCompact' | 'zoomIn' | 'zoomOut' | 'zoomReset' | 'freezePanes' | 'unfreezePanes'
+    | 'functions' | 'addSheet' | 'comment' | 'chart' | 'pivot' | 'structure' | 'insertRow' | 'deleteRow' | 'insertColumn' | 'deleteColumn'
     | 'bold' | 'italic' | 'underline' | 'strike' | 'alignLeft' | 'alignCenter' | 'alignRight' | 'wrapText' | 'fillYellow' | 'fillGreen' | 'fillRed' | 'textBlue' | 'textRed' | 'conditional'
-    | 'sortAsc' | 'sortDesc' | 'validation'
+    | 'sortAsc' | 'sortDesc' | 'filter' | 'clearFilter' | 'removeDuplicates' | 'namedRanges' | 'validation'
     | 'protection' | 'lockRange' | 'unlockRange' | 'goalSeek' | 'shortcuts' | 'about' | 'notReady'
 
   interface MenuItem {
@@ -95,6 +97,66 @@
     visible: boolean
   }
 
+  interface ValidationDefinition {
+    validation_type: string
+    operator: string
+    formula1: string | null
+    formula2: string | null
+    source: string | null
+    allow_blank: boolean
+    show_dropdown: boolean
+    error_style: string
+    error_title: string | null
+    error_message: string | null
+    prompt_title: string | null
+    prompt_message: string | null
+  }
+
+  interface StoredValidationRule {
+    id: string
+    label: string
+    range: CellRange
+    validation: ValidationDefinition
+  }
+
+  interface ConditionalRuleDefinition {
+    id: string
+    condition_type: string
+    range: [number, number, number, number]
+    operator: string | null
+    value1: string | null
+    value2: string | null
+    format: CellFormat
+    color_scale_stops: unknown[]
+    bar_color: string | null
+    show_bar_value: boolean
+    icon_set_type: string | null
+    is_top: boolean
+    rank: number
+    is_above_average: boolean
+    std_dev: number
+    priority: number
+    stop_if_true: boolean
+  }
+
+  interface StoredConditionalRule {
+    id: string
+    label: string
+    rule: ConditionalRuleDefinition
+  }
+
+  interface NamedRange {
+    id: string
+    name: string
+    range: CellRange
+  }
+
+  interface FunctionHelp {
+    syntax: string
+    description: string
+    example: string
+  }
+
   let openMenu: MenuKey | null = $state(null)
   let formulaMenuOpen: boolean = $state(false)
   let formulaMenuX: number = $state(0)
@@ -112,21 +174,42 @@
   let chartTitle: string = $state('Chart')
   let chartType: string = $state('Column')
   let chartSeriesName: string = $state('Series 1')
+  let chartColumns: ColumnInfo[] = $state([])
+  let chartXColumn: string = $state('')
+  let chartYColumn: string = $state('')
+  let chartLegendPosition: string = $state('Bottom')
   let chartSvg: string = $state('')
   let pivotAggregation: string = $state('Sum')
   let pivotColumns: ColumnInfo[] = $state([])
+  let pivotRowColumn: string = $state('')
+  let pivotColumnColumn: string = $state('')
+  let pivotValueColumn: string = $state('')
+  let pivotFilterColumn: string = $state('')
+  let pivotFilterValue: string = $state('')
+  let filterColumn: string = $state('')
+  let filterCondition: string = $state('Contains')
+  let filterValue: string = $state('')
+  let filterHasHeader: boolean = $state(true)
+  let hiddenRows: Record<number, boolean> = $state({})
+  let activeFilterLabel: string = $state('')
+  let namedRangeName: string = $state('')
+  let namedRanges: NamedRange[] = $state([])
+  let validationRuleName: string = $state('Rule 1')
   let validationType: string = $state('WholeNumber')
   let validationOperator: string = $state('Between')
   let validationFormula1: string = $state('0')
   let validationFormula2: string = $state('100')
   let validationSource: string = $state('')
   let validationResults: ValidationErrorData[] = $state([])
+  let validationRules: StoredValidationRule[] = $state([])
+  let conditionalRuleName: string = $state('Highlight rule')
   let conditionalType: string = $state('CellValue')
   let conditionalOperator: string = $state('GreaterThan')
   let conditionalValue1: string = $state('0')
   let conditionalValue2: string = $state('')
   let conditionalFill: string = $state('#fef3c7')
   let conditionalMatches: Array<[number, number]> = $state([])
+  let conditionalRules: StoredConditionalRule[] = $state([])
   let printPageSize: string = $state('Letter')
   let printOrientation: string = $state('Portrait')
   let printPageCount: number | null = $state(null)
@@ -139,6 +222,8 @@
   let goalSeekInputCell: string = $state('A2')
   let goalSeekTargetValue: string = $state('0')
   let goalSeekResult: GoalSeekResult | null = $state(null)
+  let frozenRowCount: number = $state(0)
+  let frozenColCount: number = $state(0)
   let dragScrollTimer: ReturnType<typeof setInterval> | null = null
   let dragScrollDir: 'down' | 'up' | 'left' | 'right' | null = null
   let gridContainerEl: HTMLElement | null = $state(null)
@@ -156,6 +241,63 @@
     Info: ['ISNUMBER', 'ISTEXT', 'ISLOGICAL', 'ISERROR', 'ISEMPTY', 'ISBLANK', 'ISNONTEXT', 'ISODD', 'ISEVEN', 'NA', 'TYPE'],
   }
 
+  const FUNCTION_HELP: Record<string, FunctionHelp> = {
+    SUM: { syntax: 'SUM(number1, [number2], ...)', description: 'Adds numbers or ranges.', example: '=SUM(B2:B12)' },
+    AVERAGE: { syntax: 'AVERAGE(number1, [number2], ...)', description: 'Returns the arithmetic mean.', example: '=AVERAGE(C2:C12)' },
+    COUNT: { syntax: 'COUNT(value1, [value2], ...)', description: 'Counts numeric values.', example: '=COUNT(D2:D100)' },
+    COUNTA: { syntax: 'COUNTA(value1, [value2], ...)', description: 'Counts non-empty values.', example: '=COUNTA(A2:A100)' },
+    IF: { syntax: 'IF(condition, value_if_true, value_if_false)', description: 'Returns one value when a condition is true and another when false.', example: '=IF(C2>0,"Open","Closed")' },
+    VLOOKUP: { syntax: 'VLOOKUP(search_key, range, index, [is_sorted])', description: 'Looks up a value in the first column of a range.', example: '=VLOOKUP(A2,Products!A:D,4,FALSE)' },
+    INDEX: { syntax: 'INDEX(range, row, [column])', description: 'Returns the value at a row and column inside a range.', example: '=INDEX(B2:D20,3,2)' },
+    MATCH: { syntax: 'MATCH(search_key, range, [search_type])', description: 'Returns a value position within a range.', example: '=MATCH("Rice",A2:A50,0)' },
+    TEXTJOIN: { syntax: 'TEXTJOIN(delimiter, ignore_empty, text1, ...)', description: 'Joins text values with a delimiter.', example: '=TEXTJOIN(", ",TRUE,A2:A5)' },
+    PMT: { syntax: 'PMT(rate, periods, present_value)', description: 'Calculates a loan payment.', example: '=PMT(8%/12,24,5000)' },
+    TODAY: { syntax: 'TODAY()', description: 'Returns the current date.', example: '=TODAY()' },
+    ROUND: { syntax: 'ROUND(value, places)', description: 'Rounds a number to a fixed number of decimal places.', example: '=ROUND(B2,2)' },
+  }
+
+  const TEMPLATES: Record<string, { title: string; rows: string[][] }> = {
+    budget: {
+      title: 'Household Budget',
+      rows: [
+        ['Category', 'Planned', 'Actual', 'Difference'],
+        ['Food', '250', '230', '=B2-C2'],
+        ['Transport', '80', '96', '=B3-C3'],
+        ['Utilities', '120', '118', '=B4-C4'],
+        ['Savings', '100', '75', '=B5-C5'],
+        ['Total', '=SUM(B2:B5)', '=SUM(C2:C5)', '=SUM(D2:D5)'],
+      ],
+    },
+    inventory: {
+      title: 'Inventory Tracker',
+      rows: [
+        ['Item', 'Category', 'In stock', 'Reorder level', 'Status'],
+        ['Rice 10kg', 'Food', '42', '20', '=IF(C2<D2,"Reorder","OK")'],
+        ['Soap', 'Household', '18', '24', '=IF(C3<D3,"Reorder","OK")'],
+        ['Exercise books', 'School', '67', '30', '=IF(C4<D4,"Reorder","OK")'],
+      ],
+    },
+    attendance: {
+      title: 'Attendance Register',
+      rows: [
+        ['Name', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Present Days'],
+        ['Student 1', '1', '1', '0', '1', '1', '=SUM(B2:F2)'],
+        ['Student 2', '1', '0', '1', '1', '0', '=SUM(B3:F3)'],
+        ['Student 3', '1', '1', '1', '1', '1', '=SUM(B4:F4)'],
+      ],
+    },
+    invoice: {
+      title: 'Simple Invoice',
+      rows: [
+        ['Description', 'Quantity', 'Unit Price', 'Line Total'],
+        ['Service', '1', '50', '=B2*C2'],
+        ['Materials', '3', '12', '=B3*C3'],
+        ['Delivery', '1', '8', '=B4*C4'],
+        ['', '', 'Total', '=SUM(D2:D4)'],
+      ],
+    },
+  }
+
   const MENU_DEFINITIONS: MenuDefinition[] = [
     {
       key: 'file',
@@ -163,6 +305,7 @@
       sections: [
         [
           { label: 'New Workbook', action: 'newWorkbook', shortcut: 'Ctrl+N' },
+          { label: 'New from Template...', action: 'templates' },
           { label: 'Open XLSX...', action: 'openXlsx', shortcut: 'Ctrl+O' },
         ],
         [
@@ -211,7 +354,8 @@
           { label: 'Reset Zoom', action: 'zoomReset' },
         ],
         [
-          { label: 'Freeze Panes', action: 'notReady', disabled: true },
+          { label: 'Freeze Panes at Selection', action: 'freezePanes' },
+          { label: 'Unfreeze Panes', action: 'unfreezePanes' },
         ],
       ],
     },
@@ -227,7 +371,11 @@
         ],
         [
           { label: 'New Sheet', action: 'addSheet', shortcut: 'Shift+F11' },
-          { label: 'Rows / Columns', action: 'notReady', disabled: true },
+          { label: 'Rows / Columns...', action: 'structure' },
+          { label: 'Insert Row Above', action: 'insertRow' },
+          { label: 'Insert Column Left', action: 'insertColumn' },
+          { label: 'Delete Row', action: 'deleteRow' },
+          { label: 'Delete Column', action: 'deleteColumn' },
         ],
       ],
     },
@@ -273,9 +421,10 @@
           { label: 'Goal Seek...', action: 'goalSeek' },
         ],
         [
-          { label: 'Filter', action: 'notReady', disabled: true },
-          { label: 'Remove Duplicates', action: 'notReady', disabled: true },
-          { label: 'Named Ranges', action: 'notReady', disabled: true },
+          { label: 'Filter...', action: 'filter' },
+          { label: 'Clear Filter', action: 'clearFilter' },
+          { label: 'Remove Duplicates', action: 'removeDuplicates' },
+          { label: 'Named Ranges...', action: 'namedRanges' },
         ],
       ],
     },
@@ -319,8 +468,15 @@
   let scrollTop: number = $state(0)
   let scrollLeft: number = $state(0)
 
+  let displayedRows: number[] = $derived(buildDisplayedRows())
+  let frozenDisplayRows: number[] = $derived(displayedRows.filter((row) => row < frozenRowCount))
+  let scrollableDisplayRows: number[] = $derived(displayedRows.filter((row) => row >= frozenRowCount))
   let visibleRowStart: number = $derived(Math.floor(scrollTop / ROW_HEIGHT))
-  let visibleRowEnd: number = $derived(Math.min(visibleRowStart + VISIBLE_ROWS + 5, ROWS))
+  let visibleRowEnd: number = $derived(Math.min(visibleRowStart + VISIBLE_ROWS + 5, scrollableDisplayRows.length))
+  let visibleRows: number[] = $derived([
+    ...frozenDisplayRows,
+    ...scrollableDisplayRows.slice(visibleRowStart, visibleRowEnd),
+  ])
   let visibleColStart: number = $derived(Math.max(0, Math.floor(scrollLeft / COL_WIDTH)))
   let visibleColEnd: number = $derived(Math.min(visibleColStart + COLS, COLS))
 
@@ -447,6 +603,45 @@
     return path
   }
 
+  function buildDisplayedRows(): number[] {
+    const rows: number[] = []
+    for (let row = 0; row < ROWS; row++) {
+      if (!hiddenRows[row]) rows.push(row)
+    }
+    return rows
+  }
+
+  function rangeToTuple(range: CellRange): [number, number, number, number] {
+    const r = normalizeRange(range)
+    return [r.startRow, r.startCol, r.endRow, r.endCol]
+  }
+
+  function tupleToRange(range: [number, number, number, number]): CellRange {
+    return {
+      startRow: range[0],
+      startCol: range[1],
+      endRow: range[2],
+      endCol: range[3],
+    }
+  }
+
+  function cellInRange(range: CellRange, row: number, col: number): boolean {
+    const r = normalizeRange(range)
+    return row >= r.startRow && row <= r.endRow && col >= r.startCol && col <= r.endCol
+  }
+
+  function functionHelp(name: string): FunctionHelp {
+    return FUNCTION_HELP[name] ?? {
+      syntax: `${name}(...)`,
+      description: 'Available in the formula engine. Use the function name followed by arguments in parentheses.',
+      example: `=${name}()`,
+    }
+  }
+
+  function cssDecls(styles: Array<string | null | undefined>): string {
+    return styles.filter(Boolean).join('; ')
+  }
+
   function describeError(error: unknown): string {
     return error instanceof Error ? error.message : String(error)
   }
@@ -503,6 +698,132 @@
       })
   }
 
+  async function applyCellValueChanges(
+    changes: Array<{ row: number; col: number; value: string }>,
+    context: string,
+    successMessage?: string,
+  ) {
+    const byKey = new Map<string, { row: number; col: number; value: string }>()
+    for (const change of changes) {
+      if (change.row < 0 || change.row >= ROWS || change.col < 0 || change.col >= COLS) continue
+      byKey.set(cellKey(change.row, change.col), change)
+    }
+
+    const nextContents = { ...cellContents }
+    const nextDisplays = { ...cellDisplays }
+    const history: HistoryEntry[] = []
+    const commands: Promise<unknown>[] = []
+
+    for (const [key, change] of byKey.entries()) {
+      const oldValue = cellContents[key] ?? ''
+      if (oldValue === change.value) continue
+      history.push({
+        sheetId: activeSheetId,
+        row: change.row,
+        col: change.col,
+        oldValue,
+        newValue: change.value,
+      })
+      if (change.value) {
+        nextContents[key] = change.value
+        nextDisplays[key] = change.value.startsWith('=') ? (cellDisplays[key] ?? change.value) : change.value
+        commands.push(invoke('set_cell', {
+          sheetId: activeSheetId,
+          row: change.row,
+          col: change.col,
+          value: change.value,
+        }))
+      } else {
+        delete nextContents[key]
+        delete nextDisplays[key]
+        commands.push(invoke('clear_cell', {
+          sheetId: activeSheetId,
+          row: change.row,
+          col: change.col,
+        }))
+      }
+    }
+
+    if (history.length === 0) {
+      if (successMessage) setStatus(successMessage)
+      return
+    }
+
+    cellContents = nextContents
+    cellDisplays = nextDisplays
+    undoRedo.push(history)
+    updateUndoRedoState()
+
+    try {
+      await Promise.all(commands)
+      if (history.some((entry) => entry.newValue.startsWith('='))) {
+        await refreshSheetData()
+      }
+      if (successMessage) setStatus(successMessage)
+    } catch (e) {
+      setError(e, context)
+      await refreshSheetData()
+    }
+  }
+
+  async function replaceSheetSnapshot(
+    nextContents: Record<string, string>,
+    nextDisplays: Record<string, string>,
+    nextFormats: CellFormatMap,
+    context: string,
+    successMessage: string,
+  ) {
+    const keys = new Set([...Object.keys(cellContents), ...Object.keys(nextContents)])
+    const history: HistoryEntry[] = []
+    const valueCommands: Promise<unknown>[] = []
+
+    for (const key of keys) {
+      const { row, col } = parseCellKey(key)
+      const oldValue = cellContents[key] ?? ''
+      const newValue = nextContents[key] ?? ''
+      if (oldValue !== newValue) {
+        history.push({ sheetId: activeSheetId, row, col, oldValue, newValue })
+      }
+      if (newValue) {
+        valueCommands.push(invoke('set_cell', { sheetId: activeSheetId, row, col, value: newValue }))
+      } else if (oldValue) {
+        valueCommands.push(invoke('clear_cell', { sheetId: activeSheetId, row, col }))
+      }
+    }
+
+    const formatKeys = new Set([...Object.keys(cellFormats), ...Object.keys(nextFormats)])
+    const formatCommands: Promise<unknown>[] = []
+    for (const key of formatKeys) {
+      const { row, col } = parseCellKey(key)
+      const nextFormat = nextFormats[key] ?? {}
+      formatCommands.push(invoke('set_cell_format', {
+        sheetId: activeSheetId,
+        row,
+        col,
+        format: nextFormat,
+      }))
+    }
+
+    cellContents = nextContents
+    cellDisplays = nextDisplays
+    cellFormats = nextFormats
+    if (history.length > 0) {
+      undoRedo.push(history)
+      updateUndoRedoState()
+    }
+
+    try {
+      await Promise.all([...valueCommands, ...formatCommands])
+      if (Object.values(nextContents).some((value) => value.startsWith('='))) {
+        await refreshSheetData()
+      }
+      setStatus(successMessage)
+    } catch (e) {
+      setError(e, context)
+      await refreshSheetData()
+    }
+  }
+
   function getCellValue(row: number, col: number): string {
     return cellContents[cellKey(row, col)] ?? ''
   }
@@ -515,8 +836,17 @@
     return cellFormats[cellKey(row, col)] ?? {}
   }
 
+  function getEffectiveCellFormat(row: number, col: number): CellFormat {
+    let fmt: CellFormat = { ...getCellFormat(row, col) }
+    for (const stored of conditionalRules) {
+      if (!conditionalApplies(stored.rule, row, col)) continue
+      fmt = { ...fmt, ...stored.rule.format }
+    }
+    return fmt
+  }
+
   function getCellStyle(row: number, col: number): string {
-    const fmt = getCellFormat(row, col)
+    const fmt = getEffectiveCellFormat(row, col)
     const styles: string[] = []
     if (fmt.bold) styles.push('font-weight: bold')
     if (fmt.italic) styles.push('font-style: italic')
@@ -527,7 +857,45 @@
     if (fmt.font_color) styles.push(`color: ${fmt.font_color}`)
     if (fmt.bg_color) styles.push(`background: ${fmt.bg_color}`)
     if (fmt.h_align) styles.push(`text-align: ${fmt.h_align === 'general' ? 'left' : fmt.h_align}`)
+    return cssDecls([...styles, getFreezeStyle(row, col)])
+  }
+
+  function getFreezeStyle(row: number, col: number): string {
+    const styles: string[] = []
+    const isFrozenRow = row < frozenRowCount
+    const isFrozenCol = col < frozenColCount
+    if (isFrozenRow) {
+      const frozenIndex = frozenDisplayRows.indexOf(row)
+      styles.push('position: sticky')
+      styles.push(`top: ${HEADER_HEIGHT + Math.max(0, frozenIndex) * ROW_HEIGHT}px`)
+    }
+    if (isFrozenCol) {
+      styles.push('position: sticky')
+      styles.push(`left: ${COL_WIDTH * 0.6 + col * COL_WIDTH}px`)
+    }
+    if (isFrozenRow || isFrozenCol) {
+      styles.push(`z-index: ${isFrozenRow && isFrozenCol ? 6 : 4}`)
+      styles.push('background: var(--bg)')
+    }
     return styles.join('; ')
+  }
+
+  function getRowHeaderStyle(row: number): string {
+    if (row >= frozenRowCount) return `height: ${ROW_HEIGHT}px`
+    const frozenIndex = frozenDisplayRows.indexOf(row)
+    return cssDecls([
+      `height: ${ROW_HEIGHT}px`,
+      'top: ' + (HEADER_HEIGHT + Math.max(0, frozenIndex) * ROW_HEIGHT) + 'px',
+      'z-index: 7',
+    ])
+  }
+
+  function getColHeaderStyle(col: number): string {
+    if (col >= frozenColCount) return ''
+    return cssDecls([
+      `left: ${COL_WIDTH * 0.6 + col * COL_WIDTH}px`,
+      'z-index: 7',
+    ])
   }
 
   async function applyFormatToSelection(format: Partial<CellFormat>) {
@@ -668,6 +1036,21 @@
       chartSvg = ''
       const r = normalizeRange(currentRange)
       chartTitle = `${activeSheetName()} ${rangeLabel(r)}`
+      loadChartColumns()
+    }
+    if (panel === 'filter') {
+      const r = normalizeRange(currentRange)
+      filterColumn = String(selectedCol >= r.startCol && selectedCol <= r.endCol ? selectedCol : r.startCol)
+      filterValue = ''
+    }
+    if (panel === 'namedRanges') {
+      namedRangeName = nextNamedRangeName()
+    }
+    if (panel === 'validation') {
+      validationRuleName = `Validation ${validationRules.length + 1}`
+    }
+    if (panel === 'conditional') {
+      conditionalRuleName = `Highlight ${conditionalRules.length + 1}`
     }
     if (panel === 'print') {
       printPageCount = null
@@ -676,6 +1059,18 @@
 
   function closePanel() {
     activePanel = null
+  }
+
+  function resetWorkbookSessionState() {
+    hiddenRows = {}
+    activeFilterLabel = ''
+    namedRanges = []
+    validationRules = []
+    conditionalRules = []
+    conditionalMatches = []
+    validationResults = []
+    frozenRowCount = 0
+    frozenColCount = 0
   }
 
   function isInSelection(row: number, col: number): boolean {
@@ -707,6 +1102,11 @@
       const { row, col } = parseCellKey(key)
       const oldValue = cellContents[key] ?? ''
       if (editValue !== oldValue) {
+        const validationError = validationMessageForValue(row, col, editValue)
+        if (validationError) {
+          setError(validationError, 'Validation failed')
+          return
+        }
         cellContents[key] = editValue
         if (!editValue.startsWith('=')) {
           cellDisplays[key] = editValue
@@ -861,6 +1261,11 @@
         const key = cellKey(targetRow, targetCol)
         const oldValue = cellContents[key] ?? ''
         const newValue = clipboard.cells[row][col]
+        const validationError = validationMessageForValue(targetRow, targetCol, newValue)
+        if (validationError) {
+          setError(validationError, 'Paste skipped invalid cell')
+          continue
+        }
         if (oldValue !== newValue) {
           history.push({ sheetId: activeSheetId, row: targetRow, col: targetCol, oldValue, newValue })
           cellContents[key] = newValue
@@ -893,6 +1298,11 @@
           const key = cellKey(targetRow, targetCol)
           const oldValue = cellContents[key] ?? ''
           const newValue = cells[row][col]
+          const validationError = validationMessageForValue(targetRow, targetCol, newValue)
+          if (validationError) {
+            setError(validationError, 'Paste skipped invalid cell')
+            continue
+          }
           if (oldValue !== newValue) {
             history.push({ sheetId: activeSheetId, row: targetRow, col: targetCol, oldValue, newValue })
             cellContents[key] = newValue
@@ -1066,6 +1476,11 @@
       const key = cellKey(selectedRow, selectedCol)
       const oldValue = cellContents[key] ?? ''
       if (formulaBarValue !== oldValue) {
+        const validationError = validationMessageForValue(selectedRow, selectedCol, formulaBarValue)
+        if (validationError) {
+          setError(validationError, 'Validation failed')
+          return
+        }
         cellContents[key] = formulaBarValue
         if (!formulaBarValue.startsWith('=')) {
           cellDisplays[key] = formulaBarValue
@@ -1166,6 +1581,8 @@
     cellContents = {}
     cellDisplays = {}
     cellFormats = {}
+    hiddenRows = {}
+    activeFilterLabel = ''
     try {
       const data = await invoke<CellData[]>('get_sheet_data', { sheetId: id })
       const contents: Record<string, string> = {}
@@ -1231,6 +1648,7 @@
     try {
       const result = await invoke<SheetInfo[]>('new_workbook')
       currentFilePath = null
+      resetWorkbookSessionState()
       await loadSheetList(result)
       setStatus('New workbook')
     } catch (e) {
@@ -1247,6 +1665,7 @@
       if (!path) return
       const result = await invoke<SheetInfo[]>('import_xlsx_file', { filePath: path })
       currentFilePath = path
+      resetWorkbookSessionState()
       await loadSheetList(result)
       setStatus(`Opened ${filename(path)}`)
     } catch (e) {
@@ -1267,6 +1686,7 @@
         delimiter,
         sheetId: activeSheetId,
       })
+      resetWorkbookSessionState()
       await loadSheetList(result, activeSheetId)
       setStatus(`Imported ${filename(path)}`)
     } catch (e) {
@@ -1283,6 +1703,7 @@
       if (!path) return
       const result = await invoke<SheetInfo[]>('import_json_file', { filePath: path })
       currentFilePath = null
+      resetWorkbookSessionState()
       await loadSheetList(result)
       setStatus(`Imported ${filename(path)}`)
     } catch (e) {
@@ -1399,12 +1820,18 @@
 
   async function runChart() {
     const r = normalizeRange(currentRange)
-    const xCol = r.startCol
-    const yCol = Math.min(r.startCol + 1, r.endCol)
+    const xCol = Number(chartXColumn)
+    const yCol = Number(chartYColumn)
     if (xCol === yCol || r.startRow === r.endRow) {
-      setError('Select at least two columns and two rows before creating a chart', 'Chart unavailable')
+      setError('Choose different label and value columns from a range with headers and data rows', 'Chart unavailable')
       return
     }
+    if (!Number.isInteger(xCol) || !Number.isInteger(yCol) || xCol < r.startCol || xCol > r.endCol || yCol < r.startCol || yCol > r.endCol) {
+      setError('Choose chart columns inside the selected range', 'Chart unavailable')
+      return
+    }
+    const yLabel = chartColumns.find((col) => col.col === yCol)?.name ?? colLabel(yCol)
+    const xLabel = chartColumns.find((col) => col.col === xCol)?.name ?? colLabel(xCol)
     try {
       const result = await invoke<ChartResult>('create_chart', {
         sheetId: activeSheetId,
@@ -1412,7 +1839,7 @@
           title: chartTitle || 'Chart',
           chart_type: chartType,
           series: [{
-            name: chartSeriesName || colLabel(yCol),
+            name: chartSeriesName || yLabel,
             x_column: xCol,
             y_column: yCol,
             color: null,
@@ -1420,9 +1847,9 @@
           header_row: r.startRow,
           data_start_row: Math.min(r.startRow + 1, r.endRow),
           data_end_row: r.endRow,
-          x_axis_label: colLabel(xCol),
-          y_axis_label: colLabel(yCol),
-          legend_position: 'Bottom',
+          x_axis_label: xLabel,
+          y_axis_label: yLabel,
+          legend_position: chartLegendPosition,
         },
       })
       chartSvg = result.svg
@@ -1441,8 +1868,34 @@
         startCol: r.startCol,
         endCol: r.endCol,
       })
+      pivotRowColumn = String(pivotColumns[0]?.col ?? r.startCol)
+      pivotValueColumn = String(pivotColumns[pivotColumns.length - 1]?.col ?? r.endCol)
+      pivotColumnColumn = ''
+      pivotFilterColumn = ''
+      pivotFilterValue = ''
     } catch {
       pivotColumns = []
+      pivotRowColumn = String(r.startCol)
+      pivotValueColumn = String(r.endCol)
+    }
+  }
+
+  async function loadChartColumns() {
+    const r = normalizeRange(currentRange)
+    try {
+      chartColumns = await invoke<ColumnInfo[]>('get_pivot_columns', {
+        sheetId: activeSheetId,
+        headerRow: r.startRow,
+        startCol: r.startCol,
+        endCol: r.endCol,
+      })
+      chartXColumn = String(chartColumns[0]?.col ?? r.startCol)
+      chartYColumn = String(chartColumns[1]?.col ?? Math.min(r.startCol + 1, r.endCol))
+      chartSeriesName = chartColumns.find((col) => String(col.col) === chartYColumn)?.name ?? 'Series 1'
+    } catch {
+      chartColumns = []
+      chartXColumn = String(r.startCol)
+      chartYColumn = String(Math.min(r.startCol + 1, r.endCol))
     }
   }
 
@@ -1452,8 +1905,14 @@
       setError('Select a table with headers, row labels, and at least one value column', 'Pivot unavailable')
       return
     }
-    const rowCol = pivotColumns[0]?.col ?? r.startCol
-    const valueCol = pivotColumns[pivotColumns.length - 1]?.col ?? r.endCol
+    const rowCol = Number(pivotRowColumn)
+    const valueCol = Number(pivotValueColumn)
+    const columnCol = pivotColumnColumn ? Number(pivotColumnColumn) : null
+    const filterCol = pivotFilterColumn ? Number(pivotFilterColumn) : null
+    if (!Number.isInteger(rowCol) || !Number.isInteger(valueCol)) {
+      setError('Choose row and value fields before creating a pivot', 'Pivot unavailable')
+      return
+    }
     try {
       const result = await invoke<SheetInfo[]>('create_pivot_sheet', {
         sheetId: activeSheetId,
@@ -1462,14 +1921,14 @@
           data_range: [r.startRow, r.startCol, r.endRow, r.endCol],
           header_row: r.startRow,
           row_fields: [{ column: rowCol, label: pivotColumns.find((c) => c.col === rowCol)?.name ?? colLabel(rowCol) }],
-          column_fields: [],
+          column_fields: columnCol == null ? [] : [{ column: columnCol, label: pivotColumns.find((c) => c.col === columnCol)?.name ?? colLabel(columnCol) }],
           value_fields: [{
             column: valueCol,
             label: pivotColumns.find((c) => c.col === valueCol)?.name ?? colLabel(valueCol),
             aggregation: pivotAggregation,
           }],
-          filter_field: null,
-          filter_values: [],
+          filter_field: filterCol == null ? null : { column: filterCol, label: pivotColumns.find((c) => c.col === filterCol)?.name ?? colLabel(filterCol) },
+          filter_values: pivotFilterValue.trim() ? pivotFilterValue.split(',').map((value) => value.trim()).filter(Boolean) : [],
         },
       })
       await loadSheetList(result, result[result.length - 1]?.id ?? activeSheetId)
@@ -1480,7 +1939,276 @@
     }
   }
 
-  function buildValidation() {
+  function filterMatches(row: number, col: number): boolean {
+    const raw = getCellValue(row, col)
+    const display = getCellDisplay(row, col)
+    const text = (display || raw).trim()
+    const needle = filterValue.trim()
+    const numeric = Number(text)
+    const numericNeedle = Number(needle)
+
+    switch (filterCondition) {
+      case 'Equals': return text.localeCompare(needle, undefined, { sensitivity: 'accent' }) === 0
+      case 'NotEquals': return text.localeCompare(needle, undefined, { sensitivity: 'accent' }) !== 0
+      case 'Contains': return text.toLowerCase().includes(needle.toLowerCase())
+      case 'StartsWith': return text.toLowerCase().startsWith(needle.toLowerCase())
+      case 'EndsWith': return text.toLowerCase().endsWith(needle.toLowerCase())
+      case 'GreaterThan': return Number.isFinite(numeric) && Number.isFinite(numericNeedle) && numeric > numericNeedle
+      case 'LessThan': return Number.isFinite(numeric) && Number.isFinite(numericNeedle) && numeric < numericNeedle
+      case 'Empty': return text === ''
+      case 'NotEmpty': return text !== ''
+      default: return true
+    }
+  }
+
+  function applyFilter() {
+    const r = normalizeRange(currentRange)
+    const col = Number(filterColumn || r.startCol)
+    if (!Number.isInteger(col) || col < r.startCol || col > r.endCol) {
+      setError('Choose a filter column inside the selected range', 'Filter failed')
+      return
+    }
+    const nextHidden: Record<number, boolean> = {}
+    const firstDataRow = filterHasHeader ? r.startRow + 1 : r.startRow
+    let hidden = 0
+    for (let row = firstDataRow; row <= r.endRow; row++) {
+      if (!filterMatches(row, col)) {
+        nextHidden[row] = true
+        hidden += 1
+      }
+    }
+    hiddenRows = nextHidden
+    activeFilterLabel = `${colLabel(col)} ${filterCondition}${filterCondition === 'Empty' || filterCondition === 'NotEmpty' ? '' : ` "${filterValue}"`}`
+    setStatus(`Filter applied to ${rangeLabel(r)}; ${hidden} row${hidden === 1 ? '' : 's'} hidden`)
+  }
+
+  function clearFilter() {
+    hiddenRows = {}
+    activeFilterLabel = ''
+    setStatus('Filter cleared')
+  }
+
+  async function removeDuplicateRows() {
+    const r = normalizeRange(currentRange)
+    if (r.endRow <= r.startRow) {
+      setError('Select at least two rows before removing duplicates', 'Remove duplicates failed')
+      return
+    }
+
+    const seen = new Set<string>()
+    const keptRows: string[][] = []
+    let duplicateCount = 0
+
+    for (let row = r.startRow; row <= r.endRow; row++) {
+      const values: string[] = []
+      for (let col = r.startCol; col <= r.endCol; col++) {
+        values.push(getCellValue(row, col))
+      }
+      const signature = values.map((value) => value.trim().toLowerCase()).join('\u0000')
+      if (seen.has(signature)) {
+        duplicateCount += 1
+      } else {
+        seen.add(signature)
+        keptRows.push(values)
+      }
+    }
+
+    if (duplicateCount === 0) {
+      setStatus('No duplicate rows found')
+      return
+    }
+
+    const changes: Array<{ row: number; col: number; value: string }> = []
+    const width = r.endCol - r.startCol + 1
+    for (let rowOffset = 0; rowOffset <= r.endRow - r.startRow; rowOffset++) {
+      for (let colOffset = 0; colOffset < width; colOffset++) {
+        changes.push({
+          row: r.startRow + rowOffset,
+          col: r.startCol + colOffset,
+          value: keptRows[rowOffset]?.[colOffset] ?? '',
+        })
+      }
+    }
+
+    await applyCellValueChanges(
+      changes,
+      'Remove duplicates failed',
+      `Removed ${duplicateCount} duplicate row${duplicateCount === 1 ? '' : 's'} from ${rangeLabel(r)}`,
+    )
+  }
+
+  function nextNamedRangeName(): string {
+    let index = namedRanges.length + 1
+    let name = `Range_${index}`
+    while (namedRanges.some((range) => range.name.toLowerCase() === name.toLowerCase())) {
+      index += 1
+      name = `Range_${index}`
+    }
+    return name
+  }
+
+  function addNamedRange() {
+    const name = namedRangeName.trim()
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+      setError('Use letters, numbers, and underscores; start with a letter or underscore', 'Named range failed')
+      return
+    }
+    if (parseCellAddress(name)) {
+      setError('Named ranges cannot look like cell addresses', 'Named range failed')
+      return
+    }
+    if (namedRanges.some((range) => range.name.toLowerCase() === name.toLowerCase())) {
+      setError('A named range with that name already exists', 'Named range failed')
+      return
+    }
+    namedRanges = [...namedRanges, { id: `named-${Date.now()}`, name, range: normalizeRange(currentRange) }]
+    namedRangeName = nextNamedRangeName()
+    setStatus(`Named ${rangeLabel(currentRange)} as ${name}`)
+  }
+
+  function removeNamedRange(id: string) {
+    const removed = namedRanges.find((range) => range.id === id)
+    namedRanges = namedRanges.filter((range) => range.id !== id)
+    if (removed) setStatus(`Removed named range ${removed.name}`)
+  }
+
+  function selectNamedRange(range: NamedRange) {
+    selectRange(range.range)
+  }
+
+  function selectRange(range: CellRange) {
+    const r = normalizeRange(range)
+    selectedRow = r.startRow
+    selectedCol = r.startCol
+    selectionStart = { row: r.startRow, col: r.startCol }
+    selectionEnd = { row: r.endRow, col: r.endCol }
+    formulaBarValue = getCellValue(r.startRow, r.startCol)
+    if (gridContainerEl) {
+      gridContainerEl.scrollTop = Math.max(0, r.startRow * ROW_HEIGHT - ROW_HEIGHT * 2)
+      gridContainerEl.scrollLeft = Math.max(0, r.startCol * COL_WIDTH - COL_WIDTH)
+    }
+  }
+
+  function insertNamedRangeReference(range: NamedRange) {
+    const ref = rangeLabel(range.range)
+    if (!editingCell) {
+      startEdit(selectedRow, selectedCol)
+      editValue = editValue || '='
+    }
+    editValue = editValue.endsWith('=') || editValue.endsWith('(') ? `${editValue}${ref}` : `${editValue}${ref}`
+  }
+
+  async function transformSheetCells(
+    transform: (row: number, col: number) => { row: number; col: number } | null,
+    context: string,
+    successMessage: string,
+  ) {
+    const nextContents: Record<string, string> = {}
+    const nextDisplays: Record<string, string> = {}
+    const nextFormats: CellFormatMap = {}
+
+    for (const [key, value] of Object.entries(cellContents)) {
+      const { row, col } = parseCellKey(key)
+      const target = transform(row, col)
+      if (!target) continue
+      nextContents[cellKey(target.row, target.col)] = value
+    }
+
+    for (const [key, value] of Object.entries(cellDisplays)) {
+      const { row, col } = parseCellKey(key)
+      const target = transform(row, col)
+      if (!target) continue
+      nextDisplays[cellKey(target.row, target.col)] = value
+    }
+
+    for (const [key, value] of Object.entries(cellFormats)) {
+      const { row, col } = parseCellKey(key)
+      const target = transform(row, col)
+      if (!target) continue
+      nextFormats[cellKey(target.row, target.col)] = value
+    }
+
+    await replaceSheetSnapshot(nextContents, nextDisplays, nextFormats, context, successMessage)
+  }
+
+  async function insertRowAbove() {
+    const rowIndex = selectedRow
+    await transformSheetCells((row, col) => {
+      if (row < rowIndex) return { row, col }
+      if (row >= ROWS - 1) return null
+      return { row: row + 1, col }
+    }, 'Insert row failed', `Inserted row above ${rowIndex + 1}`)
+    selectCell(rowIndex, selectedCol)
+  }
+
+  async function deleteSelectedRow() {
+    const rowIndex = selectedRow
+    await transformSheetCells((row, col) => {
+      if (row < rowIndex) return { row, col }
+      if (row === rowIndex) return null
+      return { row: row - 1, col }
+    }, 'Delete row failed', `Deleted row ${rowIndex + 1}`)
+    selectCell(Math.min(rowIndex, ROWS - 1), selectedCol)
+  }
+
+  async function insertColumnLeft() {
+    const colIndex = selectedCol
+    await transformSheetCells((row, col) => {
+      if (col < colIndex) return { row, col }
+      if (col >= COLS - 1) return null
+      return { row, col: col + 1 }
+    }, 'Insert column failed', `Inserted column before ${colLabel(colIndex)}`)
+    selectCell(selectedRow, colIndex)
+  }
+
+  async function deleteSelectedColumn() {
+    const colIndex = selectedCol
+    await transformSheetCells((row, col) => {
+      if (col < colIndex) return { row, col }
+      if (col === colIndex) return null
+      return { row, col: col - 1 }
+    }, 'Delete column failed', `Deleted column ${colLabel(colIndex)}`)
+    selectCell(selectedRow, Math.min(colIndex, COLS - 1))
+  }
+
+  function freezePanesAtSelection() {
+    frozenRowCount = selectedRow
+    frozenColCount = selectedCol
+    if (selectedRow === 0 && selectedCol === 0) {
+      frozenRowCount = 1
+    }
+    setStatus(`Frozen ${frozenRowCount} row${frozenRowCount === 1 ? '' : 's'} and ${frozenColCount} column${frozenColCount === 1 ? '' : 's'}`)
+  }
+
+  function unfreezePanes() {
+    frozenRowCount = 0
+    frozenColCount = 0
+    setStatus('Panes unfrozen')
+  }
+
+  async function applyTemplate(key: string) {
+    const template = TEMPLATES[key]
+    if (!template) return
+    const start = normalizeRange(currentRange)
+    const changes: Array<{ row: number; col: number; value: string }> = []
+    for (let row = 0; row < template.rows.length; row++) {
+      for (let col = 0; col < template.rows[row].length; col++) {
+        changes.push({
+          row: start.startRow + row,
+          col: start.startCol + col,
+          value: template.rows[row][col],
+        })
+      }
+    }
+    await applyCellValueChanges(changes, 'Template insert failed', `Inserted ${template.title} template`)
+    selectionStart = { row: start.startRow, col: start.startCol }
+    selectionEnd = {
+      row: start.startRow + template.rows.length - 1,
+      col: start.startCol + template.rows[0].length - 1,
+    }
+  }
+
+  function buildValidation(): ValidationDefinition {
     return {
       validation_type: validationType,
       operator: validationOperator,
@@ -1495,6 +2223,58 @@
       prompt_title: null,
       prompt_message: null,
     }
+  }
+
+  function validationLabel(rule: StoredValidationRule): string {
+    if (rule.validation.validation_type === 'List') {
+      return `${rule.label}: list values in ${rangeLabel(rule.range)}`
+    }
+    return `${rule.label}: ${rule.validation.validation_type} ${rule.validation.operator} ${rule.validation.formula1 ?? ''}${rule.validation.formula2 ? ` and ${rule.validation.formula2}` : ''} in ${rangeLabel(rule.range)}`
+  }
+
+  function checkValidationValue(validation: ValidationDefinition, value: string): string | null {
+    if (value.startsWith('=')) return null
+    if (!value.trim()) return validation.allow_blank ? null : 'Value is required'
+    if (validation.validation_type === 'List') {
+      const allowed = (validation.source ?? '').split(',').map((entry) => entry.trim()).filter(Boolean)
+      return allowed.some((entry) => entry.toLowerCase() === value.trim().toLowerCase())
+        ? null
+        : `Value must be one of: ${allowed.join(', ')}`
+    }
+    const checkNumber = validation.validation_type === 'WholeNumber'
+      || validation.validation_type === 'Decimal'
+      || validation.validation_type === 'Date'
+      || validation.validation_type === 'Time'
+    const measured = validation.validation_type === 'TextLength' ? value.length : Number(value)
+    if (checkNumber && !Number.isFinite(measured)) return 'Value must be numeric'
+    if (validation.validation_type === 'WholeNumber' && !Number.isInteger(measured)) return 'Value must be a whole number'
+    if (validation.validation_type === 'TextLength' && !Number.isFinite(measured)) return 'Text length could not be measured'
+    if (validation.validation_type === 'Custom') return null
+
+    const first = validation.formula1 == null || validation.formula1 === '' ? null : Number(validation.formula1)
+    const second = validation.formula2 == null || validation.formula2 === '' ? null : Number(validation.formula2)
+    const op = validation.operator
+    const passes =
+      op === 'Between' ? (first == null || measured >= first) && (second == null || measured <= second)
+      : op === 'NotBetween' ? !((first == null || measured >= first) && (second == null || measured <= second))
+      : op === 'Equal' ? first == null || measured === first
+      : op === 'NotEqual' ? first == null || measured !== first
+      : op === 'GreaterThan' ? first == null || measured > first
+      : op === 'LessThan' ? first == null || measured < first
+      : op === 'GreaterThanOrEqual' ? first == null || measured >= first
+      : op === 'LessThanOrEqual' ? first == null || measured <= first
+      : true
+
+    return passes ? null : `Value does not satisfy ${validation.validation_type} ${validation.operator}`
+  }
+
+  function validationMessageForValue(row: number, col: number, value: string): string | null {
+    for (const rule of validationRules) {
+      if (!cellInRange(rule.range, row, col)) continue
+      const error = checkValidationValue(rule.validation, value)
+      if (error) return `${cellKey(row, col)} violates ${rule.label}: ${error}`
+    }
+    return null
   }
 
   async function runValidation() {
@@ -1513,7 +2293,27 @@
     }
   }
 
-  function buildConditionalRule() {
+  async function saveValidationRule() {
+    const label = validationRuleName.trim() || `Validation ${validationRules.length + 1}`
+    const r = normalizeRange(currentRange)
+    const rule: StoredValidationRule = {
+      id: `validation-${Date.now()}`,
+      label,
+      range: r,
+      validation: buildValidation(),
+    }
+    validationRules = [...validationRules, rule]
+    await runValidation()
+    setStatus(`Saved validation rule for ${rangeLabel(r)}`)
+  }
+
+  function removeValidationRule(id: string) {
+    const removed = validationRules.find((rule) => rule.id === id)
+    validationRules = validationRules.filter((rule) => rule.id !== id)
+    if (removed) setStatus(`Removed ${removed.label}`)
+  }
+
+  function buildConditionalRule(): ConditionalRuleDefinition {
     const r = normalizeRange(currentRange)
     return {
       id: `rule-${Date.now()}`,
@@ -1536,29 +2336,82 @@
     }
   }
 
+  function compareConditionalNumber(value: number, rule: ConditionalRuleDefinition): boolean {
+    const first = rule.value1 == null || rule.value1 === '' ? null : Number(rule.value1)
+    const second = rule.value2 == null || rule.value2 === '' ? null : Number(rule.value2)
+    if (!Number.isFinite(value)) return false
+    switch (rule.operator) {
+      case 'Between': return (first == null || value >= first) && (second == null || value <= second)
+      case 'NotBetween': return !((first == null || value >= first) && (second == null || value <= second))
+      case 'Equal': return first == null || value === first
+      case 'NotEqual': return first == null || value !== first
+      case 'GreaterThan': return first == null || value > first
+      case 'LessThan': return first == null || value < first
+      case 'GreaterThanOrEqual': return first == null || value >= first
+      case 'LessThanOrEqual': return first == null || value <= first
+      default: return true
+    }
+  }
+
+  function conditionalApplies(rule: ConditionalRuleDefinition, row: number, col: number): boolean {
+    const range = tupleToRange(rule.range)
+    if (!cellInRange(range, row, col)) return false
+    const raw = getCellValue(row, col)
+    const text = raw.trim()
+    switch (rule.condition_type) {
+      case 'CellValue':
+        return compareConditionalNumber(Number(raw), rule)
+      case 'TextContains':
+        return text.toLowerCase().includes((rule.value1 ?? '').toLowerCase())
+      case 'TextNotContains':
+        return !text.toLowerCase().includes((rule.value1 ?? '').toLowerCase())
+      case 'TextBeginsWith':
+        return text.toLowerCase().startsWith((rule.value1 ?? '').toLowerCase())
+      case 'TextEndsWith':
+        return text.toLowerCase().endsWith((rule.value1 ?? '').toLowerCase())
+      case 'Blanks':
+        return text === ''
+      case 'NoBlanks':
+        return text !== ''
+      case 'Duplicate': {
+        if (!text) return false
+        let matches = 0
+        for (let r = range.startRow; r <= range.endRow; r++) {
+          for (let c = range.startCol; c <= range.endCol; c++) {
+            if ((getCellValue(r, c) || '').trim().toLowerCase() === text.toLowerCase()) {
+              matches += 1
+              if (matches > 1) return true
+            }
+          }
+        }
+        return false
+      }
+      default:
+        return false
+    }
+  }
+
   async function applyConditionalFormat() {
     try {
+      const rule = buildConditionalRule()
       const matches = await invoke<Array<[number, number]>>('find_conditional_format_matches', {
         sheetId: activeSheetId,
-        rule: buildConditionalRule(),
+        rule,
       })
       conditionalMatches = matches
-      for (const [row, col] of matches) {
-        const key = cellKey(row, col)
-        const existing = cellFormats[key] ?? {}
-        const next = { ...existing, bg_color: conditionalFill, bold: true }
-        cellFormats[key] = next
-        await invoke('set_cell_format', {
-          sheetId: activeSheetId,
-          row,
-          col,
-          format: next,
-        })
-      }
-      setStatus(`Applied conditional format to ${matches.length} cell${matches.length === 1 ? '' : 's'}`)
+      const label = conditionalRuleName.trim() || `Highlight ${conditionalRules.length + 1}`
+      conditionalRules = [...conditionalRules, { id: rule.id, label, rule }]
+      setStatus(`Saved conditional rule; ${matches.length} current match${matches.length === 1 ? '' : 'es'}`)
     } catch (e) {
       setError(e, 'Conditional formatting failed')
     }
+  }
+
+  function removeConditionalRule(id: string) {
+    const removed = conditionalRules.find((rule) => rule.id === id)
+    conditionalRules = conditionalRules.filter((rule) => rule.id !== id)
+    conditionalMatches = []
+    if (removed) setStatus(`Removed ${removed.label}`)
   }
 
   async function updatePrintPreview() {
@@ -1693,6 +2546,7 @@
     closePopovers()
     switch (action) {
       case 'newWorkbook': return handleNewWorkbook()
+      case 'templates': return openPanel('templates')
       case 'openXlsx': return handleOpenXlsx()
       case 'importCsv': return handleImportCsv()
       case 'importJson': return handleImportJson()
@@ -1713,11 +2567,18 @@
       case 'zoomIn': zoomPercent = Math.min(150, zoomPercent + 10); return
       case 'zoomOut': zoomPercent = Math.max(70, zoomPercent - 10); return
       case 'zoomReset': zoomPercent = 100; return
+      case 'freezePanes': return freezePanesAtSelection()
+      case 'unfreezePanes': return unfreezePanes()
       case 'functions': return openPanel('functions')
       case 'addSheet': return handleAddSheet()
       case 'comment': return openPanel('comment')
       case 'chart': return openPanel('chart')
       case 'pivot': return openPanel('pivot')
+      case 'structure': return openPanel('structure')
+      case 'insertRow': return insertRowAbove()
+      case 'deleteRow': return deleteSelectedRow()
+      case 'insertColumn': return insertColumnLeft()
+      case 'deleteColumn': return deleteSelectedColumn()
       case 'bold': return toggleBold()
       case 'italic': return toggleItalic()
       case 'underline': return toggleUnderline()
@@ -1734,6 +2595,10 @@
       case 'conditional': return openPanel('conditional')
       case 'sortAsc': return handleSort(true)
       case 'sortDesc': return handleSort(false)
+      case 'filter': return openPanel('filter')
+      case 'clearFilter': return clearFilter()
+      case 'removeDuplicates': return removeDuplicateRows()
+      case 'namedRanges': return openPanel('namedRanges')
       case 'validation': return openPanel('validation')
       case 'protection': return openPanel('protection')
       case 'lockRange': return setRangeLock(true)
@@ -1849,13 +2714,17 @@
     <div class="ribbon-group">
       <button type="button" class="fmt-btn" onclick={() => handleSort(true)} title="Sort ascending">↑ Sort</button>
       <button type="button" class="fmt-btn" onclick={() => handleSort(false)} title="Sort descending">↓ Sort</button>
+      <button type="button" class="fmt-btn" onclick={() => openPanel('filter')} title="Filter selected range">Filter</button>
+      <button type="button" class="fmt-btn" onclick={removeDuplicateRows} title="Remove duplicate rows in selected range">Deduplicate</button>
       <button type="button" class="fmt-btn" onclick={() => openPanel('find')} title="Find and replace">Find</button>
       <button type="button" class="fmt-btn" onclick={() => openPanel('validation')} title="Validate selected range">Validate</button>
+      <button type="button" class="fmt-btn" onclick={() => openPanel('namedRanges')} title="Manage named ranges">Names</button>
     </div>
     <div class="fmt-divider"></div>
     <div class="ribbon-group">
       <button type="button" class="fmt-btn" onclick={() => openPanel('chart')} title="Create chart">Chart</button>
       <button type="button" class="fmt-btn" onclick={() => openPanel('pivot')} title="Create pivot table">Pivot</button>
+      <button type="button" class="fmt-btn" onclick={() => openPanel('templates')} title="Insert template">Templates</button>
       <button type="button" class="fmt-btn" onclick={() => openPanel('print')} title="Print and export PDF">Print</button>
     </div>
   </div>
@@ -1894,24 +2763,24 @@
   <div class="grid-container" style="--grid-zoom: {zoomPercent / 100};" role="grid" tabindex="-1" bind:this={gridContainerEl} onscroll={handleScroll} onmousemove={handleGridMouseMove}>
     <div
       class="grid"
-      style="grid-template-columns: {COL_WIDTH * 0.6}px repeat({COLS}, {COL_WIDTH}px); height: {HEADER_HEIGHT + ROWS * ROW_HEIGHT}px;"
+      style="grid-template-columns: {COL_WIDTH * 0.6}px repeat({COLS}, {COL_WIDTH}px); height: {HEADER_HEIGHT + displayedRows.length * ROW_HEIGHT}px;"
     >
       <div class="corner-cell"></div>
       {#each Array(COLS) as _, c}
-        <div class="col-header">{colLabel(c)}</div>
+        <div class="col-header" style={getColHeaderStyle(c)}>{colLabel(c)}</div>
       {/each}
 
       <div class="grid-spacer" style="height: {visibleRowStart * ROW_HEIGHT}px;"></div>
 
-      {#each Array(visibleRowEnd - visibleRowStart) as _, i}
-        {@const r = visibleRowStart + i}
-        <div class="row-header" style="height: {ROW_HEIGHT}px;">{r + 1}</div>
+      {#each visibleRows as r}
+        <div class="row-header" style={getRowHeaderStyle(r)}>{r + 1}</div>
         {#each Array(COLS) as _, c}
           <button
             type="button"
             class="cell"
             class:selected={isInSelection(r, c)}
             class:active={selectedRow === r && selectedCol === c}
+            class:frozen={r < frozenRowCount || c < frozenColCount}
             onmousedown={(e) => handleMouseDown(r, c, e)}
             onmouseenter={() => handleMouseEnter(r, c)}
             ondblclick={() => startEdit(r, c)}
@@ -1934,7 +2803,7 @@
         {/each}
       {/each}
 
-      <div class="grid-spacer" style="height: {Math.max(0, (ROWS - visibleRowEnd) * ROW_HEIGHT)}px;"></div>
+      <div class="grid-spacer" style="height: {Math.max(0, (scrollableDisplayRows.length - visibleRowEnd) * ROW_HEIGHT)}px;"></div>
     </div>
     {#if isMultiSelection}
       <div class="selection-label">{selectionLabel}</div>
@@ -1979,6 +2848,12 @@
   <div class="status-bar">
     <span>{activeSheetName()}</span>
     <span>{rangeLabel(currentRange)}</span>
+    {#if activeFilterLabel}
+      <span>Filter {activeFilterLabel}</span>
+    {/if}
+    {#if frozenRowCount || frozenColCount}
+      <span>Frozen {frozenRowCount}R/{frozenColCount}C</span>
+    {/if}
     <span>Count {selectionStats.count}</span>
     {#if selectionStats.numericCount > 0}
       <span>Sum {formatStat(selectionStats.sum)}</span>
@@ -2001,6 +2876,10 @@
               {:else if activePanel === 'chart'}Analyze
               {:else if activePanel === 'pivot'}Analyze
               {:else if activePanel === 'validation'}Data
+              {:else if activePanel === 'filter'}Data
+              {:else if activePanel === 'namedRanges'}Data
+              {:else if activePanel === 'structure'}Insert
+              {:else if activePanel === 'templates'}File
               {:else if activePanel === 'conditional'}Format
               {:else if activePanel === 'print'}File
               {:else if activePanel === 'protection'}Tools
@@ -2014,6 +2893,10 @@
               {:else if activePanel === 'chart'}Chart Builder
               {:else if activePanel === 'pivot'}Pivot Table
               {:else if activePanel === 'validation'}Validate Range
+              {:else if activePanel === 'filter'}Filter Rows
+              {:else if activePanel === 'namedRanges'}Named Ranges
+              {:else if activePanel === 'structure'}Rows and Columns
+              {:else if activePanel === 'templates'}Templates
               {:else if activePanel === 'conditional'}Conditional Formatting
               {:else if activePanel === 'print'}Print and PDF
               {:else if activePanel === 'protection'}Protection
@@ -2033,7 +2916,12 @@
               {#each filteredFormulaFunctions as fn}
                 <button type="button" class="function-row" onclick={() => insertFunction(fn.name)}>
                   <span class="function-name">{fn.name}</span>
-                  <span class="function-category">{fn.category}</span>
+                  <span>
+                    <span class="function-category">{fn.category}</span>
+                    <span class="function-syntax">{functionHelp(fn.name).syntax}</span>
+                    <span class="function-description">{functionHelp(fn.name).description}</span>
+                    <span class="function-example">{functionHelp(fn.name).example}</span>
+                  </span>
                 </button>
               {/each}
             </div>
@@ -2070,8 +2958,31 @@
                 <option>Scatter</option>
               </select>
             </label>
+            <label>Label column
+              <select class="panel-input" bind:value={chartXColumn}>
+                {#each chartColumns as col}
+                  <option value={String(col.col)}>{col.name || colLabel(col.col)}</option>
+                {/each}
+              </select>
+            </label>
+            <label>Value column
+              <select class="panel-input" bind:value={chartYColumn} onchange={() => chartSeriesName = chartColumns.find((col) => String(col.col) === chartYColumn)?.name ?? chartSeriesName}>
+                {#each chartColumns as col}
+                  <option value={String(col.col)}>{col.name || colLabel(col.col)}</option>
+                {/each}
+              </select>
+            </label>
             <label>Series name<input class="panel-input" bind:value={chartSeriesName} /></label>
-            <p class="panel-note">Uses the first selected column as labels and the second selected column as values. Current range: {rangeLabel(currentRange)}.</p>
+            <label>Legend
+              <select class="panel-input" bind:value={chartLegendPosition}>
+                <option>Bottom</option>
+                <option>Top</option>
+                <option>Left</option>
+                <option>Right</option>
+                <option>None</option>
+              </select>
+            </label>
+            <p class="panel-note">Uses the selected range as a table with headers. Current range: {rangeLabel(currentRange)}.</p>
             <div class="panel-actions">
               <button type="button" class="primary-btn" onclick={runChart}>Create Chart</button>
             </div>
@@ -2081,7 +2992,29 @@
           </div>
         {:else if activePanel === 'pivot'}
           <div class="panel-body form-grid">
-            <p class="panel-note">Uses the first detected column as the row field and the last detected column as the value field. Current range: {rangeLabel(currentRange)}.</p>
+            <p class="panel-note">Builds a pivot sheet from the selected table. Current range: {rangeLabel(currentRange)}.</p>
+            <label>Rows
+              <select class="panel-input" bind:value={pivotRowColumn}>
+                {#each pivotColumns as col}
+                  <option value={String(col.col)}>{col.name || colLabel(col.col)}</option>
+                {/each}
+              </select>
+            </label>
+            <label>Columns
+              <select class="panel-input" bind:value={pivotColumnColumn}>
+                <option value="">None</option>
+                {#each pivotColumns as col}
+                  <option value={String(col.col)}>{col.name || colLabel(col.col)}</option>
+                {/each}
+              </select>
+            </label>
+            <label>Values
+              <select class="panel-input" bind:value={pivotValueColumn}>
+                {#each pivotColumns as col}
+                  <option value={String(col.col)}>{col.name || colLabel(col.col)}</option>
+                {/each}
+              </select>
+            </label>
             <label>Aggregation
               <select class="panel-input" bind:value={pivotAggregation}>
                 <option>Sum</option>
@@ -2092,6 +3025,15 @@
                 <option>Product</option>
               </select>
             </label>
+            <label>Filter field
+              <select class="panel-input" bind:value={pivotFilterColumn}>
+                <option value="">None</option>
+                {#each pivotColumns as col}
+                  <option value={String(col.col)}>{col.name || colLabel(col.col)}</option>
+                {/each}
+              </select>
+            </label>
+            <label>Filter values<input class="panel-input" bind:value={pivotFilterValue} placeholder="Comma-separated values" /></label>
             <div class="chip-row">
               {#each pivotColumns as col}
                 <span class="chip">{col.name || colLabel(col.col)}</span>
@@ -2103,6 +3045,7 @@
           </div>
         {:else if activePanel === 'validation'}
           <div class="panel-body form-grid">
+            <label>Rule name<input class="panel-input" bind:value={validationRuleName} /></label>
             <label>Rule type
               <select class="panel-input" bind:value={validationType}>
                 <option>WholeNumber</option>
@@ -2134,7 +3077,21 @@
             {/if}
             <div class="panel-actions">
               <button type="button" class="primary-btn" onclick={runValidation}>Validate {rangeLabel(currentRange)}</button>
+              <button type="button" class="secondary-btn" onclick={saveValidationRule}>Save Rule</button>
             </div>
+            {#if validationRules.length > 0}
+              <div class="rule-list">
+                {#each validationRules as rule}
+                  <div class="rule-row">
+                    <button type="button" class="result-row" onclick={() => selectRange(rule.range)}>
+                      <span>{rangeLabel(rule.range)}</span>
+                      <span>{validationLabel(rule)}</span>
+                    </button>
+                    <button type="button" class="icon-btn small" onclick={() => removeValidationRule(rule.id)} aria-label="Remove validation rule">×</button>
+                  </div>
+                {/each}
+              </div>
+            {/if}
             <div class="result-list">
               {#each validationResults as result}
                 <button type="button" class="result-row" onclick={() => jumpToResult(result)}>
@@ -2144,12 +3101,101 @@
               {/each}
             </div>
           </div>
+        {:else if activePanel === 'filter'}
+          <div class="panel-body form-grid">
+            <p class="panel-note">Filters the current selected range: {rangeLabel(currentRange)}.</p>
+            <label class="check-row"><input type="checkbox" bind:checked={filterHasHeader} /> First row is headers</label>
+            <label>Column
+              <select class="panel-input" bind:value={filterColumn}>
+                {#each Array(currentRange.endCol - currentRange.startCol + 1) as _, offset}
+                  {@const col = currentRange.startCol + offset}
+                  <option value={String(col)}>{colLabel(col)} {getCellValue(currentRange.startRow, col) ? `- ${getCellValue(currentRange.startRow, col)}` : ''}</option>
+                {/each}
+              </select>
+            </label>
+            <label>Condition
+              <select class="panel-input" bind:value={filterCondition}>
+                <option>Contains</option>
+                <option>Equals</option>
+                <option>NotEquals</option>
+                <option>StartsWith</option>
+                <option>EndsWith</option>
+                <option>GreaterThan</option>
+                <option>LessThan</option>
+                <option>Empty</option>
+                <option>NotEmpty</option>
+              </select>
+            </label>
+            {#if filterCondition !== 'Empty' && filterCondition !== 'NotEmpty'}
+              <label>Value<input class="panel-input" bind:value={filterValue} placeholder="Filter value" /></label>
+            {/if}
+            <div class="panel-actions">
+              <button type="button" class="primary-btn" onclick={applyFilter}>Apply Filter</button>
+              <button type="button" class="secondary-btn" onclick={clearFilter}>Clear Filter</button>
+            </div>
+            {#if activeFilterLabel}
+              <p class="panel-note">Active filter: {activeFilterLabel}</p>
+            {/if}
+          </div>
+        {:else if activePanel === 'namedRanges'}
+          <div class="panel-body form-grid">
+            <p class="panel-note">Current selection: {rangeLabel(currentRange)}.</p>
+            <label>Name<input class="panel-input" bind:value={namedRangeName} placeholder="Revenue_Q1" /></label>
+            <div class="panel-actions">
+              <button type="button" class="primary-btn" onclick={addNamedRange}>Add Named Range</button>
+            </div>
+            {#if namedRanges.length > 0}
+              <div class="rule-list">
+                {#each namedRanges as named}
+                  <div class="rule-row">
+                    <button type="button" class="result-row" onclick={() => selectNamedRange(named)}>
+                      <span>{named.name}</span>
+                      <span>{rangeLabel(named.range)}</span>
+                    </button>
+                    <button type="button" class="secondary-btn" onclick={() => insertNamedRangeReference(named)}>Insert Ref</button>
+                    <button type="button" class="icon-btn small" onclick={() => removeNamedRange(named.id)} aria-label="Remove named range">×</button>
+                  </div>
+                {/each}
+              </div>
+            {/if}
+          </div>
+        {:else if activePanel === 'structure'}
+          <div class="panel-body form-grid">
+            <p class="panel-note">Active cell: {cellKey(selectedRow, selectedCol)}. Row and column operations shift existing cells and are undoable.</p>
+            <div class="panel-actions">
+              <button type="button" class="primary-btn" onclick={insertRowAbove}>Insert Row Above</button>
+              <button type="button" class="secondary-btn" onclick={deleteSelectedRow}>Delete Row</button>
+              <button type="button" class="primary-btn" onclick={insertColumnLeft}>Insert Column Left</button>
+              <button type="button" class="secondary-btn" onclick={deleteSelectedColumn}>Delete Column</button>
+            </div>
+            <div class="panel-actions">
+              <button type="button" class="secondary-btn" onclick={freezePanesAtSelection}>Freeze Panes at Selection</button>
+              <button type="button" class="secondary-btn" onclick={unfreezePanes}>Unfreeze Panes</button>
+            </div>
+            <p class="panel-note">Frozen rows: {frozenRowCount}. Frozen columns: {frozenColCount}.</p>
+          </div>
+        {:else if activePanel === 'templates'}
+          <div class="panel-body form-grid">
+            <p class="panel-note">Templates insert practical starter tables at the current selection.</p>
+            <div class="template-grid">
+              {#each Object.entries(TEMPLATES) as [key, template]}
+                <button type="button" class="template-card" onclick={() => applyTemplate(key)}>
+                  <span>{template.title}</span>
+                  <small>{template.rows.length} rows × {template.rows[0].length} columns</small>
+                </button>
+              {/each}
+            </div>
+          </div>
         {:else if activePanel === 'conditional'}
           <div class="panel-body form-grid">
+            <label>Rule name<input class="panel-input" bind:value={conditionalRuleName} /></label>
             <label>Condition
               <select class="panel-input" bind:value={conditionalType}>
                 <option>CellValue</option>
                 <option>TextContains</option>
+                <option>TextNotContains</option>
+                <option>TextBeginsWith</option>
+                <option>TextEndsWith</option>
                 <option>Blanks</option>
                 <option>NoBlanks</option>
                 <option>Duplicate</option>
@@ -2169,9 +3215,22 @@
             <label>Second value<input class="panel-input" bind:value={conditionalValue2} /></label>
             <label>Fill color<input class="panel-input" type="color" bind:value={conditionalFill} /></label>
             <div class="panel-actions">
-              <button type="button" class="primary-btn" onclick={applyConditionalFormat}>Apply to Matches</button>
+              <button type="button" class="primary-btn" onclick={applyConditionalFormat}>Save Live Rule</button>
             </div>
-            <p class="panel-note">Applied to {conditionalMatches.length} cells. These are static formats based on the current values.</p>
+            <p class="panel-note">{conditionalMatches.length} current cell{conditionalMatches.length === 1 ? '' : 's'} match the last saved rule.</p>
+            {#if conditionalRules.length > 0}
+              <div class="rule-list">
+                {#each conditionalRules as stored}
+                  <div class="rule-row">
+                    <button type="button" class="result-row" onclick={() => selectRange(tupleToRange(stored.rule.range))}>
+                      <span>{rangeLabel(tupleToRange(stored.rule.range))}</span>
+                      <span>{stored.label}: {stored.rule.condition_type}</span>
+                    </button>
+                    <button type="button" class="icon-btn small" onclick={() => removeConditionalRule(stored.id)} aria-label="Remove conditional rule">×</button>
+                  </div>
+                {/each}
+              </div>
+            {/if}
           </div>
         {:else if activePanel === 'print'}
           <div class="panel-body form-grid">

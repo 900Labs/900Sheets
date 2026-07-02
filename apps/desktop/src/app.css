@@ -465,6 +465,10 @@ body {
   z-index: 2;
 }
 
+.cell.frozen {
+  box-shadow: inset -1px 0 var(--border-strong), inset 0 -1px var(--border-strong);
+}
+
 .cell-value {
   overflow: hidden;
   text-overflow: ellipsis;
@@ -797,6 +801,78 @@ textarea.panel-input {
 .function-category {
   color: var(--text-muted);
   font-size: 12px;
+}
+
+.function-syntax,
+.function-description,
+.function-example {
+  display: block;
+  margin-top: 2px;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.25;
+}
+
+.function-syntax,
+.function-example {
+  font-family: ui-monospace, 'SF Mono', Consolas, monospace;
+}
+
+.rule-list {
+  display: grid;
+  gap: 6px;
+  max-height: 280px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px;
+  background: var(--bg-alt);
+}
+
+.rule-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 6px;
+}
+
+.icon-btn.small {
+  width: 24px;
+  height: 24px;
+  font-size: 14px;
+}
+
+.template-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 8px;
+}
+
+.template-card {
+  display: grid;
+  gap: 4px;
+  min-height: 72px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px;
+  background: var(--bg);
+  color: var(--text);
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+}
+
+.template-card:hover {
+  border-color: var(--accent-border);
+  background: var(--accent-bg);
+}
+
+.template-card span {
+  font-weight: 650;
+}
+
+.template-card small {
+  color: var(--text-muted);
 }
 
 .chart-preview {
