@@ -32,20 +32,280 @@
   let errorMessage: string = $state('')
   let currentFilePath: string | null = $state(null)
   let cellFormats: CellFormatMap = $state({})
-  let fileMenuOpen: boolean = $state(false)
+  type MenuKey = 'file' | 'edit' | 'view' | 'insert' | 'format' | 'data' | 'tools' | 'help'
+  type PanelKey = 'functions' | 'find' | 'chart' | 'pivot' | 'validation' | 'conditional' | 'print' | 'protection' | 'comment' | 'goalSeek' | 'shortcuts' | 'about'
+  type MenuAction =
+    | 'newWorkbook' | 'openXlsx' | 'importCsv' | 'importJson' | 'saveXlsx' | 'exportCsv' | 'exportJson' | 'exportPdf'
+    | 'undo' | 'redo' | 'cut' | 'copy' | 'paste' | 'delete' | 'findReplace'
+    | 'toggleFormulaBar' | 'toggleGridlines' | 'toggleCompact' | 'zoomIn' | 'zoomOut' | 'zoomReset'
+    | 'functions' | 'addSheet' | 'comment' | 'chart' | 'pivot'
+    | 'bold' | 'italic' | 'underline' | 'strike' | 'alignLeft' | 'alignCenter' | 'alignRight' | 'wrapText' | 'fillYellow' | 'fillGreen' | 'fillRed' | 'textBlue' | 'textRed' | 'conditional'
+    | 'sortAsc' | 'sortDesc' | 'validation'
+    | 'protection' | 'lockRange' | 'unlockRange' | 'goalSeek' | 'shortcuts' | 'about' | 'notReady'
+
+  interface MenuItem {
+    label: string
+    action: MenuAction
+    shortcut?: string
+    disabled?: boolean
+  }
+
+  interface MenuDefinition {
+    key: MenuKey
+    label: string
+    sections: MenuItem[][]
+  }
+
+  interface SearchResultData {
+    row: number
+    col: number
+    matched_text: string
+  }
+
+  interface ValidationErrorData {
+    row: number
+    col: number
+    error: string
+  }
+
+  interface ChartResult {
+    title: string
+    chart_type: string
+    svg: string
+  }
+
+  interface ColumnInfo {
+    col: number
+    name: string
+  }
+
+  interface GoalSeekResult {
+    success: boolean
+    input_value: number
+    achieved_value: number
+    iterations: number
+    error?: string | null
+  }
+
+  interface CellComment {
+    row: number
+    col: number
+    text: string
+    author: string
+    visible: boolean
+  }
+
+  let openMenu: MenuKey | null = $state(null)
   let formulaMenuOpen: boolean = $state(false)
+  let formulaMenuX: number = $state(0)
+  let formulaMenuY: number = $state(0)
+  let activePanel: PanelKey | null = $state(null)
+  let showFormulaBar: boolean = $state(true)
+  let showGridlines: boolean = $state(true)
+  let compactControls: boolean = $state(false)
+  let zoomPercent: number = $state(100)
+  let findQuery: string = $state('')
+  let replaceValue: string = $state('')
+  let findMatchCase: boolean = $state(false)
+  let findResults: SearchResultData[] = $state([])
+  let functionSearch: string = $state('')
+  let chartTitle: string = $state('Chart')
+  let chartType: string = $state('Column')
+  let chartSeriesName: string = $state('Series 1')
+  let chartSvg: string = $state('')
+  let pivotAggregation: string = $state('Sum')
+  let pivotColumns: ColumnInfo[] = $state([])
+  let validationType: string = $state('WholeNumber')
+  let validationOperator: string = $state('Between')
+  let validationFormula1: string = $state('0')
+  let validationFormula2: string = $state('100')
+  let validationSource: string = $state('')
+  let validationResults: ValidationErrorData[] = $state([])
+  let conditionalType: string = $state('CellValue')
+  let conditionalOperator: string = $state('GreaterThan')
+  let conditionalValue1: string = $state('0')
+  let conditionalValue2: string = $state('')
+  let conditionalFill: string = $state('#fef3c7')
+  let conditionalMatches: Array<[number, number]> = $state([])
+  let printPageSize: string = $state('Letter')
+  let printOrientation: string = $state('Portrait')
+  let printPageCount: number | null = $state(null)
+  let protectionPassword: string = $state('')
+  let commentText: string = $state('')
+  let commentAuthor: string = $state('900Sheets user')
+  let currentComment: CellComment | null = $state(null)
+  let allComments: CellComment[] = $state([])
+  let goalSeekTargetCell: string = $state('A1')
+  let goalSeekInputCell: string = $state('A2')
+  let goalSeekTargetValue: string = $state('0')
+  let goalSeekResult: GoalSeekResult | null = $state(null)
   let dragScrollTimer: ReturnType<typeof setInterval> | null = null
   let dragScrollDir: 'down' | 'up' | 'left' | 'right' | null = null
   let gridContainerEl: HTMLElement | null = $state(null)
 
   const FORMULA_FUNCTIONS: Record<string, string[]> = {
-    Math: ['SUM', 'AVERAGE', 'MIN', 'MAX', 'COUNT', 'COUNTA', 'PRODUCT', 'ABS', 'ROUND', 'ROUNDUP', 'ROUNDDOWN', 'FLOOR', 'CEILING', 'MOD', 'POWER', 'SQRT', 'INT', 'EXP', 'LN', 'LOG10', 'LOG', 'LOG2', 'PI', 'RAND', 'RANDBETWEEN', 'SIGN', 'TRUNC', 'QUOTIENT', 'GCD', 'LCM', 'COMBIN', 'PERMUT', 'FACT', 'FACTDOUBLE'],
+    Math: ['SUM', 'AVERAGE', 'MIN', 'MAX', 'COUNT', 'COUNTA', 'PRODUCT', 'ABS', 'ROUND', 'ROUNDUP', 'ROUNDDOWN', 'FLOOR', 'CEILING', 'MOD', 'POWER', 'SQRT', 'SQRTPI', 'INT', 'EXP', 'LN', 'LOG10', 'LOG', 'LOG2', 'PI', 'RAND', 'RANDBETWEEN', 'SIGN', 'TRUNC', 'QUOTIENT', 'GCD', 'LCM', 'COMBIN', 'COMBINA', 'PERMUT', 'PERMUTA', 'FACT', 'FACTDOUBLE', 'MROUND', 'MULTINOMIAL', 'SERIESSUM'],
+    Trig: ['SIN', 'COS', 'TAN', 'ASIN', 'ACOS', 'ATAN', 'ATAN2', 'DEGREES', 'RADIANS', 'SINH', 'COSH', 'TANH', 'ASINH', 'ACOSH', 'ATANH'],
     Statistical: ['MEDIAN', 'MODE', 'STDEV', 'STDEVP', 'VAR', 'VARP', 'LARGE', 'SMALL', 'RANK', 'PERCENTILE', 'QUARTILE', 'PERCENTRANK', 'FORECAST', 'SLOPE', 'INTERCEPT', 'CORREL', 'COVAR', 'AVERAGEIF'],
     Logical: ['IF', 'AND', 'OR', 'NOT', 'TRUE', 'FALSE', 'IFERROR', 'IFNA', 'XOR'],
-    Text: ['LEN', 'UPPER', 'LOWER', 'PROPER', 'TRIM', 'LEFT', 'RIGHT', 'MID', 'CONCATENATE', 'SUBSTITUTE', 'REPT', 'FIND', 'SEARCH', 'REPLACE', 'TEXT', 'VALUE', 'CONCAT', 'TEXTJOIN', 'EXACT', 'CHAR', 'CODE', 'CLEAN', 'FIXED'],
-    Date: ['DATE', 'TIME', 'NOW', 'TODAY', 'YEAR', 'MONTH', 'DAY', 'HOUR', 'MINUTE', 'SECOND', 'WEEKDAY', 'WEEKNUM', 'DATEVALUE', 'TIMEVALUE', 'EDATE', 'EOMONTH', 'DATEDIF', 'DAYS'],
-    Info: ['ISNUMBER', 'ISTEXT', 'ISLOGICAL', 'ISERROR', 'ISBLANK', 'ISODD', 'ISEVEN', 'NA', 'TYPE'],
+    Text: ['LEN', 'UPPER', 'LOWER', 'PROPER', 'TRIM', 'LEFT', 'RIGHT', 'MID', 'MIDB', 'CONCATENATE', 'SUBSTITUTE', 'REPT', 'FIND', 'SEARCH', 'REPLACE', 'TEXT', 'VALUE', 'CONCAT', 'TEXTJOIN', 'EXACT', 'CHAR', 'CODE', 'CLEAN', 'FIXED', 'T', 'N', 'UNICODE', 'TEXTBEFORE', 'TEXTAFTER'],
+    Date: ['DATE', 'TIME', 'NOW', 'TODAY', 'YEAR', 'MONTH', 'DAY', 'HOUR', 'MINUTE', 'SECOND', 'WEEKDAY', 'WEEKNUM', 'ISOWEEKNUM', 'DATEVALUE', 'TIMEVALUE', 'EDATE', 'EOMONTH', 'DATEDIF', 'DAYS'],
+    Lookup: ['VLOOKUP', 'HLOOKUP', 'INDEX', 'MATCH', 'CHOOSE', 'ROW', 'COLUMN', 'ROWS', 'COLUMNS', 'ADDRESS', 'LOOKUP'],
+    Financial: ['PMT', 'PV', 'FV', 'NPV', 'RATE', 'NPER', 'SLN', 'SYD', 'DDB'],
+    Engineering: ['BIN2DEC', 'DEC2BIN', 'HEX2DEC', 'DEC2HEX', 'OCT2DEC', 'DEC2OCT', 'BITAND', 'BITOR', 'BITXOR', 'BITLSHIFT', 'BITRSHIFT', 'GESTEP', 'DELTA'],
+    Info: ['ISNUMBER', 'ISTEXT', 'ISLOGICAL', 'ISERROR', 'ISEMPTY', 'ISBLANK', 'ISNONTEXT', 'ISODD', 'ISEVEN', 'NA', 'TYPE'],
   }
+
+  const MENU_DEFINITIONS: MenuDefinition[] = [
+    {
+      key: 'file',
+      label: 'File',
+      sections: [
+        [
+          { label: 'New Workbook', action: 'newWorkbook', shortcut: 'Ctrl+N' },
+          { label: 'Open XLSX...', action: 'openXlsx', shortcut: 'Ctrl+O' },
+        ],
+        [
+          { label: 'Import CSV...', action: 'importCsv' },
+          { label: 'Import JSON...', action: 'importJson' },
+        ],
+        [
+          { label: 'Save as XLSX...', action: 'saveXlsx', shortcut: 'Ctrl+S' },
+          { label: 'Export as CSV...', action: 'exportCsv' },
+          { label: 'Export as JSON...', action: 'exportJson' },
+          { label: 'Export as PDF...', action: 'exportPdf', shortcut: 'Ctrl+P' },
+        ],
+      ],
+    },
+    {
+      key: 'edit',
+      label: 'Edit',
+      sections: [
+        [
+          { label: 'Undo', action: 'undo', shortcut: 'Ctrl+Z' },
+          { label: 'Redo', action: 'redo', shortcut: 'Ctrl+Y' },
+        ],
+        [
+          { label: 'Cut', action: 'cut', shortcut: 'Ctrl+X' },
+          { label: 'Copy', action: 'copy', shortcut: 'Ctrl+C' },
+          { label: 'Paste', action: 'paste', shortcut: 'Ctrl+V' },
+          { label: 'Delete Selection', action: 'delete', shortcut: 'Delete' },
+        ],
+        [
+          { label: 'Find and Replace...', action: 'findReplace', shortcut: 'Ctrl+F' },
+        ],
+      ],
+    },
+    {
+      key: 'view',
+      label: 'View',
+      sections: [
+        [
+          { label: 'Toggle Formula Bar', action: 'toggleFormulaBar' },
+          { label: 'Toggle Gridlines', action: 'toggleGridlines' },
+          { label: 'Compact Controls', action: 'toggleCompact' },
+        ],
+        [
+          { label: 'Zoom In', action: 'zoomIn' },
+          { label: 'Zoom Out', action: 'zoomOut' },
+          { label: 'Reset Zoom', action: 'zoomReset' },
+        ],
+        [
+          { label: 'Freeze Panes', action: 'notReady', disabled: true },
+        ],
+      ],
+    },
+    {
+      key: 'insert',
+      label: 'Insert',
+      sections: [
+        [
+          { label: 'Function...', action: 'functions' },
+          { label: 'Chart...', action: 'chart' },
+          { label: 'Pivot Table...', action: 'pivot' },
+          { label: 'Comment...', action: 'comment' },
+        ],
+        [
+          { label: 'New Sheet', action: 'addSheet', shortcut: 'Shift+F11' },
+          { label: 'Rows / Columns', action: 'notReady', disabled: true },
+        ],
+      ],
+    },
+    {
+      key: 'format',
+      label: 'Format',
+      sections: [
+        [
+          { label: 'Bold', action: 'bold', shortcut: 'Ctrl+B' },
+          { label: 'Italic', action: 'italic', shortcut: 'Ctrl+I' },
+          { label: 'Underline', action: 'underline', shortcut: 'Ctrl+U' },
+          { label: 'Wrap Text', action: 'wrapText' },
+        ],
+        [
+          { label: 'Align Left', action: 'alignLeft' },
+          { label: 'Align Center', action: 'alignCenter' },
+          { label: 'Align Right', action: 'alignRight' },
+        ],
+        [
+          { label: 'Yellow Fill', action: 'fillYellow' },
+          { label: 'Green Fill', action: 'fillGreen' },
+          { label: 'Red Fill', action: 'fillRed' },
+          { label: 'Blue Text', action: 'textBlue' },
+          { label: 'Red Text', action: 'textRed' },
+        ],
+        [
+          { label: 'Conditional Formatting...', action: 'conditional' },
+        ],
+      ],
+    },
+    {
+      key: 'data',
+      label: 'Data',
+      sections: [
+        [
+          { label: 'Sort Ascending', action: 'sortAsc' },
+          { label: 'Sort Descending', action: 'sortDesc' },
+          { label: 'Find and Replace...', action: 'findReplace' },
+        ],
+        [
+          { label: 'Data Validation...', action: 'validation' },
+          { label: 'Pivot Table...', action: 'pivot' },
+          { label: 'Goal Seek...', action: 'goalSeek' },
+        ],
+        [
+          { label: 'Filter', action: 'notReady', disabled: true },
+          { label: 'Remove Duplicates', action: 'notReady', disabled: true },
+          { label: 'Named Ranges', action: 'notReady', disabled: true },
+        ],
+      ],
+    },
+    {
+      key: 'tools',
+      label: 'Tools',
+      sections: [
+        [
+          { label: 'Protect Sheet...', action: 'protection' },
+          { label: 'Lock Selected Range', action: 'lockRange' },
+          { label: 'Unlock Selected Range', action: 'unlockRange' },
+        ],
+        [
+          { label: 'Goal Seek...', action: 'goalSeek' },
+          { label: 'Scenarios', action: 'notReady', disabled: true },
+          { label: 'Locale Settings', action: 'notReady', disabled: true },
+        ],
+      ],
+    },
+    {
+      key: 'help',
+      label: 'Help',
+      sections: [
+        [
+          { label: 'Keyboard Shortcuts', action: 'shortcuts' },
+          { label: 'About 900Sheets', action: 'about' },
+        ],
+      ],
+    },
+  ]
 
   const undoRedo = new UndoRedoStack()
 
@@ -79,9 +339,107 @@
   let isMultiSelection: boolean = $derived(
     currentRange.startRow !== currentRange.endRow || currentRange.startCol !== currentRange.endCol
   )
+  let formulaFunctionEntries = $derived(
+    Object.entries(FORMULA_FUNCTIONS).flatMap(([category, funcs]) =>
+      funcs.map((name) => ({ category, name }))
+    )
+  )
+  let filteredFormulaFunctions = $derived(
+    formulaFunctionEntries.filter((fn) => {
+      const query = functionSearch.trim().toLowerCase()
+      if (!query) return true
+      return fn.name.toLowerCase().includes(query) || fn.category.toLowerCase().includes(query)
+    })
+  )
+  let selectionStats = $derived(calculateSelectionStats())
 
   function filename(path: string): string {
     return path.split(/[\\/]/).pop() || path
+  }
+
+  function calculateSelectionStats() {
+    const r = normalizeRange(currentRange)
+    let count = 0
+    let numericCount = 0
+    let sum = 0
+    let min = Number.POSITIVE_INFINITY
+    let max = Number.NEGATIVE_INFINITY
+    for (let row = r.startRow; row <= r.endRow; row++) {
+      for (let col = r.startCol; col <= r.endCol; col++) {
+        const raw = cellContents[cellKey(row, col)]
+        if (raw == null || raw === '') continue
+        count += 1
+        const value = Number(raw)
+        if (Number.isFinite(value)) {
+          numericCount += 1
+          sum += value
+          min = Math.min(min, value)
+          max = Math.max(max, value)
+        }
+      }
+    }
+    return {
+      count,
+      numericCount,
+      sum,
+      average: numericCount > 0 ? sum / numericCount : 0,
+      min: numericCount > 0 ? min : 0,
+      max: numericCount > 0 ? max : 0,
+    }
+  }
+
+  function formatStat(value: number): string {
+    if (!Number.isFinite(value)) return ''
+    return Number.isInteger(value) ? String(value) : value.toFixed(2)
+  }
+
+  function colIndexFromLabel(label: string): number | null {
+    const cleaned = label.trim().toUpperCase()
+    if (!/^[A-Z]+$/.test(cleaned)) return null
+    let value = 0
+    for (const ch of cleaned) {
+      value = value * 26 + (ch.charCodeAt(0) - 64)
+    }
+    return value - 1
+  }
+
+  function parseCellAddress(address: string): { row: number; col: number } | null {
+    const match = address.trim().toUpperCase().match(/^([A-Z]+)([1-9]\d*)$/)
+    if (!match) return null
+    const col = colIndexFromLabel(match[1])
+    if (col == null) return null
+    return { row: Number(match[2]) - 1, col }
+  }
+
+  function activeSheetName(): string {
+    return sheets.find((sheet) => sheet.id === activeSheetId)?.name ?? 'Sheet'
+  }
+
+  function defaultPrintConfig() {
+    return {
+      page_size: printPageSize,
+      orientation: printOrientation,
+      margins: {
+        top: 36,
+        bottom: 36,
+        left: 36,
+        right: 36,
+        header: 18,
+        footer: 18,
+      },
+      scaling: 'FitToPageWidth',
+      header: { left: activeSheetName(), center: null, right: null },
+      footer: { left: null, center: 'Page {page} of {pages}', right: null },
+      gridlines: showGridlines,
+      headings: true,
+      print_area: isMultiSelection
+        ? [currentRange.startRow, currentRange.startCol, currentRange.endRow, currentRange.endCol]
+        : null,
+      repeat_rows: null,
+      repeat_cols: null,
+      horizontal_center: false,
+      vertical_center: false,
+    }
   }
 
   function selectedPath(path: string | string[] | null): string | null {
@@ -250,16 +608,29 @@
     }
   }
 
-  function toggleFileMenu() {
-    fileMenuOpen = !fileMenuOpen
+  function toggleMenu(menu: MenuKey) {
+    openMenu = openMenu === menu ? null : menu
+    formulaMenuOpen = false
   }
 
-  function closeFileMenu() {
-    fileMenuOpen = false
+  function closeMenus() {
+    openMenu = null
   }
 
-  function toggleFormulaMenu() {
+  function closePopovers() {
+    openMenu = null
+    formulaMenuOpen = false
+  }
+
+  function toggleFormulaMenu(event: MouseEvent) {
+    const trigger = event.currentTarget as HTMLElement
+    const rect = trigger.getBoundingClientRect()
+    const toolbarRect = trigger.closest('.format-toolbar')?.getBoundingClientRect()
+    const menuWidth = 220
+    formulaMenuX = Math.max(8, Math.min(rect.left, window.innerWidth - menuWidth - 8))
+    formulaMenuY = Math.max(rect.bottom + 4, (toolbarRect?.bottom ?? rect.bottom) + 4)
     formulaMenuOpen = !formulaMenuOpen
+    openMenu = null
   }
 
   function closeFormulaMenu() {
@@ -268,6 +639,7 @@
 
   function insertFunction(name: string) {
     closeFormulaMenu()
+    activePanel = null
     const prefix = '='
     const snippet = `${name}()`
     if (editingCell) {
@@ -281,6 +653,29 @@
       startEdit(selectedRow, selectedCol)
       editValue = prefix + snippet
     }
+  }
+
+  function openPanel(panel: PanelKey) {
+    activePanel = panel
+    closePopovers()
+    if (panel === 'comment') {
+      loadCommentPanel()
+    }
+    if (panel === 'pivot') {
+      loadPivotColumns()
+    }
+    if (panel === 'chart') {
+      chartSvg = ''
+      const r = normalizeRange(currentRange)
+      chartTitle = `${activeSheetName()} ${rangeLabel(r)}`
+    }
+    if (panel === 'print') {
+      printPageCount = null
+    }
+  }
+
+  function closePanel() {
+    activePanel = null
   }
 
   function isInSelection(row: number, col: number): boolean {
@@ -553,48 +948,75 @@
     }
 
     const ctrl = e.ctrlKey || e.metaKey
+    const key = e.key.toLowerCase()
 
-    if (ctrl && e.key === 'z' && !e.shiftKey) {
+    if (ctrl && key === 'n') {
+      e.preventDefault()
+      handleNewWorkbook()
+      return
+    }
+    if (ctrl && key === 'o') {
+      e.preventDefault()
+      handleOpenXlsx()
+      return
+    }
+    if (ctrl && key === 's') {
+      e.preventDefault()
+      handleSaveXlsx()
+      return
+    }
+    if (ctrl && key === 'p') {
+      e.preventDefault()
+      openPanel('print')
+      return
+    }
+    if (ctrl && key === 'f') {
+      e.preventDefault()
+      openPanel('find')
+      return
+    }
+
+    if (ctrl && key === 'z' && !e.shiftKey) {
       e.preventDefault()
       doUndo()
       return
     }
-    if ((ctrl && e.key === 'y') || (ctrl && e.shiftKey && e.key === 'Z')) {
+    if ((ctrl && key === 'y') || (ctrl && e.shiftKey && key === 'z')) {
       e.preventDefault()
       doRedo()
       return
     }
-    if (ctrl && e.key === 'c') {
+    if (ctrl && key === 'c') {
       e.preventDefault()
       copySelection(false)
       return
     }
-    if (ctrl && e.key === 'b') {
+    if (ctrl && key === 'b') {
       e.preventDefault()
       toggleBold()
       return
     }
-    if (ctrl && e.key === 'i') {
+    if (ctrl && key === 'i') {
       e.preventDefault()
       toggleItalic()
       return
     }
-    if (ctrl && e.key === 'u') {
+    if (ctrl && key === 'u') {
       e.preventDefault()
       toggleUnderline()
       return
     }
-    if (ctrl && e.key === 'x') {
+    if (ctrl && key === 'x') {
       e.preventDefault()
       copySelection(true)
       return
     }
-    if (ctrl && e.key === 'v') {
+    if (ctrl && key === 'v') {
       e.preventDefault()
       pasteFromSystemClipboard()
       return
     }
-    if (ctrl && e.key === 'a') {
+    if (ctrl && key === 'a') {
       e.preventDefault()
       selectionStart = { row: 0, col: 0 }
       selectionEnd = { row: ROWS - 1, col: COLS - 1 }
@@ -918,97 +1340,558 @@
     }
   }
 
+  async function handleExportPdf() {
+    try {
+      const path = await save({
+        defaultPath: `${activeSheetName()}.pdf`,
+        filters: [{ name: 'PDF', extensions: ['pdf'] }],
+      })
+      if (!path) return
+      await invoke('save_pdf_to_file', {
+        sheetId: activeSheetId,
+        config: defaultPrintConfig(),
+        filePath: path,
+      })
+      setStatus(`Exported ${filename(path)}`)
+    } catch (e) {
+      setError(e, 'Failed to export PDF')
+    }
+  }
+
+  async function runFind() {
+    if (!findQuery.trim()) {
+      findResults = []
+      return
+    }
+    try {
+      findResults = await invoke<SearchResultData[]>('find_in_sheet_cmd', {
+        sheetId: activeSheetId,
+        query: findQuery,
+        matchCase: findMatchCase,
+      })
+      setStatus(`${findResults.length} match${findResults.length === 1 ? '' : 'es'} found`)
+      if (findResults[0]) jumpToResult(findResults[0])
+    } catch (e) {
+      setError(e, 'Find failed')
+    }
+  }
+
+  async function runReplace() {
+    if (!findQuery.trim()) return
+    try {
+      const count = await invoke<number>('replace_in_sheet_cmd', {
+        sheetId: activeSheetId,
+        find: findQuery,
+        replace: replaceValue,
+        matchCase: findMatchCase,
+      })
+      await refreshSheetData()
+      findResults = []
+      setStatus(`Replaced ${count} match${count === 1 ? '' : 'es'}`)
+    } catch (e) {
+      setError(e, 'Replace failed')
+    }
+  }
+
+  function jumpToResult(result: SearchResultData | ValidationErrorData | { row: number; col: number }) {
+    selectCell(result.row, result.col)
+  }
+
+  async function runChart() {
+    const r = normalizeRange(currentRange)
+    const xCol = r.startCol
+    const yCol = Math.min(r.startCol + 1, r.endCol)
+    if (xCol === yCol || r.startRow === r.endRow) {
+      setError('Select at least two columns and two rows before creating a chart', 'Chart unavailable')
+      return
+    }
+    try {
+      const result = await invoke<ChartResult>('create_chart', {
+        sheetId: activeSheetId,
+        config: {
+          title: chartTitle || 'Chart',
+          chart_type: chartType,
+          series: [{
+            name: chartSeriesName || colLabel(yCol),
+            x_column: xCol,
+            y_column: yCol,
+            color: null,
+          }],
+          header_row: r.startRow,
+          data_start_row: Math.min(r.startRow + 1, r.endRow),
+          data_end_row: r.endRow,
+          x_axis_label: colLabel(xCol),
+          y_axis_label: colLabel(yCol),
+          legend_position: 'Bottom',
+        },
+      })
+      chartSvg = result.svg
+      setStatus(`Created ${chartType.toLowerCase()} chart from ${rangeLabel(r)}`)
+    } catch (e) {
+      setError(e, 'Chart failed')
+    }
+  }
+
+  async function loadPivotColumns() {
+    const r = normalizeRange(currentRange)
+    try {
+      pivotColumns = await invoke<ColumnInfo[]>('get_pivot_columns', {
+        sheetId: activeSheetId,
+        headerRow: r.startRow,
+        startCol: r.startCol,
+        endCol: r.endCol,
+      })
+    } catch {
+      pivotColumns = []
+    }
+  }
+
+  async function runPivotSheet() {
+    const r = normalizeRange(currentRange)
+    if (r.startRow === r.endRow || r.startCol === r.endCol) {
+      setError('Select a table with headers, row labels, and at least one value column', 'Pivot unavailable')
+      return
+    }
+    const rowCol = pivotColumns[0]?.col ?? r.startCol
+    const valueCol = pivotColumns[pivotColumns.length - 1]?.col ?? r.endCol
+    try {
+      const result = await invoke<SheetInfo[]>('create_pivot_sheet', {
+        sheetId: activeSheetId,
+        config: {
+          source_sheet: activeSheetId,
+          data_range: [r.startRow, r.startCol, r.endRow, r.endCol],
+          header_row: r.startRow,
+          row_fields: [{ column: rowCol, label: pivotColumns.find((c) => c.col === rowCol)?.name ?? colLabel(rowCol) }],
+          column_fields: [],
+          value_fields: [{
+            column: valueCol,
+            label: pivotColumns.find((c) => c.col === valueCol)?.name ?? colLabel(valueCol),
+            aggregation: pivotAggregation,
+          }],
+          filter_field: null,
+          filter_values: [],
+        },
+      })
+      await loadSheetList(result, result[result.length - 1]?.id ?? activeSheetId)
+      setStatus(`Created pivot sheet from ${rangeLabel(r)}`)
+      closePanel()
+    } catch (e) {
+      setError(e, 'Pivot failed')
+    }
+  }
+
+  function buildValidation() {
+    return {
+      validation_type: validationType,
+      operator: validationOperator,
+      formula1: validationType === 'List' ? null : validationFormula1,
+      formula2: validationType === 'List' || validationOperator !== 'Between' && validationOperator !== 'NotBetween' ? null : validationFormula2,
+      source: validationType === 'List' ? validationSource : null,
+      allow_blank: true,
+      show_dropdown: validationType === 'List',
+      error_style: 'Stop',
+      error_title: 'Invalid value',
+      error_message: 'The selected value does not match the validation rule.',
+      prompt_title: null,
+      prompt_message: null,
+    }
+  }
+
+  async function runValidation() {
+    const r = normalizeRange(currentRange)
+    try {
+      validationResults = await invoke<ValidationErrorData[]>('validate_range_cmd', {
+        sheetId: activeSheetId,
+        rule: {
+          range: [r.startRow, r.startCol, r.endRow, r.endCol],
+          validation: buildValidation(),
+        },
+      })
+      setStatus(validationResults.length === 0 ? `Validation passed for ${rangeLabel(r)}` : `${validationResults.length} validation issue${validationResults.length === 1 ? '' : 's'} found`)
+    } catch (e) {
+      setError(e, 'Validation failed')
+    }
+  }
+
+  function buildConditionalRule() {
+    const r = normalizeRange(currentRange)
+    return {
+      id: `rule-${Date.now()}`,
+      condition_type: conditionalType,
+      range: [r.startRow, r.startCol, r.endRow, r.endCol],
+      operator: conditionalType === 'CellValue' ? conditionalOperator : null,
+      value1: conditionalType === 'Blanks' || conditionalType === 'NoBlanks' || conditionalType === 'Duplicate' ? null : conditionalValue1,
+      value2: conditionalOperator === 'Between' || conditionalOperator === 'NotBetween' ? conditionalValue2 : null,
+      format: { bg_color: conditionalFill, bold: true },
+      color_scale_stops: [],
+      bar_color: null,
+      show_bar_value: true,
+      icon_set_type: null,
+      is_top: true,
+      rank: 10,
+      is_above_average: true,
+      std_dev: 0,
+      priority: 0,
+      stop_if_true: false,
+    }
+  }
+
+  async function applyConditionalFormat() {
+    try {
+      const matches = await invoke<Array<[number, number]>>('find_conditional_format_matches', {
+        sheetId: activeSheetId,
+        rule: buildConditionalRule(),
+      })
+      conditionalMatches = matches
+      for (const [row, col] of matches) {
+        const key = cellKey(row, col)
+        const existing = cellFormats[key] ?? {}
+        const next = { ...existing, bg_color: conditionalFill, bold: true }
+        cellFormats[key] = next
+        await invoke('set_cell_format', {
+          sheetId: activeSheetId,
+          row,
+          col,
+          format: next,
+        })
+      }
+      setStatus(`Applied conditional format to ${matches.length} cell${matches.length === 1 ? '' : 's'}`)
+    } catch (e) {
+      setError(e, 'Conditional formatting failed')
+    }
+  }
+
+  async function updatePrintPreview() {
+    try {
+      printPageCount = await invoke<number>('get_page_count', {
+        sheetId: activeSheetId,
+        config: defaultPrintConfig(),
+      })
+      setStatus(`${printPageCount} print page${printPageCount === 1 ? '' : 's'} estimated`)
+    } catch (e) {
+      setError(e, 'Print preview failed')
+    }
+  }
+
+  async function setProtection(protectedSheet: boolean) {
+    if (!protectionPassword) {
+      setError('Enter a password first', 'Protection failed')
+      return
+    }
+    try {
+      if (protectedSheet) {
+        await invoke('protect_sheet', { sheetId: activeSheetId, password: protectionPassword })
+        setStatus('Sheet protected')
+      } else {
+        const ok = await invoke<boolean>('unprotect_sheet', { sheetId: activeSheetId, password: protectionPassword })
+        setStatus(ok ? 'Sheet unprotected' : 'Password did not match')
+      }
+      protectionPassword = ''
+    } catch (e) {
+      setError(e, protectedSheet ? 'Protect sheet failed' : 'Unprotect sheet failed')
+    }
+  }
+
+  async function setRangeLock(locked: boolean) {
+    const r = normalizeRange(currentRange)
+    try {
+      await invoke('lock_cell_range', {
+        sheetId: activeSheetId,
+        startRow: r.startRow,
+        startCol: r.startCol,
+        endRow: r.endRow,
+        endCol: r.endCol,
+        locked,
+      })
+      setStatus(`${locked ? 'Locked' : 'Unlocked'} ${rangeLabel(r)}`)
+    } catch (e) {
+      setError(e, locked ? 'Lock range failed' : 'Unlock range failed')
+    }
+  }
+
+  async function loadCommentPanel() {
+    try {
+      currentComment = await invoke<CellComment | null>('get_cell_comment', {
+        row: selectedRow,
+        col: selectedCol,
+      })
+      commentText = currentComment?.text ?? ''
+      allComments = await invoke<CellComment[]>('list_comments')
+    } catch (e) {
+      setError(e, 'Comment load failed')
+    }
+  }
+
+  async function saveComment() {
+    try {
+      await invoke('add_cell_comment', {
+        row: selectedRow,
+        col: selectedCol,
+        text: commentText,
+        author: commentAuthor || '900Sheets user',
+      })
+      await loadCommentPanel()
+      setStatus(`Saved comment on ${cellKey(selectedRow, selectedCol)}`)
+    } catch (e) {
+      setError(e, 'Comment save failed')
+    }
+  }
+
+  async function removeCurrentComment() {
+    try {
+      await invoke('remove_cell_comment', { row: selectedRow, col: selectedCol })
+      commentText = ''
+      await loadCommentPanel()
+      setStatus(`Removed comment from ${cellKey(selectedRow, selectedCol)}`)
+    } catch (e) {
+      setError(e, 'Comment removal failed')
+    }
+  }
+
+  async function runGoalSeek() {
+    const target = parseCellAddress(goalSeekTargetCell)
+    const input = parseCellAddress(goalSeekInputCell)
+    const targetValue = Number(goalSeekTargetValue)
+    if (!target || !input || !Number.isFinite(targetValue)) {
+      setError('Use addresses like A1 and a numeric target value', 'Goal seek failed')
+      return
+    }
+    try {
+      goalSeekResult = await invoke<GoalSeekResult>('goal_seek_cmd', {
+        sheetId: activeSheetId,
+        config: {
+          target_cell_row: target.row,
+          target_cell_col: target.col,
+          target_value: targetValue,
+          input_cell_row: input.row,
+          input_cell_col: input.col,
+          max_iterations: 100,
+          tolerance: 0.001,
+        },
+      })
+      if (goalSeekResult.success) {
+        const oldValue = cellContents[cellKey(input.row, input.col)] ?? ''
+        const newValue = String(goalSeekResult.input_value)
+        await invoke('set_cell', {
+          sheetId: activeSheetId,
+          row: input.row,
+          col: input.col,
+          value: newValue,
+        })
+        undoRedo.push([{ sheetId: activeSheetId, row: input.row, col: input.col, oldValue, newValue }])
+        updateUndoRedoState()
+        await refreshSheetData()
+        selectCell(input.row, input.col)
+      }
+      setStatus(goalSeekResult.success ? `Goal seek applied ${formatStat(goalSeekResult.input_value)}` : goalSeekResult.error ?? 'Goal seek did not converge')
+    } catch (e) {
+      setError(e, 'Goal seek failed')
+    }
+  }
+
+  async function executeMenuAction(action: MenuAction) {
+    closePopovers()
+    switch (action) {
+      case 'newWorkbook': return handleNewWorkbook()
+      case 'openXlsx': return handleOpenXlsx()
+      case 'importCsv': return handleImportCsv()
+      case 'importJson': return handleImportJson()
+      case 'saveXlsx': return handleSaveXlsx()
+      case 'exportCsv': return handleExportCsv()
+      case 'exportJson': return handleExportJson()
+      case 'exportPdf': return handleExportPdf()
+      case 'undo': return doUndo()
+      case 'redo': return doRedo()
+      case 'cut': return copySelection(true)
+      case 'copy': return copySelection(false)
+      case 'paste': return pasteFromSystemClipboard()
+      case 'delete': return deleteSelection()
+      case 'findReplace': return openPanel('find')
+      case 'toggleFormulaBar': showFormulaBar = !showFormulaBar; return
+      case 'toggleGridlines': showGridlines = !showGridlines; return
+      case 'toggleCompact': compactControls = !compactControls; return
+      case 'zoomIn': zoomPercent = Math.min(150, zoomPercent + 10); return
+      case 'zoomOut': zoomPercent = Math.max(70, zoomPercent - 10); return
+      case 'zoomReset': zoomPercent = 100; return
+      case 'functions': return openPanel('functions')
+      case 'addSheet': return handleAddSheet()
+      case 'comment': return openPanel('comment')
+      case 'chart': return openPanel('chart')
+      case 'pivot': return openPanel('pivot')
+      case 'bold': return toggleBold()
+      case 'italic': return toggleItalic()
+      case 'underline': return toggleUnderline()
+      case 'strike': return toggleStrikethrough()
+      case 'alignLeft': return setAlignment('left')
+      case 'alignCenter': return setAlignment('center')
+      case 'alignRight': return setAlignment('right')
+      case 'wrapText': return applyFormatToSelection({ wrap_text: !getCellFormat(selectedRow, selectedCol).wrap_text })
+      case 'fillYellow': return applyFormatToSelection({ bg_color: '#fef3c7' })
+      case 'fillGreen': return applyFormatToSelection({ bg_color: '#dcfce7' })
+      case 'fillRed': return applyFormatToSelection({ bg_color: '#fee2e2' })
+      case 'textBlue': return applyFormatToSelection({ font_color: '#1d4ed8' })
+      case 'textRed': return applyFormatToSelection({ font_color: '#b91c1c' })
+      case 'conditional': return openPanel('conditional')
+      case 'sortAsc': return handleSort(true)
+      case 'sortDesc': return handleSort(false)
+      case 'validation': return openPanel('validation')
+      case 'protection': return openPanel('protection')
+      case 'lockRange': return setRangeLock(true)
+      case 'unlockRange': return setRangeLock(false)
+      case 'goalSeek': return openPanel('goalSeek')
+      case 'shortcuts': return openPanel('shortcuts')
+      case 'about': return openPanel('about')
+      case 'notReady': setStatus('This workflow is planned but not wired yet'); return
+    }
+  }
+
   onMount(async () => {
     await handleNewWorkbook()
   })
 </script>
 
-<svelte:window onkeydown={handleKeydown} onmouseup={handleMouseUp} onclick={() => { closeFileMenu(); closeFormulaMenu() }} />
+<svelte:window onkeydown={handleKeydown} onmouseup={handleMouseUp} onclick={closePopovers} />
 
-<div class="app">
+<div class="app" class:compact={compactControls} class:no-gridlines={!showGridlines}>
   <div class="toolbar">
     <span class="app-title">900Sheets</span>
-    <div class="toolbar-actions">
-      <div class="menu-wrapper">
-        <button type="button" class="toolbar-btn text" onclick={(e) => { e.stopPropagation(); toggleFileMenu() }} title="File menu">File ▾</button>
-        {#if fileMenuOpen}
-          <div class="dropdown-menu" role="menu" tabindex="-1" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
-            <button type="button" class="dropdown-item" onclick={() => { closeFileMenu(); handleNewWorkbook() }}>New Workbook</button>
-            <button type="button" class="dropdown-item" onclick={() => { closeFileMenu(); handleOpenXlsx() }}>Open XLSX…</button>
-            <div class="dropdown-divider"></div>
-            <button type="button" class="dropdown-item" onclick={() => { closeFileMenu(); handleImportCsv() }}>Import CSV…</button>
-            <button type="button" class="dropdown-item" onclick={() => { closeFileMenu(); handleImportJson() }}>Import JSON…</button>
-            <div class="dropdown-divider"></div>
-            <button type="button" class="dropdown-item" onclick={() => { closeFileMenu(); handleSaveXlsx() }}>Save as XLSX…</button>
-            <button type="button" class="dropdown-item" onclick={() => { closeFileMenu(); handleExportCsv() }}>Export as CSV…</button>
-            <button type="button" class="dropdown-item" onclick={() => { closeFileMenu(); handleExportJson() }}>Export as JSON…</button>
-          </div>
-        {/if}
-      </div>
-      <div class="toolbar-divider"></div>
-      <button type="button" class="toolbar-btn" onclick={doUndo} disabled={!canUndo} title="Undo (Ctrl+Z)">↶</button>
-      <button type="button" class="toolbar-btn" onclick={doRedo} disabled={!canRedo} title="Redo (Ctrl+Y)">↷</button>
-    </div>
+    <nav class="menu-bar" aria-label="Application menus">
+      {#each MENU_DEFINITIONS as menu}
+        <div class="menu-wrapper">
+          <button
+            type="button"
+            class="toolbar-btn text"
+            class:active={openMenu === menu.key}
+            onclick={(e) => { e.stopPropagation(); toggleMenu(menu.key) }}
+          >
+            {menu.label}
+          </button>
+          {#if openMenu === menu.key}
+            <div class="dropdown-menu app-menu" role="menu" tabindex="-1" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
+              {#each menu.sections as section, sectionIndex}
+                {#if sectionIndex > 0}
+                  <div class="dropdown-divider"></div>
+                {/if}
+                {#each section as item}
+                  <button
+                    type="button"
+                    class="dropdown-item menu-item"
+                    disabled={item.disabled}
+                    onclick={(e) => { e.preventDefault(); e.stopPropagation(); executeMenuAction(item.action) }}
+                  >
+                    <span>{item.label}</span>
+                    {#if item.shortcut}
+                      <span class="menu-shortcut">{item.shortcut}</span>
+                    {/if}
+                  </button>
+                {/each}
+              {/each}
+            </div>
+          {/if}
+        </div>
+      {/each}
+    </nav>
+    <div class="toolbar-divider"></div>
+    <button type="button" class="toolbar-btn" onclick={doUndo} disabled={!canUndo} title="Undo (Ctrl+Z)">↶</button>
+    <button type="button" class="toolbar-btn" onclick={doRedo} disabled={!canRedo} title="Redo (Ctrl+Y)">↷</button>
     <div class="toolbar-status" class:error={!!errorMessage}>
       {errorMessage || statusMessage}
     </div>
   </div>
 
   <div class="format-toolbar">
-    <div class="menu-wrapper">
-      <button type="button" class="fmt-btn fx-btn" onclick={(e) => { e.stopPropagation(); toggleFormulaMenu() }} title="Insert function">fx ▾</button>
-      {#if formulaMenuOpen}
-        <div class="dropdown-menu formula-menu" role="menu" tabindex="-1" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
-          {#each Object.entries(FORMULA_FUNCTIONS) as [category, funcs]}
-            <div class="dropdown-category">{category}</div>
-            {#each funcs as fn}
-              <button type="button" class="dropdown-item" onclick={() => insertFunction(fn)}>{fn}</button>
-            {/each}
-          {/each}
-        </div>
-      {/if}
+    <div class="ribbon-group">
+      <button type="button" class="fmt-btn fx-btn" onclick={(e) => { e.stopPropagation(); toggleFormulaMenu(e) }} title="Insert function">fx ▾</button>
+      <button type="button" class="fmt-btn" onclick={() => openPanel('functions')} title="Function browser">Functions</button>
     </div>
     <div class="fmt-divider"></div>
-    <button type="button" class="fmt-btn" onclick={toggleBold} title="Bold (Ctrl+B)"><b>B</b></button>
-    <button type="button" class="fmt-btn" onclick={toggleItalic} title="Italic (Ctrl+I)"><i>I</i></button>
-    <button type="button" class="fmt-btn" onclick={toggleUnderline} title="Underline (Ctrl+U)"><u>U</u></button>
-    <button type="button" class="fmt-btn" onclick={toggleStrikethrough} title="Strikethrough"><s>S</s></button>
+    <div class="ribbon-group">
+      <button type="button" class="fmt-btn" onclick={() => copySelection(false)} title="Copy (Ctrl+C)">Copy</button>
+      <button type="button" class="fmt-btn" onclick={() => pasteFromSystemClipboard()} title="Paste (Ctrl+V)">Paste</button>
+    </div>
     <div class="fmt-divider"></div>
-    <button type="button" class="fmt-btn" onclick={() => setAlignment('left')} title="Align left">⬅</button>
-    <button type="button" class="fmt-btn" onclick={() => setAlignment('center')} title="Align center">↔</button>
-    <button type="button" class="fmt-btn" onclick={() => setAlignment('right')} title="Align right">➡</button>
+    <div class="ribbon-group">
+      <button type="button" class="fmt-btn" onclick={toggleBold} title="Bold (Ctrl+B)"><b>B</b></button>
+      <button type="button" class="fmt-btn" onclick={toggleItalic} title="Italic (Ctrl+I)"><i>I</i></button>
+      <button type="button" class="fmt-btn" onclick={toggleUnderline} title="Underline (Ctrl+U)"><u>U</u></button>
+      <button type="button" class="fmt-btn" onclick={toggleStrikethrough} title="Strikethrough"><s>S</s></button>
+      <button type="button" class="fmt-btn" onclick={() => applyFormatToSelection({ wrap_text: !getCellFormat(selectedRow, selectedCol).wrap_text })} title="Wrap text">Wrap</button>
+    </div>
     <div class="fmt-divider"></div>
-    <button type="button" class="fmt-btn" onclick={increaseFontSize} title="Increase font size">A+</button>
-    <button type="button" class="fmt-btn" onclick={decreaseFontSize} title="Decrease font size">A−</button>
+    <div class="ribbon-group">
+      <button type="button" class="fmt-btn" onclick={() => setAlignment('left')} title="Align left">⬅</button>
+      <button type="button" class="fmt-btn" onclick={() => setAlignment('center')} title="Align center">↔</button>
+      <button type="button" class="fmt-btn" onclick={() => setAlignment('right')} title="Align right">➡</button>
+    </div>
     <div class="fmt-divider"></div>
-    <select class="fmt-select" onchange={(e) => setNumberFormat((e.target as HTMLSelectElement).value)} title="Number format">
-      <option value="">General</option>
-      <option value="#,##0">Number</option>
-      <option value="$#,##0.00">Currency</option>
-      <option value="0%">Percentage</option>
-      <option value="0.00%">Percentage (2 dp)</option>
-      <option value="yyyy-mm-dd">Date (ISO)</option>
-      <option value="mm/dd/yyyy">Date (US)</option>
-      <option value="hh:mm">Time</option>
-      <option value="#,##0.00">Number (2 dp)</option>
-    </select>
+    <div class="ribbon-group">
+      <button type="button" class="fmt-btn" onclick={increaseFontSize} title="Increase font size">A+</button>
+      <button type="button" class="fmt-btn" onclick={decreaseFontSize} title="Decrease font size">A−</button>
+      <button type="button" class="swatch-btn yellow" onclick={() => applyFormatToSelection({ bg_color: '#fef3c7' })} title="Yellow fill"></button>
+      <button type="button" class="swatch-btn green" onclick={() => applyFormatToSelection({ bg_color: '#dcfce7' })} title="Green fill"></button>
+      <button type="button" class="swatch-btn red" onclick={() => applyFormatToSelection({ bg_color: '#fee2e2' })} title="Red fill"></button>
+    </div>
     <div class="fmt-divider"></div>
-    <button type="button" class="fmt-btn" onclick={() => handleSort(true)} title="Sort ascending">↑ Sort</button>
-    <button type="button" class="fmt-btn" onclick={() => handleSort(false)} title="Sort descending">↓ Sort</button>
+    <div class="ribbon-group">
+      <select class="fmt-select" onchange={(e) => setNumberFormat((e.target as HTMLSelectElement).value)} title="Number format">
+        <option value="">General</option>
+        <option value="#,##0">Number</option>
+        <option value="$#,##0.00">Currency</option>
+        <option value="0%">Percentage</option>
+        <option value="0.00%">Percentage (2 dp)</option>
+        <option value="yyyy-mm-dd">Date (ISO)</option>
+        <option value="mm/dd/yyyy">Date (US)</option>
+        <option value="hh:mm">Time</option>
+        <option value="#,##0.00">Number (2 dp)</option>
+      </select>
+    </div>
+    <div class="fmt-divider"></div>
+    <div class="ribbon-group">
+      <button type="button" class="fmt-btn" onclick={() => handleSort(true)} title="Sort ascending">↑ Sort</button>
+      <button type="button" class="fmt-btn" onclick={() => handleSort(false)} title="Sort descending">↓ Sort</button>
+      <button type="button" class="fmt-btn" onclick={() => openPanel('find')} title="Find and replace">Find</button>
+      <button type="button" class="fmt-btn" onclick={() => openPanel('validation')} title="Validate selected range">Validate</button>
+    </div>
+    <div class="fmt-divider"></div>
+    <div class="ribbon-group">
+      <button type="button" class="fmt-btn" onclick={() => openPanel('chart')} title="Create chart">Chart</button>
+      <button type="button" class="fmt-btn" onclick={() => openPanel('pivot')} title="Create pivot table">Pivot</button>
+      <button type="button" class="fmt-btn" onclick={() => openPanel('print')} title="Print and export PDF">Print</button>
+    </div>
   </div>
 
-  <div class="formula-bar">
-    <span class="cell-ref">{rangeLabel(currentRange)}</span>
-    <span class="fx">fx</span>
-    <input
-      type="text"
-      bind:value={formulaBarValue}
-      onkeydown={handleFormulaBarKeydown}
-      placeholder="Enter value or formula"
-    />
-  </div>
+  {#if formulaMenuOpen}
+    <div
+      class="dropdown-menu formula-menu"
+      style="left: {formulaMenuX}px; top: {formulaMenuY}px;"
+      role="menu"
+      tabindex="-1"
+      onclick={(e) => e.stopPropagation()}
+      onkeydown={(e) => e.stopPropagation()}
+    >
+      {#each Object.entries(FORMULA_FUNCTIONS) as [category, funcs]}
+        <div class="dropdown-category">{category}</div>
+        {#each funcs as fn}
+          <button type="button" class="dropdown-item" onclick={() => insertFunction(fn)}>{fn}</button>
+        {/each}
+      {/each}
+    </div>
+  {/if}
 
-  <div class="grid-container" role="grid" tabindex="-1" bind:this={gridContainerEl} onscroll={handleScroll} onmousemove={handleGridMouseMove}>
+  {#if showFormulaBar}
+    <div class="formula-bar">
+      <span class="cell-ref">{rangeLabel(currentRange)}</span>
+      <span class="fx">fx</span>
+      <input
+        type="text"
+        bind:value={formulaBarValue}
+        onkeydown={handleFormulaBarKeydown}
+        placeholder="Enter value or formula"
+      />
+    </div>
+  {/if}
+
+  <div class="grid-container" style="--grid-zoom: {zoomPercent / 100};" role="grid" tabindex="-1" bind:this={gridContainerEl} onscroll={handleScroll} onmousemove={handleGridMouseMove}>
     <div
       class="grid"
       style="grid-template-columns: {COL_WIDTH * 0.6}px repeat({COLS}, {COL_WIDTH}px); height: {HEADER_HEIGHT + ROWS * ROW_HEIGHT}px;"
@@ -1092,4 +1975,297 @@
     {/each}
     <button type="button" class="sheet-tab-add" onclick={handleAddSheet} title="Add sheet">+</button>
   </div>
+
+  <div class="status-bar">
+    <span>{activeSheetName()}</span>
+    <span>{rangeLabel(currentRange)}</span>
+    <span>Count {selectionStats.count}</span>
+    {#if selectionStats.numericCount > 0}
+      <span>Sum {formatStat(selectionStats.sum)}</span>
+      <span>Avg {formatStat(selectionStats.average)}</span>
+      <span>Min {formatStat(selectionStats.min)}</span>
+      <span>Max {formatStat(selectionStats.max)}</span>
+    {/if}
+    <span class="status-spacer"></span>
+    <span>{zoomPercent}%</span>
+  </div>
+
+  {#if activePanel}
+    <div class="modal-backdrop" role="presentation" onclick={closePanel}>
+      <section class="panel" role="dialog" aria-modal="true" tabindex="-1" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
+        <header class="panel-header">
+          <div>
+            <p class="panel-kicker">
+              {#if activePanel === 'functions'}Insert
+              {:else if activePanel === 'find'}Edit
+              {:else if activePanel === 'chart'}Analyze
+              {:else if activePanel === 'pivot'}Analyze
+              {:else if activePanel === 'validation'}Data
+              {:else if activePanel === 'conditional'}Format
+              {:else if activePanel === 'print'}File
+              {:else if activePanel === 'protection'}Tools
+              {:else if activePanel === 'comment'}Review
+              {:else if activePanel === 'goalSeek'}Tools
+              {:else}Help{/if}
+            </p>
+            <h2>
+              {#if activePanel === 'functions'}Function Browser
+              {:else if activePanel === 'find'}Find and Replace
+              {:else if activePanel === 'chart'}Chart Builder
+              {:else if activePanel === 'pivot'}Pivot Table
+              {:else if activePanel === 'validation'}Validate Range
+              {:else if activePanel === 'conditional'}Conditional Formatting
+              {:else if activePanel === 'print'}Print and PDF
+              {:else if activePanel === 'protection'}Protection
+              {:else if activePanel === 'comment'}Cell Comment
+              {:else if activePanel === 'goalSeek'}Goal Seek
+              {:else if activePanel === 'shortcuts'}Keyboard Shortcuts
+              {:else}About 900Sheets{/if}
+            </h2>
+          </div>
+          <button type="button" class="icon-btn" onclick={closePanel} aria-label="Close">×</button>
+        </header>
+
+        {#if activePanel === 'functions'}
+          <div class="panel-body">
+            <input class="panel-input" type="search" bind:value={functionSearch} placeholder="Search 174 functions by name or category" />
+            <div class="function-list">
+              {#each filteredFormulaFunctions as fn}
+                <button type="button" class="function-row" onclick={() => insertFunction(fn.name)}>
+                  <span class="function-name">{fn.name}</span>
+                  <span class="function-category">{fn.category}</span>
+                </button>
+              {/each}
+            </div>
+          </div>
+        {:else if activePanel === 'find'}
+          <div class="panel-body form-grid">
+            <label>Find<input class="panel-input" bind:value={findQuery} placeholder="Text or value" /></label>
+            <label>Replace with<input class="panel-input" bind:value={replaceValue} placeholder="Replacement" /></label>
+            <label class="check-row"><input type="checkbox" bind:checked={findMatchCase} /> Match case</label>
+            <div class="panel-actions">
+              <button type="button" class="primary-btn" onclick={runFind}>Find</button>
+              <button type="button" class="secondary-btn" onclick={runReplace}>Replace All</button>
+            </div>
+            <div class="result-list">
+              {#each findResults as result}
+                <button type="button" class="result-row" onclick={() => jumpToResult(result)}>
+                  <span>{cellKey(result.row, result.col)}</span>
+                  <span>{result.matched_text}</span>
+                </button>
+              {/each}
+            </div>
+          </div>
+        {:else if activePanel === 'chart'}
+          <div class="panel-body form-grid">
+            <label>Title<input class="panel-input" bind:value={chartTitle} /></label>
+            <label>Type
+              <select class="panel-input" bind:value={chartType}>
+                <option>Column</option>
+                <option>Bar</option>
+                <option>Line</option>
+                <option>Area</option>
+                <option>Pie</option>
+                <option>Doughnut</option>
+                <option>Scatter</option>
+              </select>
+            </label>
+            <label>Series name<input class="panel-input" bind:value={chartSeriesName} /></label>
+            <p class="panel-note">Uses the first selected column as labels and the second selected column as values. Current range: {rangeLabel(currentRange)}.</p>
+            <div class="panel-actions">
+              <button type="button" class="primary-btn" onclick={runChart}>Create Chart</button>
+            </div>
+            {#if chartSvg}
+              <div class="chart-preview">{@html chartSvg}</div>
+            {/if}
+          </div>
+        {:else if activePanel === 'pivot'}
+          <div class="panel-body form-grid">
+            <p class="panel-note">Uses the first detected column as the row field and the last detected column as the value field. Current range: {rangeLabel(currentRange)}.</p>
+            <label>Aggregation
+              <select class="panel-input" bind:value={pivotAggregation}>
+                <option>Sum</option>
+                <option>Count</option>
+                <option>Average</option>
+                <option>Min</option>
+                <option>Max</option>
+                <option>Product</option>
+              </select>
+            </label>
+            <div class="chip-row">
+              {#each pivotColumns as col}
+                <span class="chip">{col.name || colLabel(col.col)}</span>
+              {/each}
+            </div>
+            <div class="panel-actions">
+              <button type="button" class="primary-btn" onclick={runPivotSheet}>Create Pivot Sheet</button>
+            </div>
+          </div>
+        {:else if activePanel === 'validation'}
+          <div class="panel-body form-grid">
+            <label>Rule type
+              <select class="panel-input" bind:value={validationType}>
+                <option>WholeNumber</option>
+                <option>Decimal</option>
+                <option>TextLength</option>
+                <option>List</option>
+                <option>Date</option>
+                <option>Time</option>
+                <option>Custom</option>
+              </select>
+            </label>
+            <label>Operator
+              <select class="panel-input" bind:value={validationOperator}>
+                <option>Between</option>
+                <option>NotBetween</option>
+                <option>Equal</option>
+                <option>NotEqual</option>
+                <option>GreaterThan</option>
+                <option>LessThan</option>
+                <option>GreaterThanOrEqual</option>
+                <option>LessThanOrEqual</option>
+              </select>
+            </label>
+            {#if validationType === 'List'}
+              <label>Allowed values<input class="panel-input" bind:value={validationSource} placeholder="Open,Closed,Pending" /></label>
+            {:else}
+              <label>Value 1<input class="panel-input" bind:value={validationFormula1} /></label>
+              <label>Value 2<input class="panel-input" bind:value={validationFormula2} /></label>
+            {/if}
+            <div class="panel-actions">
+              <button type="button" class="primary-btn" onclick={runValidation}>Validate {rangeLabel(currentRange)}</button>
+            </div>
+            <div class="result-list">
+              {#each validationResults as result}
+                <button type="button" class="result-row" onclick={() => jumpToResult(result)}>
+                  <span>{cellKey(result.row, result.col)}</span>
+                  <span>{result.error}</span>
+                </button>
+              {/each}
+            </div>
+          </div>
+        {:else if activePanel === 'conditional'}
+          <div class="panel-body form-grid">
+            <label>Condition
+              <select class="panel-input" bind:value={conditionalType}>
+                <option>CellValue</option>
+                <option>TextContains</option>
+                <option>Blanks</option>
+                <option>NoBlanks</option>
+                <option>Duplicate</option>
+              </select>
+            </label>
+            <label>Operator
+              <select class="panel-input" bind:value={conditionalOperator}>
+                <option>GreaterThan</option>
+                <option>LessThan</option>
+                <option>Equal</option>
+                <option>NotEqual</option>
+                <option>Between</option>
+                <option>NotBetween</option>
+              </select>
+            </label>
+            <label>Value<input class="panel-input" bind:value={conditionalValue1} /></label>
+            <label>Second value<input class="panel-input" bind:value={conditionalValue2} /></label>
+            <label>Fill color<input class="panel-input" type="color" bind:value={conditionalFill} /></label>
+            <div class="panel-actions">
+              <button type="button" class="primary-btn" onclick={applyConditionalFormat}>Apply to Matches</button>
+            </div>
+            <p class="panel-note">Applied to {conditionalMatches.length} cells. These are static formats based on the current values.</p>
+          </div>
+        {:else if activePanel === 'print'}
+          <div class="panel-body form-grid">
+            <label>Page size
+              <select class="panel-input" bind:value={printPageSize}>
+                <option>Letter</option>
+                <option>A4</option>
+                <option>A3</option>
+                <option>Legal</option>
+                <option>Tabloid</option>
+              </select>
+            </label>
+            <label>Orientation
+              <select class="panel-input" bind:value={printOrientation}>
+                <option>Portrait</option>
+                <option>Landscape</option>
+              </select>
+            </label>
+            <p class="panel-note">Print area uses the current selection when more than one cell is selected.</p>
+            <div class="panel-actions">
+              <button type="button" class="secondary-btn" onclick={updatePrintPreview}>Estimate Pages</button>
+              <button type="button" class="primary-btn" onclick={handleExportPdf}>Export PDF</button>
+            </div>
+            {#if printPageCount !== null}
+              <p class="panel-note">{printPageCount} page{printPageCount === 1 ? '' : 's'} estimated.</p>
+            {/if}
+          </div>
+        {:else if activePanel === 'protection'}
+          <div class="panel-body form-grid">
+            <label>Password<input class="panel-input" type="password" bind:value={protectionPassword} /></label>
+            <div class="panel-actions">
+              <button type="button" class="primary-btn" onclick={() => setProtection(true)}>Protect Sheet</button>
+              <button type="button" class="secondary-btn" onclick={() => setProtection(false)}>Unprotect Sheet</button>
+            </div>
+            <div class="panel-actions">
+              <button type="button" class="secondary-btn" onclick={() => setRangeLock(true)}>Lock {rangeLabel(currentRange)}</button>
+              <button type="button" class="secondary-btn" onclick={() => setRangeLock(false)}>Unlock {rangeLabel(currentRange)}</button>
+            </div>
+          </div>
+        {:else if activePanel === 'comment'}
+          <div class="panel-body form-grid">
+            <p class="panel-note">Selected cell: {cellKey(selectedRow, selectedCol)}</p>
+            <label>Author<input class="panel-input" bind:value={commentAuthor} /></label>
+            <label>Comment<textarea class="panel-input" bind:value={commentText}></textarea></label>
+            <div class="panel-actions">
+              <button type="button" class="primary-btn" onclick={saveComment}>Save Comment</button>
+              <button type="button" class="secondary-btn" onclick={removeCurrentComment}>Remove</button>
+            </div>
+            <div class="result-list">
+              {#each allComments as comment}
+                <button type="button" class="result-row" onclick={() => jumpToResult(comment)}>
+                  <span>{cellKey(comment.row, comment.col)}</span>
+                  <span>{comment.text}</span>
+                </button>
+              {/each}
+            </div>
+          </div>
+        {:else if activePanel === 'goalSeek'}
+          <div class="panel-body form-grid">
+            <label>Formula cell<input class="panel-input" bind:value={goalSeekTargetCell} placeholder="B1" /></label>
+            <label>Target value<input class="panel-input" bind:value={goalSeekTargetValue} placeholder="100" /></label>
+            <label>Changing cell<input class="panel-input" bind:value={goalSeekInputCell} placeholder="A1" /></label>
+            <div class="panel-actions">
+              <button type="button" class="primary-btn" onclick={runGoalSeek}>Run Goal Seek</button>
+            </div>
+            {#if goalSeekResult}
+              <p class="panel-note">
+                {goalSeekResult.success ? 'Solved' : 'Not solved'} after {goalSeekResult.iterations} iterations.
+                Input {formatStat(goalSeekResult.input_value)}, achieved {formatStat(goalSeekResult.achieved_value)}.
+              </p>
+            {/if}
+          </div>
+        {:else if activePanel === 'shortcuts'}
+          <div class="panel-body shortcut-grid">
+            <span>Ctrl+Z</span><span>Undo</span>
+            <span>Ctrl+Y</span><span>Redo</span>
+            <span>Ctrl+C / X / V</span><span>Copy, cut, paste</span>
+            <span>Ctrl+B / I / U</span><span>Bold, italic, underline</span>
+            <span>Ctrl+F</span><span>Find and replace</span>
+            <span>Delete</span><span>Clear selection</span>
+            <span>F2</span><span>Edit active cell</span>
+          </div>
+        {:else if activePanel === 'about'}
+          <div class="panel-body">
+            <p class="panel-note">900Sheets is a local-first spreadsheet app from 900 Labs. This build runs offline, stores workbook state locally, and exposes spreadsheet workflows without accounts or subscriptions.</p>
+            <div class="chip-row">
+              <span class="chip">Tauri</span>
+              <span class="chip">Svelte</span>
+              <span class="chip">Rust engine</span>
+              <span class="chip">Offline-first</span>
+            </div>
+          </div>
+        {/if}
+      </section>
+    </div>
+  {/if}
 </div>
