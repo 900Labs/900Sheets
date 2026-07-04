@@ -99,9 +99,15 @@ Run the local quality gate before opening a pull request:
 ./scripts/verify-local.sh
 ```
 
+The local quality gate includes Rust formatting, clippy, Rust tests, Svelte type checks, the frontend build, and Playwright spreadsheet interaction smokes. On a fresh machine, if Playwright reports that Chromium is missing, run:
+
+```bash
+npx --prefix apps/desktop playwright install chromium
+```
+
 ## Test Suite
 
-The project includes 386 unit tests across Rust crates and the desktop backend:
+The project includes 387 unit tests across Rust crates and the desktop backend, plus 3 Playwright spreadsheet interaction smoke tests:
 
 | Crate | Tests | Description |
 |-------|-------|-------------|
@@ -116,7 +122,8 @@ The project includes 386 unit tests across Rust crates and the desktop backend:
 | sheets-i18n | 44 | Locales, translations, formatting, accessibility |
 | sheets-print | 25 | Page layout, HTML, PDF generation |
 | sheets-advanced | 32 | Protection, goal seek, scenarios, comments |
-| sheets-desktop backend | 4 | Tauri protection/path helper behavior |
+| sheets-desktop backend | 5 | Tauri protection/path helper behavior |
+| Playwright E2E | 3 | Cell typing, Delete/Backspace clearing, compact toolbar menu viewport checks |
 
 ## Documentation
 

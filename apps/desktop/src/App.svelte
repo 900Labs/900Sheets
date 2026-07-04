@@ -6,9 +6,14 @@
   import { colLabel, cellKey, normalizeRange, rangeContains, rangeSize, rangeLabel, parseCellKey } from './lib/utils/grid'
   import { UndoRedoStack } from './lib/utils/undoRedo'
 
-  function focusInput(node: HTMLInputElement) {
+  function focusInput(node: HTMLInputElement, selectText: boolean = true) {
     node.focus()
-    node.select()
+    if (selectText) {
+      node.select()
+    } else {
+      const cursorPosition = node.value.length
+      node.setSelectionRange(cursorPosition, cursorPosition)
+    }
   }
 
   let sheets: SheetInfo[] = $state([])
@@ -21,6 +26,7 @@
   let selectionEnd: { row: number; col: number } = $state({ row: 0, col: 0 })
   let editingCell: string | null = $state(null)
   let editValue: string = $state('')
+  let selectEditTextOnFocus: boolean = $state(true)
   let formulaBarValue: string = $state('')
   let isSelecting: boolean = $state(false)
   let clipboard: ClipboardData | null = null
@@ -33,6 +39,7 @@
   let currentFilePath: string | null = $state(null)
   let cellFormats: CellFormatMap = $state({})
   type MenuKey = 'file' | 'edit' | 'view' | 'insert' | 'format' | 'data' | 'tools' | 'help'
+  type ToolbarMenuKey = 'data' | 'analyze' | 'output'
   type PanelKey =
     | 'functions' | 'find' | 'chart' | 'pivot' | 'validation' | 'conditional' | 'print' | 'protection'
     | 'comment' | 'goalSeek' | 'filter' | 'namedRanges' | 'structure' | 'templates' | 'shortcuts' | 'about'
@@ -158,6 +165,9 @@
   }
 
   let openMenu: MenuKey | null = $state(null)
+  let toolbarMenuOpen: ToolbarMenuKey | null = $state(null)
+  let toolbarMenuX: number = $state(0)
+  let toolbarMenuY: number = $state(0)
   let formulaMenuOpen: boolean = $state(false)
   let formulaMenuX: number = $state(0)
   let formulaMenuY: number = $state(0)
@@ -698,6 +708,13 @@
       })
   }
 
+  function clearLocalCell(row: number, col: number) {
+    const key = cellKey(row, col)
+    delete cellContents[key]
+    delete cellDisplays[key]
+    delete cellFormats[key]
+  }
+
   async function applyCellValueChanges(
     changes: Array<{ row: number; col: number; value: string }>,
     context: string,
@@ -979,14 +996,29 @@
   function toggleMenu(menu: MenuKey) {
     openMenu = openMenu === menu ? null : menu
     formulaMenuOpen = false
+    toolbarMenuOpen = null
+  }
+
+  function toggleToolbarMenu(menu: ToolbarMenuKey, event: MouseEvent) {
+    const trigger = event.currentTarget as HTMLElement
+    const rect = trigger.getBoundingClientRect()
+    const toolbarRect = trigger.closest('.format-toolbar')?.getBoundingClientRect()
+    const menuWidth = 190
+    toolbarMenuX = Math.max(8, Math.min(rect.left, window.innerWidth - menuWidth - 8))
+    toolbarMenuY = Math.max(rect.bottom + 4, (toolbarRect?.bottom ?? rect.bottom) + 4)
+    toolbarMenuOpen = toolbarMenuOpen === menu ? null : menu
+    openMenu = null
+    formulaMenuOpen = false
   }
 
   function closeMenus() {
     openMenu = null
+    toolbarMenuOpen = null
   }
 
   function closePopovers() {
     openMenu = null
+    toolbarMenuOpen = null
     formulaMenuOpen = false
   }
 
@@ -999,6 +1031,7 @@
     formulaMenuY = Math.max(rect.bottom + 4, (toolbarRect?.bottom ?? rect.bottom) + 4)
     formulaMenuOpen = !formulaMenuOpen
     openMenu = null
+    toolbarMenuOpen = null
   }
 
   function closeFormulaMenu() {
@@ -1091,9 +1124,10 @@
     editingCell = null
   }
 
-  function startEdit(row: number, col: number) {
+  function startEdit(row: number, col: number, initialValue?: string) {
     editingCell = cellKey(row, col)
-    editValue = getCellValue(row, col)
+    editValue = initialValue ?? getCellValue(row, col)
+    selectEditTextOnFocus = initialValue === undefined
   }
 
   function commitEdit() {
@@ -1237,7 +1271,7 @@
           const oldVal = cellContents[key] ?? ''
           if (oldVal) {
             history.push({ sheetId: activeSheetId, row: r2, col: c2, oldValue: oldVal, newValue: '' })
-            delete cellContents[key]
+            clearLocalCell(r2, c2)
             queueClearCell(r2, c2, 'Unable to cut cells')
           }
         }
@@ -1326,10 +1360,10 @@
     for (let row = r.startRow; row <= r.endRow; row++) {
       for (let col = r.startCol; col <= r.endCol; col++) {
         const key = cellKey(row, col)
-        const oldValue = cellContents[key] ?? ''
+        const oldValue = cellContents[key] ?? cellDisplays[key] ?? ''
         if (oldValue) {
           history.push({ sheetId: activeSheetId, row, col, oldValue, newValue: '' })
-          delete cellContents[key]
+          clearLocalCell(row, col)
           queueClearCell(row, col, 'Unable to delete cells')
         }
       }
@@ -1337,6 +1371,24 @@
     if (history.length > 0) {
       undoRedo.push(history)
       updateUndoRedoState()
+      setStatus(`Cleared ${history.length} cell${history.length === 1 ? '' : 's'}`)
+    }
+  }
+
+  function isClearSelectionKey(e: KeyboardEvent): boolean {
+    return e.key === 'Delete'
+      || e.key === 'Backspace'
+      || e.key === 'Del'
+      || e.code === 'Delete'
+      || e.code === 'Backspace'
+  }
+
+  function handleGridKeydown(e: KeyboardEvent) {
+    if (editingCell) return
+    if (isClearSelectionKey(e)) {
+      e.preventDefault()
+      e.stopPropagation()
+      deleteSelection()
     }
   }
 
@@ -1433,7 +1485,7 @@
       return
     }
 
-    if (e.key === 'Delete' || e.key === 'Backspace') {
+    if (isClearSelectionKey(e)) {
       e.preventDefault()
       deleteSelection()
       return
@@ -1465,8 +1517,7 @@
       if (selectedCol < COLS - 1) selectCell(selectedRow, selectedCol + 1)
     } else if (e.key.length === 1 && !ctrl && !e.metaKey) {
       e.preventDefault()
-      startEdit(selectedRow, selectedCol)
-      editValue = e.key
+      startEdit(selectedRow, selectedCol, e.key)
     }
   }
 
@@ -2711,7 +2762,60 @@
       </select>
     </div>
     <div class="fmt-divider"></div>
-    <div class="ribbon-group">
+    <div class="ribbon-group compact-workflow-group">
+      <div class="toolbar-menu-wrapper">
+        <button
+          type="button"
+          class="fmt-btn toolbar-menu-trigger"
+          class:active={toolbarMenuOpen === 'data'}
+          onclick={(e) => { e.stopPropagation(); toggleToolbarMenu('data', e) }}
+          title="Data tools"
+        >Data ▾</button>
+        {#if toolbarMenuOpen === 'data'}
+          <div class="toolbar-popover" style="left: {toolbarMenuX}px; top: {toolbarMenuY}px;" role="menu" tabindex="-1" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
+            <button type="button" class="toolbar-menu-item" onclick={() => executeMenuAction('sortAsc')}>Sort Ascending</button>
+            <button type="button" class="toolbar-menu-item" onclick={() => executeMenuAction('sortDesc')}>Sort Descending</button>
+            <div class="toolbar-menu-divider"></div>
+            <button type="button" class="toolbar-menu-item" onclick={() => executeMenuAction('filter')}>Filter</button>
+            <button type="button" class="toolbar-menu-item" onclick={() => executeMenuAction('removeDuplicates')}>Remove Duplicates</button>
+            <button type="button" class="toolbar-menu-item" onclick={() => executeMenuAction('findReplace')}>Find</button>
+            <button type="button" class="toolbar-menu-item" onclick={() => executeMenuAction('validation')}>Validate</button>
+            <button type="button" class="toolbar-menu-item" onclick={() => executeMenuAction('namedRanges')}>Named Ranges</button>
+          </div>
+        {/if}
+      </div>
+      <div class="toolbar-menu-wrapper">
+        <button
+          type="button"
+          class="fmt-btn toolbar-menu-trigger"
+          class:active={toolbarMenuOpen === 'analyze'}
+          onclick={(e) => { e.stopPropagation(); toggleToolbarMenu('analyze', e) }}
+          title="Analysis tools"
+        >Analyze ▾</button>
+        {#if toolbarMenuOpen === 'analyze'}
+          <div class="toolbar-popover" style="left: {toolbarMenuX}px; top: {toolbarMenuY}px;" role="menu" tabindex="-1" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
+            <button type="button" class="toolbar-menu-item" onclick={() => executeMenuAction('chart')}>Chart</button>
+            <button type="button" class="toolbar-menu-item" onclick={() => executeMenuAction('pivot')}>Pivot Table</button>
+          </div>
+        {/if}
+      </div>
+      <div class="toolbar-menu-wrapper">
+        <button
+          type="button"
+          class="fmt-btn toolbar-menu-trigger"
+          class:active={toolbarMenuOpen === 'output'}
+          onclick={(e) => { e.stopPropagation(); toggleToolbarMenu('output', e) }}
+          title="Templates and output"
+        >Output ▾</button>
+        {#if toolbarMenuOpen === 'output'}
+          <div class="toolbar-popover" style="left: {toolbarMenuX}px; top: {toolbarMenuY}px;" role="menu" tabindex="-1" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
+            <button type="button" class="toolbar-menu-item" onclick={() => executeMenuAction('templates')}>Templates</button>
+            <button type="button" class="toolbar-menu-item" onclick={() => openPanel('print')}>Print / PDF</button>
+          </div>
+        {/if}
+      </div>
+    </div>
+    <div class="ribbon-group workflow-group">
       <button type="button" class="fmt-btn" onclick={() => handleSort(true)} title="Sort ascending">↑ Sort</button>
       <button type="button" class="fmt-btn" onclick={() => handleSort(false)} title="Sort descending">↓ Sort</button>
       <button type="button" class="fmt-btn" onclick={() => openPanel('filter')} title="Filter selected range">Filter</button>
@@ -2720,8 +2824,8 @@
       <button type="button" class="fmt-btn" onclick={() => openPanel('validation')} title="Validate selected range">Validate</button>
       <button type="button" class="fmt-btn" onclick={() => openPanel('namedRanges')} title="Manage named ranges">Names</button>
     </div>
-    <div class="fmt-divider"></div>
-    <div class="ribbon-group">
+    <div class="fmt-divider workflow-divider"></div>
+    <div class="ribbon-group workflow-group">
       <button type="button" class="fmt-btn" onclick={() => openPanel('chart')} title="Create chart">Chart</button>
       <button type="button" class="fmt-btn" onclick={() => openPanel('pivot')} title="Create pivot table">Pivot</button>
       <button type="button" class="fmt-btn" onclick={() => openPanel('templates')} title="Insert template">Templates</button>
@@ -2760,7 +2864,7 @@
     </div>
   {/if}
 
-  <div class="grid-container" style="--grid-zoom: {zoomPercent / 100};" role="grid" tabindex="-1" bind:this={gridContainerEl} onscroll={handleScroll} onmousemove={handleGridMouseMove}>
+  <div class="grid-container" style="--grid-zoom: {zoomPercent / 100};" role="grid" tabindex="-1" bind:this={gridContainerEl} onscroll={handleScroll} onmousemove={handleGridMouseMove} onkeydown={handleGridKeydown}>
     <div
       class="grid"
       style="grid-template-columns: {COL_WIDTH * 0.6}px repeat({COLS}, {COL_WIDTH}px); height: {HEADER_HEIGHT + displayedRows.length * ROW_HEIGHT}px;"
@@ -2793,7 +2897,7 @@
                 type="text"
                 bind:value={editValue}
                 onblur={commitEdit}
-                use:focusInput
+                use:focusInput={selectEditTextOnFocus}
                 class="cell-input"
               />
             {:else}

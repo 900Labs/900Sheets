@@ -18,6 +18,18 @@ npm run check --prefix apps/desktop
 npm run build --prefix apps/desktop
 ```
 
+Spreadsheet interaction smokes:
+
+```bash
+npm run test:e2e --prefix apps/desktop
+```
+
+If Playwright reports that Chromium is missing on a fresh machine, install the browser once:
+
+```bash
+npx --prefix apps/desktop playwright install chromium
+```
+
 Backend checks are run from the repository root:
 
 ```bash

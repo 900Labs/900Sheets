@@ -189,6 +189,60 @@ body {
   background: rgba(37, 99, 235, 0.15);
 }
 
+.fmt-btn.active {
+  background: var(--accent-bg);
+  border-color: var(--accent-border);
+  color: var(--accent);
+}
+
+.compact-workflow-group {
+  display: none;
+}
+
+.toolbar-menu-wrapper {
+  position: relative;
+}
+
+.toolbar-popover {
+  position: fixed;
+  z-index: 1000;
+  display: grid;
+  gap: 2px;
+  min-width: 190px;
+  max-width: calc(100vw - 16px);
+  padding: 4px;
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.18);
+}
+
+.toolbar-menu-item {
+  width: 100%;
+  border: none;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.25;
+  padding: 6px 8px;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.toolbar-menu-item:hover {
+  background: var(--accent-bg);
+  color: var(--accent);
+}
+
+.toolbar-menu-divider {
+  height: 1px;
+  background: var(--border);
+  margin: 3px 0;
+}
+
 .fmt-divider {
   width: 1px;
   height: 20px;
@@ -366,6 +420,10 @@ body {
   background: var(--bg);
 }
 
+.grid-container:focus {
+  outline: none;
+}
+
 .selection-label {
   position: fixed;
   bottom: 40px;
@@ -459,7 +517,12 @@ body {
   z-index: 1;
 }
 
-.cell.active {
+.cell:focus {
+  outline: none;
+}
+
+.cell.active,
+.cell.active:focus {
   outline: 2px solid var(--selected-border);
   outline-offset: -2px;
   z-index: 2;
@@ -914,6 +977,34 @@ textarea.panel-input {
 .shortcut-grid span:nth-child(odd) {
   font-family: ui-monospace, 'SF Mono', Consolas, monospace;
   color: var(--accent);
+}
+
+@media (max-width: 1280px) {
+  .workflow-group,
+  .workflow-divider {
+    display: none;
+  }
+
+  .compact-workflow-group {
+    display: flex;
+  }
+}
+
+@media (max-width: 900px) {
+  .format-toolbar {
+    padding-left: 8px;
+    padding-right: 8px;
+  }
+
+  .fmt-btn {
+    padding-left: 6px;
+    padding-right: 6px;
+  }
+
+  .fmt-divider {
+    margin-left: 2px;
+    margin-right: 2px;
+  }
 }
 
 @media (max-width: 760px) {

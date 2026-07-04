@@ -23,5 +23,6 @@ run_check "3. cargo test" cargo test --workspace
 run_check "4. npm install" npm install --prefix apps/desktop --silent
 run_check "5. npm run check" npm run check --prefix apps/desktop
 run_check "6. npm run build" npm run build --prefix apps/desktop
+run_check "7. npm run test:e2e" npm run test:e2e --prefix apps/desktop
 
 echo "=== All checks passed ==="

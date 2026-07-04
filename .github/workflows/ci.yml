@@ -50,3 +50,7 @@ jobs:
         run: npm run check --prefix apps/desktop
       - name: Build
         run: npm run build --prefix apps/desktop
+      - name: Install Playwright browsers
+        run: npx --prefix apps/desktop playwright install --with-deps chromium
+      - name: E2E smoke tests
+        run: npm run test:e2e --prefix apps/desktop
