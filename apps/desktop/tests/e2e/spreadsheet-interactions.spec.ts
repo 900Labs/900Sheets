@@ -149,6 +149,25 @@ test('formula bar typing and enter do not leak into inline cell editing', async 
   await expect(page.locator('input.cell-input')).toHaveCount(0)
 })
 
+test('fx menu inserts functions with the cursor ready for arguments', async ({ page }) => {
+  await openWorkbook(page)
+
+  await cell(page, 'A1').click()
+  await page.locator('button[title="Insert function"]').click()
+
+  const formulaMenu = page.locator('.formula-menu')
+  await expect(formulaMenu).toBeVisible()
+  await formulaMenu.getByRole('button', { name: 'SUM', exact: true }).click()
+
+  const editor = page.locator('input.cell-input')
+  await expect(editor).toHaveValue('=SUM()')
+  await expect(editor).toHaveJSProperty('selectionStart', 5)
+  await expect(editor).toHaveJSProperty('selectionEnd', 5)
+
+  await editor.press('A')
+  await expect(editor).toHaveValue('=SUM(A)')
+})
+
 test('copy paste undo and redo update visible cells', async ({ page }) => {
   await openWorkbook(page)
 

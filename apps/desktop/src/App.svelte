@@ -6,12 +6,14 @@
   import { colLabel, cellKey, normalizeRange, rangeContains, rangeSize, rangeLabel, parseCellKey } from './lib/utils/grid'
   import { UndoRedoStack } from './lib/utils/undoRedo'
 
-  function focusInput(node: HTMLInputElement, selectText: boolean = true) {
+  type EditFocusOptions = { selectText: boolean; cursorPosition?: number }
+
+  function focusInput(node: HTMLInputElement, options: EditFocusOptions = { selectText: true }) {
     node.focus()
-    if (selectText) {
+    if (options.selectText) {
       node.select()
     } else {
-      const cursorPosition = node.value.length
+      const cursorPosition = Math.max(0, Math.min(options.cursorPosition ?? node.value.length, node.value.length))
       node.setSelectionRange(cursorPosition, cursorPosition)
     }
   }
@@ -26,7 +28,7 @@
   let selectionEnd: { row: number; col: number } = $state({ row: 0, col: 0 })
   let editingCell: string | null = $state(null)
   let editValue: string = $state('')
-  let selectEditTextOnFocus: boolean = $state(true)
+  let editFocusOptions: EditFocusOptions = $state({ selectText: true })
   let formulaBarValue: string = $state('')
   let isSelecting: boolean = $state(false)
   let clipboard: ClipboardData | null = null
@@ -1051,8 +1053,8 @@
         editValue = prefix + snippet
       }
     } else {
-      startEdit(selectedRow, selectedCol)
-      editValue = prefix + snippet
+      const nextValue = prefix + snippet
+      startEdit(selectedRow, selectedCol, nextValue, nextValue.length - 1)
     }
   }
 
@@ -1124,10 +1126,12 @@
     editingCell = null
   }
 
-  function startEdit(row: number, col: number, initialValue?: string) {
+  function startEdit(row: number, col: number, initialValue?: string, cursorPosition?: number) {
     editingCell = cellKey(row, col)
     editValue = initialValue ?? getCellValue(row, col)
-    selectEditTextOnFocus = initialValue === undefined
+    editFocusOptions = initialValue === undefined
+      ? { selectText: true }
+      : { selectText: false, cursorPosition }
   }
 
   function commitEdit() {
@@ -2900,7 +2904,7 @@
                 type="text"
                 bind:value={editValue}
                 onblur={commitEdit}
-                use:focusInput={selectEditTextOnFocus}
+                use:focusInput={editFocusOptions}
                 class="cell-input"
               />
             {:else}
