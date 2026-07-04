@@ -149,6 +149,28 @@ test('formula bar typing and enter do not leak into inline cell editing', async 
   await expect(page.locator('input.cell-input')).toHaveCount(0)
 })
 
+test('copy paste undo and redo update visible cells', async ({ page }) => {
+  await openWorkbook(page)
+
+  await enterCellText(page, 'A1', 'copy-me')
+
+  const a1 = cell(page, 'A1')
+  const b1 = cell(page, 'B1')
+
+  await a1.click()
+  await page.keyboard.press('Control+C')
+
+  await b1.click()
+  await page.keyboard.press('Control+V')
+  await expect(b1).toHaveText('copy-me')
+
+  await page.keyboard.press('Control+Z')
+  await expect(b1).toHaveText('')
+
+  await page.keyboard.press('Control+Y')
+  await expect(b1).toHaveText('copy-me')
+})
+
 test('compact toolbar menus stay inside the viewport', async ({ page }) => {
   await page.setViewportSize({ width: 900, height: 700 })
   await openWorkbook(page)

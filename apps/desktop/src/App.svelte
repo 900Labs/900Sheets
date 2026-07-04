@@ -1303,6 +1303,7 @@
         if (oldValue !== newValue) {
           history.push({ sheetId: activeSheetId, row: targetRow, col: targetCol, oldValue, newValue })
           cellContents[key] = newValue
+          cellDisplays[key] = newValue.startsWith('=') ? (cellDisplays[key] ?? newValue) : newValue
           queueSetCell(targetRow, targetCol, newValue, 'Unable to paste cells')
         }
       }
@@ -1340,6 +1341,7 @@
           if (oldValue !== newValue) {
             history.push({ sheetId: activeSheetId, row: targetRow, col: targetCol, oldValue, newValue })
             cellContents[key] = newValue
+            cellDisplays[key] = newValue.startsWith('=') ? (cellDisplays[key] ?? newValue) : newValue
             queueSetCell(targetRow, targetCol, newValue, 'Unable to paste cells')
           }
         }
