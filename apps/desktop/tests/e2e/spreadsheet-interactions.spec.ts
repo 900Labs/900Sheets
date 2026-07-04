@@ -133,6 +133,22 @@ test('delete and backspace clear the selected cell visibly', async ({ page }) =>
   await expect(a1).toHaveText('')
 })
 
+test('formula bar typing and enter do not leak into inline cell editing', async ({ page }) => {
+  await openWorkbook(page)
+
+  const formulaInput = page.locator('.formula-bar input')
+  await formulaInput.click()
+  await formulaInput.press('h')
+  await formulaInput.press('i')
+
+  await expect(formulaInput).toHaveValue('hi')
+  await expect(page.locator('input.cell-input')).toHaveCount(0)
+
+  await formulaInput.press('Enter')
+  await expect(cell(page, 'A1')).toHaveText('hi')
+  await expect(page.locator('input.cell-input')).toHaveCount(0)
+})
+
 test('compact toolbar menus stay inside the viewport', async ({ page }) => {
   await page.setViewportSize({ width: 900, height: 700 })
   await openWorkbook(page)

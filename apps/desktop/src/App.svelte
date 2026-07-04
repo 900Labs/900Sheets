@@ -1522,6 +1522,7 @@
   }
 
   function handleFormulaBarKeydown(e: KeyboardEvent) {
+    e.stopPropagation()
     if (e.key === 'Enter') {
       e.preventDefault()
       const key = cellKey(selectedRow, selectedCol)
