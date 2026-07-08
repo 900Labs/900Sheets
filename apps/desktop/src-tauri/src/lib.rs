@@ -91,6 +91,8 @@ struct CellData {
     value: String,
     display: String,
     cell_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    format: Option<CellFormat>,
 }
 
 fn sheet_infos(workbook: &Workbook) -> Vec<SheetInfo> {
@@ -118,6 +120,21 @@ fn clear_derived_workbook_state(state: &AppState) -> Result<(), String> {
         let mut locks = state.cell_locks.lock().map_err(|e| e.to_string())?;
         locks.clear();
     }
+    Ok(())
+}
+
+fn clear_comments(comments: &Mutex<CommentManager>) -> Result<(), String> {
+    let mut comments = comments.lock().map_err(|e| e.to_string())?;
+    comments.clear();
+    Ok(())
+}
+
+fn clear_full_workbook_state(
+    state: &AppState,
+    comments: &Mutex<CommentManager>,
+) -> Result<(), String> {
+    clear_derived_workbook_state(state)?;
+    clear_comments(comments)?;
     Ok(())
 }
 
@@ -202,6 +219,75 @@ fn clear_dependency_graph_for_sheet(state: &AppState, sheet_id: u32) -> Result<(
     Ok(())
 }
 
+fn ensure_dependency_graphs(graphs: &mut Vec<DependencyGraph>, sheet_count: usize) {
+    while graphs.len() < sheet_count {
+        graphs.push(DependencyGraph::new());
+    }
+}
+
+fn update_cell_dependencies(
+    state: &AppState,
+    sheet_id: u32,
+    sheet_count: usize,
+    row: u32,
+    col: u32,
+    value: &str,
+) -> Result<(), String> {
+    let mut graphs = state.dep_graphs.lock().map_err(|e| e.to_string())?;
+    if value.starts_with('=') {
+        ensure_dependency_graphs(&mut graphs, sheet_count);
+        let graph = graphs
+            .get_mut(sheet_id as usize)
+            .ok_or_else(|| format!("Sheet {} not found", sheet_id))?;
+        if Parser::parse_formula(value).is_err() {
+            graph.clear_cell(row, col);
+            return Ok(());
+        }
+        graph.set_formula(row, col, value)?;
+    } else if let Some(graph) = graphs.get_mut(sheet_id as usize) {
+        graph.clear_cell(row, col);
+    }
+    Ok(())
+}
+
+fn set_cell_value_in_workbook(
+    state: &AppState,
+    sheet_id: u32,
+    row: u32,
+    col: u32,
+    value: String,
+) -> Result<(), String> {
+    let mut wb = state.workbook.lock().map_err(|e| e.to_string())?;
+    let sheet_count = wb.sheet_count();
+    if sheet_id as usize >= sheet_count {
+        return Err(format!("Sheet {} not found", sheet_id));
+    }
+    update_cell_dependencies(state, sheet_id, sheet_count, row, col, &value)?;
+    let sheet = wb
+        .sheet_mut(sheet_id as usize)
+        .ok_or_else(|| format!("Sheet {} not found", sheet_id))?;
+    sheet.set_cell_value(row, col, value);
+    Ok(())
+}
+
+fn clear_cell_in_workbook(
+    state: &AppState,
+    sheet_id: u32,
+    row: u32,
+    col: u32,
+) -> Result<(), String> {
+    let mut wb = state.workbook.lock().map_err(|e| e.to_string())?;
+    let sheet = wb
+        .sheet_mut(sheet_id as usize)
+        .ok_or_else(|| format!("Sheet {} not found", sheet_id))?;
+    sheet.clear_cell(row, col);
+    let mut graphs = state.dep_graphs.lock().map_err(|e| e.to_string())?;
+    if let Some(graph) = graphs.get_mut(sheet_id as usize) {
+        graph.clear_cell(row, col);
+    }
+    Ok(())
+}
+
 #[derive(serde::Serialize)]
 struct SearchResultData {
     row: u32,
@@ -210,10 +296,13 @@ struct SearchResultData {
 }
 
 #[tauri::command]
-fn new_workbook(state: State<AppState>) -> Result<Vec<SheetInfo>, String> {
+fn new_workbook(
+    state: State<AppState>,
+    comments: State<'_, Mutex<CommentManager>>,
+) -> Result<Vec<SheetInfo>, String> {
     let mut wb = state.workbook.lock().map_err(|e| e.to_string())?;
     *wb = Workbook::new();
-    clear_derived_workbook_state(state.inner())?;
+    clear_full_workbook_state(state.inner(), comments.inner())?;
 
     Ok(sheet_infos(&wb))
 }
@@ -292,40 +381,13 @@ fn set_cell(
     state: State<AppState>,
 ) -> Result<(), String> {
     ensure_can_edit_cell(state.inner(), sheet_id, row, col)?;
-    let mut wb = state.workbook.lock().map_err(|e| e.to_string())?;
-    let sheet_count = wb.sheet_count();
-    let sheet = wb
-        .sheet_mut(sheet_id as usize)
-        .ok_or_else(|| format!("Sheet {} not found", sheet_id))?;
-    if value.starts_with('=') {
-        let mut graphs = state.dep_graphs.lock().map_err(|e| e.to_string())?;
-        if (sheet_id as usize) >= graphs.len() {
-            while graphs.len() < sheet_count {
-                graphs.push(DependencyGraph::new());
-            }
-        }
-        if let Some(graph) = graphs.get_mut(sheet_id as usize) {
-            let _ = graph.set_formula(row, col, &value);
-        }
-    } else {
-        let mut graphs = state.dep_graphs.lock().map_err(|e| e.to_string())?;
-        if (sheet_id as usize) < graphs.len() {
-            graphs[sheet_id as usize].clear_cell(row, col);
-        }
-    }
-    sheet.set_cell_value(row, col, value);
-    Ok(())
+    set_cell_value_in_workbook(state.inner(), sheet_id, row, col, value)
 }
 
 #[tauri::command]
 fn clear_cell(sheet_id: u32, row: u32, col: u32, state: State<AppState>) -> Result<(), String> {
     ensure_can_edit_cell(state.inner(), sheet_id, row, col)?;
-    let mut wb = state.workbook.lock().map_err(|e| e.to_string())?;
-    let sheet = wb
-        .sheet_mut(sheet_id as usize)
-        .ok_or_else(|| format!("Sheet {} not found", sheet_id))?;
-    sheet.clear_cell(row, col);
-    Ok(())
+    clear_cell_in_workbook(state.inner(), sheet_id, row, col)
 }
 
 #[tauri::command]
@@ -384,6 +446,7 @@ fn get_sheet_data(sheet_id: u32, state: State<AppState>) -> Result<Vec<CellData>
                 value: cell.raw.clone(),
                 display,
                 cell_type: format!("{:?}", cell.cell_type).to_lowercase(),
+                format: sheet.get_format(row, col).cloned(),
             }
         })
         .collect())
@@ -430,11 +493,15 @@ fn evaluate_formula(
 }
 
 #[tauri::command]
-fn import_xlsx(data: Vec<u8>, state: State<AppState>) -> Result<Vec<SheetInfo>, String> {
+fn import_xlsx(
+    data: Vec<u8>,
+    state: State<AppState>,
+    comments: State<'_, Mutex<CommentManager>>,
+) -> Result<Vec<SheetInfo>, String> {
     let imported = sheets_xlsx::import_workbook(&data).map_err(|e| e.to_string())?;
     let mut wb = state.workbook.lock().map_err(|e| e.to_string())?;
     *wb = imported;
-    clear_derived_workbook_state(state.inner())?;
+    clear_full_workbook_state(state.inner(), comments.inner())?;
     Ok(sheet_infos(&wb))
 }
 
@@ -445,11 +512,15 @@ fn export_xlsx(state: State<AppState>) -> Result<Vec<u8>, String> {
 }
 
 #[tauri::command]
-fn import_xlsx_file(file_path: String, state: State<AppState>) -> Result<Vec<SheetInfo>, String> {
+fn import_xlsx_file(
+    file_path: String,
+    state: State<AppState>,
+    comments: State<'_, Mutex<CommentManager>>,
+) -> Result<Vec<SheetInfo>, String> {
     let path = checked_absolute_path(&file_path)?;
     ensure_allowed_extension(&path, &["xlsx"])?;
     let data = std::fs::read(path).map_err(|e| e.to_string())?;
-    import_xlsx(data, state)
+    import_xlsx(data, state, comments)
 }
 
 #[tauri::command]
@@ -533,11 +604,15 @@ fn export_csv_file(
 }
 
 #[tauri::command]
-fn import_json_data(data: String, state: State<AppState>) -> Result<Vec<SheetInfo>, String> {
+fn import_json_data(
+    data: String,
+    state: State<AppState>,
+    comments: State<'_, Mutex<CommentManager>>,
+) -> Result<Vec<SheetInfo>, String> {
     let imported = sheets_json::import_workbook_json(&data).map_err(|e| e.to_string())?;
     let mut wb = state.workbook.lock().map_err(|e| e.to_string())?;
     *wb = imported;
-    clear_derived_workbook_state(state.inner())?;
+    clear_full_workbook_state(state.inner(), comments.inner())?;
     Ok(sheet_infos(&wb))
 }
 
@@ -548,11 +623,15 @@ fn export_json(state: State<AppState>) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn import_json_file(file_path: String, state: State<AppState>) -> Result<Vec<SheetInfo>, String> {
+fn import_json_file(
+    file_path: String,
+    state: State<AppState>,
+    comments: State<'_, Mutex<CommentManager>>,
+) -> Result<Vec<SheetInfo>, String> {
     let path = checked_absolute_path(&file_path)?;
     ensure_allowed_extension(&path, &["json"])?;
     let data = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    import_json_data(data, state)
+    import_json_data(data, state, comments)
 }
 
 #[tauri::command]
@@ -1385,5 +1464,68 @@ mod tests {
     fn allowed_extension_is_case_insensitive() {
         assert!(ensure_allowed_extension(&PathBuf::from("/tmp/data.XLSX"), &["xlsx"]).is_ok());
         assert!(ensure_allowed_extension(&PathBuf::from("/tmp/data.exe"), &["xlsx"]).is_err());
+    }
+
+    #[test]
+    fn set_cell_rejects_and_does_not_store_circular_formula() {
+        let state = test_state();
+
+        set_cell_value_in_workbook(&state, 0, 0, 0, "=B1".into()).unwrap();
+        let result = set_cell_value_in_workbook(&state, 0, 0, 1, "=A1".into());
+
+        assert!(result.is_err());
+        {
+            let wb = state.workbook.lock().unwrap();
+            let sheet = wb.sheet(0).unwrap();
+            assert_eq!(sheet.cell_value(0, 0), Some("=B1".into()));
+            assert_eq!(sheet.cell_value(0, 1), None);
+        }
+        let graphs = state.dep_graphs.lock().unwrap();
+        let graph = graphs.first().unwrap();
+        assert!(graph.get_dependencies(0, 0).unwrap().contains(&(0, 1)));
+        assert!(graph.get_dependencies(0, 1).is_none());
+    }
+
+    #[test]
+    fn clear_cell_removes_formula_edges_from_dependency_graph() {
+        let state = test_state();
+
+        set_cell_value_in_workbook(&state, 0, 0, 0, "=B1".into()).unwrap();
+        clear_cell_in_workbook(&state, 0, 0, 0).unwrap();
+
+        let graphs = state.dep_graphs.lock().unwrap();
+        let graph = graphs.first().unwrap();
+        assert!(graph.get_dependencies(0, 0).is_none());
+        assert!(graph
+            .get_dependents(0, 1)
+            .map(|deps| deps.is_empty())
+            .unwrap_or(true));
+    }
+
+    #[test]
+    fn non_formula_edit_removes_prior_formula_edges() {
+        let state = test_state();
+
+        set_cell_value_in_workbook(&state, 0, 0, 0, "=B1".into()).unwrap();
+        set_cell_value_in_workbook(&state, 0, 0, 0, "plain text".into()).unwrap();
+
+        let graphs = state.dep_graphs.lock().unwrap();
+        let graph = graphs.first().unwrap();
+        assert!(graph.get_dependencies(0, 0).is_none());
+        assert!(graph
+            .get_dependents(0, 1)
+            .map(|deps| deps.is_empty())
+            .unwrap_or(true));
+    }
+
+    #[test]
+    fn full_workbook_reset_clears_comments() {
+        let state = test_state();
+        let comments = Mutex::new(CommentManager::new());
+        comments.lock().unwrap().add(0, 0, "stale", "tester");
+
+        clear_full_workbook_state(&state, &comments).unwrap();
+
+        assert_eq!(comments.lock().unwrap().count(), 0);
     }
 }

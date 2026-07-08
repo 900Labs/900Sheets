@@ -2,18 +2,54 @@ use crate::error::CsvError;
 use sheets_core::sheet::Sheet;
 
 const MAX_CSV_SIZE: usize = 100 * 1024 * 1024;
+const MAX_CELLS: usize = 10_000_000;
+const MAX_ROWS: usize = 1_000_000;
+const MAX_COLS: usize = 16_384;
+
+#[derive(Clone, Copy)]
+struct ImportLimits {
+    max_bytes: usize,
+    max_cells: usize,
+    max_rows: usize,
+    max_cols: usize,
+}
+
+impl Default for ImportLimits {
+    fn default() -> Self {
+        Self {
+            max_bytes: MAX_CSV_SIZE,
+            max_cells: MAX_CELLS,
+            max_rows: MAX_ROWS,
+            max_cols: MAX_COLS,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ImportBudget {
+    cells: usize,
+}
 
 pub fn import_csv(data: &str, delimiter: char) -> Result<Sheet, CsvError> {
     import_csv_with_name(data, delimiter, "Sheet1")
 }
 
 pub fn import_csv_with_name(data: &str, delimiter: char, name: &str) -> Result<Sheet, CsvError> {
-    if data.len() > MAX_CSV_SIZE {
-        return Err(CsvError::FileTooLarge(data.len(), MAX_CSV_SIZE));
+    import_csv_with_name_and_limits(data, delimiter, name, ImportLimits::default())
+}
+
+fn import_csv_with_name_and_limits(
+    data: &str,
+    delimiter: char,
+    name: &str,
+    limits: ImportLimits,
+) -> Result<Sheet, CsvError> {
+    if data.len() > limits.max_bytes {
+        return Err(CsvError::FileTooLarge(data.len(), limits.max_bytes));
     }
     let mut sheet = Sheet::new(name);
 
-    let rows = parse_csv_data(data, delimiter);
+    let rows = parse_csv_data(data, delimiter, limits)?;
     for (row, fields) in rows.iter().enumerate() {
         for (col, field) in fields.iter().enumerate() {
             if !field.is_empty() {
@@ -25,10 +61,46 @@ pub fn import_csv_with_name(data: &str, delimiter: char, name: &str) -> Result<S
     Ok(sheet)
 }
 
-fn parse_csv_data(data: &str, delimiter: char) -> Vec<Vec<String>> {
+fn push_field(
+    current_row: &mut Vec<String>,
+    current_field: &mut String,
+    budget: &mut ImportBudget,
+    limits: ImportLimits,
+) -> Result<(), CsvError> {
+    let next_col_count = current_row.len() + 1;
+    if next_col_count > limits.max_cols {
+        return Err(CsvError::TooManyColumns(next_col_count, limits.max_cols));
+    }
+    budget.cells = budget.cells.saturating_add(1);
+    if budget.cells > limits.max_cells {
+        return Err(CsvError::TooManyCells(budget.cells, limits.max_cells));
+    }
+    current_row.push(std::mem::take(current_field));
+    Ok(())
+}
+
+fn push_row(
+    rows: &mut Vec<Vec<String>>,
+    current_row: &mut Vec<String>,
+    limits: ImportLimits,
+) -> Result<(), CsvError> {
+    let next_row_count = rows.len() + 1;
+    if next_row_count > limits.max_rows {
+        return Err(CsvError::TooManyRows(next_row_count, limits.max_rows));
+    }
+    rows.push(std::mem::take(current_row));
+    Ok(())
+}
+
+fn parse_csv_data(
+    data: &str,
+    delimiter: char,
+    limits: ImportLimits,
+) -> Result<Vec<Vec<String>>, CsvError> {
     let mut rows = Vec::new();
     let mut current_row = Vec::new();
     let mut current_field = String::new();
+    let mut budget = ImportBudget::default();
     let mut in_quotes = false;
     let mut chars = data.chars().peekable();
 
@@ -47,15 +119,15 @@ fn parse_csv_data(data: &str, delimiter: char) -> Vec<Vec<String>> {
         } else if ch == '"' {
             in_quotes = true;
         } else if ch == delimiter {
-            current_row.push(std::mem::take(&mut current_field));
+            push_field(&mut current_row, &mut current_field, &mut budget, limits)?;
         } else if ch == '\n' {
-            current_row.push(std::mem::take(&mut current_field));
-            rows.push(std::mem::take(&mut current_row));
+            push_field(&mut current_row, &mut current_field, &mut budget, limits)?;
+            push_row(&mut rows, &mut current_row, limits)?;
         } else if ch == '\r' {
-            // Skip \r — handle \r\n and bare \r
+            // Skip \r; handle \r\n and bare \r.
             if chars.peek() != Some(&'\n') {
-                current_row.push(std::mem::take(&mut current_field));
-                rows.push(std::mem::take(&mut current_row));
+                push_field(&mut current_row, &mut current_field, &mut budget, limits)?;
+                push_row(&mut rows, &mut current_row, limits)?;
             }
         } else {
             current_field.push(ch);
@@ -64,11 +136,11 @@ fn parse_csv_data(data: &str, delimiter: char) -> Vec<Vec<String>> {
 
     // Flush last field/row if there's remaining data
     if !current_field.is_empty() || !current_row.is_empty() {
-        current_row.push(current_field);
-        rows.push(current_row);
+        push_field(&mut current_row, &mut current_field, &mut budget, limits)?;
+        push_row(&mut rows, &mut current_row, limits)?;
     }
 
-    rows
+    Ok(rows)
 }
 
 pub fn detect_delimiter(data: &str) -> char {
@@ -197,5 +269,45 @@ mod tests {
         assert_eq!(sheet.cell_value(0, 1), Some("b".into()));
         assert_eq!(sheet.cell_value(1, 0), Some("c".into()));
         assert_eq!(sheet.cell_value(1, 1), Some("d".into()));
+    }
+
+    #[test]
+    fn test_import_rejects_too_many_rows() {
+        let limits = ImportLimits {
+            max_rows: 1,
+            ..ImportLimits::default()
+        };
+        let result = import_csv_with_name_and_limits("a\nb", ',', "Sheet1", limits);
+        assert!(matches!(result, Err(CsvError::TooManyRows(2, 1))));
+    }
+
+    #[test]
+    fn test_import_rejects_too_many_columns() {
+        let limits = ImportLimits {
+            max_cols: 2,
+            ..ImportLimits::default()
+        };
+        let result = import_csv_with_name_and_limits("a,b,c", ',', "Sheet1", limits);
+        assert!(matches!(result, Err(CsvError::TooManyColumns(3, 2))));
+    }
+
+    #[test]
+    fn test_import_rejects_too_many_cells() {
+        let limits = ImportLimits {
+            max_cells: 3,
+            ..ImportLimits::default()
+        };
+        let result = import_csv_with_name_and_limits("a,b\nc,d", ',', "Sheet1", limits);
+        assert!(matches!(result, Err(CsvError::TooManyCells(4, 3))));
+    }
+
+    #[test]
+    fn test_import_rejects_oversized_csv_before_parse() {
+        let limits = ImportLimits {
+            max_bytes: 4,
+            ..ImportLimits::default()
+        };
+        let result = import_csv_with_name_and_limits("a,b,c", ',', "Sheet1", limits);
+        assert!(matches!(result, Err(CsvError::FileTooLarge(5, 4))));
     }
 }

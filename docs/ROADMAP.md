@@ -63,4 +63,4 @@
 - Updated README, ARCHITECTURE.md, and ROADMAP.md with full feature documentation
 - Updated CI workflow and verify-local.sh with frontend build check
 - Sprint documentation for sprints 9–16
-- Final quality gate: 386 tests, all-targets clippy clean, fmt clean, frontend check clean
+- Historical sprint-close quality gate passed; the current public release gate and test counts are tracked in `docs/QUALITY_GATE.md` and the README test suite table.

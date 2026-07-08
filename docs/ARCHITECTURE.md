@@ -84,6 +84,7 @@ Internationalization and accessibility:
 - Locale-aware number, currency, percentage, date, and time formatting
 - RTL support for Arabic, Hebrew, Persian, Urdu
 - Accessibility labels: ARIA labels, screen reader support, keyboard navigation metadata
+- Locale formatting and accessibility helpers are backend-ready; the desktop locale settings UI is not fully wired.
 
 #### sheets-print
 Print layout and PDF export:
@@ -103,6 +104,7 @@ Advanced spreadsheet features:
 - Goal seek: Newton's method with numerical derivatives, bisection fallback with range expansion
 - Scenario manager: named what-if scenarios with cell values, apply/restore, summary reports
 - Cell comments/notes with author tracking, visibility toggling, and bulk management
+- Protection, goal seek, and comments are wired into the desktop UI. Scenario support is available through the backend/IPC, with the full manager UI still pending.
 
 ### Frontend
 

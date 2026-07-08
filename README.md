@@ -32,9 +32,9 @@ Built by [900 Labs](https://www.900labs.com) — building enterprise-grade open 
 - **Charts & data visualization** — bar, line, pie, scatter, area, column, and doughnut charts with SVG generation and series extraction from sheet data.
 - **Statistical, financial, engineering, date/time, lookup, and array functions** — expanding the formula engine to 174 total functions.
 - **Advanced conditional formatting** — cell rules, top/bottom, data bars, color scales, icon sets, and formula-based rules. **Data validation** with input constraints, dropdowns, and error alerts.
-- **Internationalization** — 22 supported locales, 88 translation keys, locale-aware number/currency/percentage/date/time formatting, RTL support (Arabic, Hebrew). **Accessibility** — ARIA labels, screen reader support, keyboard navigation metadata.
+- **Internationalization backend** — 22 supported locales, 88 translation keys, locale-aware number/currency/percentage/date/time formatting, RTL support (Arabic, Hebrew). **Accessibility** — ARIA labels, screen reader support, keyboard navigation metadata. Full locale settings UI remains backend-ready rather than fully wired.
 - **Print & PDF export** — page layout (A4, A3, Letter, Legal, Tabloid), portrait/landscape, margins, scaling (fit-to-page, fit-to-width, custom %), headers/footers with `{page}`/`{pages}` templates, gridlines, row/column headings, print areas, repeating rows/columns, HTML print rendering, and minimal PDF 1.4 generation.
-- **Advanced features** — sheet protection with password hashing and granular permissions, cell locking, goal seek (Newton's method with bisection fallback), scenario manager for what-if analysis, and cell comments/notes with author tracking.
+- **Advanced features** — sheet protection with password hashing and granular permissions, cell locking, goal seek (Newton's method with bisection fallback), and cell comments/notes with author tracking are wired into the desktop app. Scenario support is available in the backend engine/IPC; the full scenario manager UI is not yet wired.
 - **Cell comments/notes** with author tracking, visibility toggling, and bulk management.
 
 ## Architecture
@@ -79,7 +79,7 @@ Repository layout:
 ## Build From Source
 
 Prerequisites:
-- Rust 1.88+ — install from [rustup.rs](https://rustup.rs)
+- Rust 1.92.0 — pinned in `rust-toolchain.toml`; install from [rustup.rs](https://rustup.rs)
 - Node.js 20.19+, 22.12+, or 24+ — install from [nodejs.org](https://nodejs.org)
 - Tauri CLI v2: `cargo install tauri-cli --version "^2"`
 - Tauri v2 system dependencies — see [v2.tauri.app/start/prerequisites](https://v2.tauri.app/start/prerequisites)
@@ -105,16 +105,20 @@ The local quality gate includes Rust formatting, clippy, Rust tests, Svelte type
 npx --prefix apps/desktop playwright install chromium
 ```
 
+Tagged releases run the macOS release workflow and upload an unsigned
+`900Sheets.app` artifact. Code signing, notarization, and Windows/Linux release
+artifacts remain release-operations follow-ups.
+
 ## Test Suite
 
-The project includes 387 unit tests across Rust crates and the desktop backend, plus 3 Playwright spreadsheet interaction smoke tests:
+The project includes 396 unit tests across Rust crates and the desktop backend, plus 6 Playwright spreadsheet interaction smoke tests:
 
 | Crate | Tests | Description |
 |-------|-------|-------------|
 | sheets-core | 65 | Workbook, sheet, cell, address, format |
-| sheets-formula | 111 | Parser, evaluator, 174 functions |
+| sheets-formula | 112 | Parser, evaluator, 174 functions |
 | sheets-xlsx | 12 | Import/export round-trip and import resource limits |
-| sheets-csv | 20 | Delimiter detection, import/export |
+| sheets-csv | 24 | Delimiter detection, import/export, import resource limits |
 | sheets-json | 18 | Import/export and import resource limits |
 | sheets-chart | 9 | Chart types, SVG generation |
 | sheets-pivot | 11 | Grouping, aggregation, filtering |
@@ -122,8 +126,8 @@ The project includes 387 unit tests across Rust crates and the desktop backend, 
 | sheets-i18n | 44 | Locales, translations, formatting, accessibility |
 | sheets-print | 25 | Page layout, HTML, PDF generation |
 | sheets-advanced | 32 | Protection, goal seek, scenarios, comments |
-| sheets-desktop backend | 5 | Tauri protection/path helper behavior |
-| Playwright E2E | 3 | Cell typing, Delete/Backspace clearing, compact toolbar menu viewport checks |
+| sheets-desktop backend | 9 | Tauri protection/path helper behavior, formula graph safety, reset cleanup |
+| Playwright E2E | 6 | Cell typing, Delete/Backspace clearing, formula bar/fx, copy/paste undo/redo, compact toolbar menu viewport checks |
 
 ## Documentation
 

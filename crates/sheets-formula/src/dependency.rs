@@ -17,31 +17,42 @@ impl DependencyGraph {
     pub fn set_formula(&mut self, row: u32, col: u32, formula: &str) -> Result<(), String> {
         let expr = Parser::parse_formula(formula).map_err(|e| e.to_string())?;
         let refs: HashSet<(u32, u32)> = expr.references().into_iter().collect();
+        let cell = (row, col);
 
-        if let Some(old_deps) = self.deps.remove(&(row, col)) {
-            for dep in &old_deps {
-                if let Some(deps_set) = self.dependents.get_mut(dep) {
-                    deps_set.remove(&(row, col));
-                }
+        let old_deps = self.remove_formula_edges(cell);
+        self.insert_formula_edges(cell, refs);
+
+        if self.has_circular_ref(row, col) {
+            self.remove_formula_edges(cell);
+            if let Some(old_deps) = old_deps {
+                self.insert_formula_edges(cell, old_deps);
             }
+            return Err(format!("Circular reference detected at ({}, {})", row, col));
         }
 
-        for dep in &refs {
-            self.dependents.entry(*dep).or_default().insert((row, col));
-        }
-
-        self.deps.insert((row, col), refs);
         Ok(())
     }
 
-    pub fn clear_cell(&mut self, row: u32, col: u32) {
-        if let Some(old_deps) = self.deps.remove(&(row, col)) {
-            for dep in &old_deps {
-                if let Some(deps_set) = self.dependents.get_mut(dep) {
-                    deps_set.remove(&(row, col));
-                }
+    fn remove_formula_edges(&mut self, cell: (u32, u32)) -> Option<HashSet<(u32, u32)>> {
+        let old_deps = self.deps.remove(&cell)?;
+        for dep in &old_deps {
+            if let Some(deps_set) = self.dependents.get_mut(dep) {
+                deps_set.remove(&cell);
             }
         }
+        Some(old_deps)
+    }
+
+    fn insert_formula_edges(&mut self, cell: (u32, u32), refs: HashSet<(u32, u32)>) {
+        for dep in &refs {
+            self.dependents.entry(*dep).or_default().insert(cell);
+        }
+
+        self.deps.insert(cell, refs);
+    }
+
+    pub fn clear_cell(&mut self, row: u32, col: u32) {
+        self.remove_formula_edges((row, col));
     }
 
     pub fn get_dependencies(&self, row: u32, col: u32) -> Option<&HashSet<(u32, u32)>> {
@@ -185,8 +196,32 @@ mod tests {
     fn test_circular_ref_detected() {
         let mut graph = DependencyGraph::new();
         graph.set_formula(0, 0, "B1").unwrap();
+        let result = graph.set_formula(0, 1, "A1");
+        assert!(result.is_err());
+        assert!(!graph.has_circular_ref(0, 0));
+        assert!(graph.get_dependencies(0, 1).is_none());
+        assert!(graph
+            .get_dependents(0, 0)
+            .map(|deps| !deps.contains(&(0, 1)))
+            .unwrap_or(true));
+    }
+
+    #[test]
+    fn test_circular_ref_rejection_rolls_back_old_dependencies() {
+        let mut graph = DependencyGraph::new();
+        graph.set_formula(0, 0, "C1").unwrap();
         graph.set_formula(0, 1, "A1").unwrap();
-        assert!(graph.has_circular_ref(0, 0));
+
+        let result = graph.set_formula(0, 0, "B1");
+
+        assert!(result.is_err());
+        let deps = graph.get_dependencies(0, 0).unwrap();
+        assert!(deps.contains(&(0, 2)));
+        assert!(!deps.contains(&(0, 1)));
+        assert!(graph
+            .get_dependents(0, 1)
+            .map(|deps| !deps.contains(&(0, 0)))
+            .unwrap_or(true));
     }
 
     #[test]

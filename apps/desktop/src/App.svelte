@@ -1096,7 +1096,13 @@
     activePanel = null
   }
 
-  function resetWorkbookSessionState() {
+  function resetCommentPanelState() {
+    commentText = ''
+    currentComment = null
+    allComments = []
+  }
+
+  function resetWorkbookSessionState(options: { clearComments?: boolean } = {}) {
     hiddenRows = {}
     activeFilterLabel = ''
     namedRanges = []
@@ -1106,6 +1112,7 @@
     validationResults = []
     frozenRowCount = 0
     frozenColCount = 0
+    if (options.clearComments) resetCommentPanelState()
   }
 
   function isInSelection(row: number, col: number): boolean {
@@ -1178,16 +1185,7 @@
         const key = cellKey(cell.row, cell.col)
         contents[key] = cell.value
         displays[key] = cell.display
-        try {
-          const fmt = await invoke<CellFormat | null>('get_cell_format', {
-            sheetId: activeSheetId,
-            row: cell.row,
-            col: cell.col,
-          })
-          if (fmt) formats[key] = fmt
-        } catch {
-          // format fetch is optional
-        }
+        if (cell.format) formats[key] = cell.format
       }
       cellContents = contents
       cellDisplays = displays
@@ -1645,12 +1643,16 @@
       const data = await invoke<CellData[]>('get_sheet_data', { sheetId: id })
       const contents: Record<string, string> = {}
       const displays: Record<string, string> = {}
+      const formats: CellFormatMap = {}
       for (const cell of data) {
-        contents[cellKey(cell.row, cell.col)] = cell.value
-        displays[cellKey(cell.row, cell.col)] = cell.display
+        const key = cellKey(cell.row, cell.col)
+        contents[key] = cell.value
+        displays[key] = cell.display
+        if (cell.format) formats[key] = cell.format
       }
       cellContents = contents
       cellDisplays = displays
+      cellFormats = formats
     } catch (e) {
       console.error('Failed to load sheet data:', e)
     }
@@ -1706,7 +1708,7 @@
     try {
       const result = await invoke<SheetInfo[]>('new_workbook')
       currentFilePath = null
-      resetWorkbookSessionState()
+      resetWorkbookSessionState({ clearComments: true })
       await loadSheetList(result)
       setStatus('New workbook')
     } catch (e) {
@@ -1723,7 +1725,7 @@
       if (!path) return
       const result = await invoke<SheetInfo[]>('import_xlsx_file', { filePath: path })
       currentFilePath = path
-      resetWorkbookSessionState()
+      resetWorkbookSessionState({ clearComments: true })
       await loadSheetList(result)
       setStatus(`Opened ${filename(path)}`)
     } catch (e) {
@@ -1761,7 +1763,7 @@
       if (!path) return
       const result = await invoke<SheetInfo[]>('import_json_file', { filePath: path })
       currentFilePath = null
-      resetWorkbookSessionState()
+      resetWorkbookSessionState({ clearComments: true })
       await loadSheetList(result)
       setStatus(`Imported ${filename(path)}`)
     } catch (e) {

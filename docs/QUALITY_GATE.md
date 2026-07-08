@@ -14,7 +14,7 @@ The quality gate must pass before merging to `main`. Run:
 4. **Frontend install**: `npm install --prefix apps/desktop` — dependencies installed
 5. **Frontend check**: `npm run check --prefix apps/desktop` — type check passes
 6. **Frontend build**: `npm run build --prefix apps/desktop` — build succeeds
-7. **Spreadsheet interaction smoke tests**: `npm run test:e2e --prefix apps/desktop` — core editing, formula, copy/paste, and compact-menu flows pass in Playwright
+7. **Spreadsheet interaction smoke tests**: `npm run test:e2e --prefix apps/desktop` — six core editing, formula bar/fx, copy/paste, and compact-menu flows pass in Playwright
 
 ## Failure Policy
 

@@ -46,7 +46,14 @@ async function installTauriMock(page: Page) {
           case 'get_sheet_data':
             return Array.from(cells.entries()).map(([key, cell]) => {
               const [row, col] = key.split(':').map(Number)
-              return { row, col, value: cell.value, display: cell.display }
+              return {
+                row,
+                col,
+                value: cell.value,
+                display: cell.display,
+                cell_type: cell.value.startsWith('=') ? 'formula' : 'text',
+                format: formats.get(key) ?? null,
+              }
             })
           case 'set_cell': {
             const value = String(args.value ?? '')

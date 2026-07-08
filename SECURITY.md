@@ -29,7 +29,7 @@ Security vulnerabilities in 900Sheets include:
 
 ## Known `cargo audit` Warnings
 
-Last verified on 2026-07-07, `cargo audit` reports no failing vulnerabilities
+Last verified on 2026-07-08, `cargo audit` reports no failing vulnerabilities
 and exits successfully. It does report 17 warnings from transitive dependencies
 introduced by the Tauri/wry Linux GTK/WebKit stack and parser tooling. These are
 not in 900Sheets application code.

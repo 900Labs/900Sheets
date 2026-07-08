@@ -9,6 +9,7 @@ export interface CellData {
   value: string
   display: string
   cell_type: string
+  format?: CellFormat | null
 }
 
 export interface CellRange {

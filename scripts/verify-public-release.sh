@@ -11,9 +11,11 @@ SOURCE_PATHS=(
   Cargo.toml
   Cargo.lock
   README.md
+  CHANGELOG.md
   SECURITY.md
   CONTRIBUTING.md
   CODE_OF_CONDUCT.md
+  rust-toolchain.toml
   apps
   crates
   docs
