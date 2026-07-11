@@ -30,10 +30,14 @@ pub fn import_workbook(data: &[u8]) -> Result<Workbook, XlsxError> {
         return Ok(workbook);
     }
 
-    workbook.rename_sheet(0, &sheets[0].0);
+    workbook
+        .rename_sheet(0, &sheets[0].0)
+        .map_err(|error| XlsxError::InvalidFormat(error.to_string()))?;
 
     for (name, _) in sheets.iter().skip(1) {
-        workbook.add_sheet(name);
+        workbook
+            .add_sheet(name)
+            .map_err(|error| XlsxError::InvalidFormat(error.to_string()))?;
     }
 
     let mut total_cells = 0usize;
@@ -826,6 +830,24 @@ mod tests {
             workbook.sheet(1).unwrap().cell_value(0, 0),
             Some("99".into())
         );
+    }
+
+    #[test]
+    fn test_import_rejects_case_insensitive_duplicate_sheet_names() {
+        use std::io::Write;
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("xl/workbook.xml", options).unwrap();
+        zip.write_all(br#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/><sheet name="data" sheetId="2" r:id="rId2"/></sheets></workbook>"#).unwrap();
+        zip.start_file("xl/_rels/workbook.xml.rels", options)
+            .unwrap();
+        zip.write_all(br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/></Relationships>"#).unwrap();
+        let data = zip.finish().unwrap().into_inner();
+
+        assert!(matches!(
+            import_workbook(&data),
+            Err(XlsxError::InvalidFormat(message)) if message.contains("already exists")
+        ));
     }
 
     fn create_minimal_xlsx() -> Vec<u8> {

@@ -17,9 +17,11 @@ It runs:
 7. `npm run test:unit --prefix apps/desktop`
 8. `npm run test:e2e --prefix apps/desktop`
 
-The v0.3.0 baseline is 418 Rust tests, 4 mutation-queue unit tests, and 8 Playwright tests. A higher count is expected when new tests are added. The gate must remain free of Rust warnings and Svelte or TypeScript diagnostics.
+The v0.4.0 release-prep baseline is 462 Rust tests, 9 frontend unit tests, and 16 Playwright tests. A higher count is expected when new tests are added. The gate must remain free of Rust warnings and Svelte or TypeScript diagnostics.
 
 The XLSX compatibility test opens and re-saves a generated workbook with LibreOffice. CI installs LibreOffice and fails if `soffice` is unavailable. Local runs report a skip when LibreOffice is not installed.
+
+The `recovery-platform-checks` CI matrix runs all desktop library tests on Ubuntu and Windows. This keeps the Unix and Windows recovery implementations compiled and executes the cleanup-retirement regression on both platforms.
 
 ## Public-release preflight
 
@@ -29,8 +31,9 @@ Before tagging, also run:
 ./scripts/verify-public-release.sh
 npm audit --prefix apps/desktop --audit-level=high
 cargo audit
-npm run tauri:build --prefix apps/desktop
 ```
+
+On macOS, also build and verify the release bundle with `npm run tauri:build --prefix apps/desktop`, then follow the signing and archive checks in [RELEASING.md](RELEASING.md). On Windows or Linux, `cargo build --release -p sheets-desktop` is a valid non-bundle compile check. It does not produce a supported package.
 
 Confirm that:
 

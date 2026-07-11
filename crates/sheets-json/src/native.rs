@@ -113,17 +113,48 @@ pub fn import_native_workbook_with_metadata(
         return Err(JsonError::TooManyCells(item_count, MAX_CELLS_AND_FORMATS));
     }
 
-    let mut workbook = Workbook::new();
-    workbook.rename_sheet(0, &native.sheets[0].name);
-    if native.sheets[0].stable_id != 0 {
-        workbook.set_sheet_stable_id(0, native.sheets[0].stable_id);
+    let mut assigned_ids = Vec::with_capacity(native.sheets.len());
+    let mut used_ids: std::collections::HashSet<u64> = native
+        .sheets
+        .iter()
+        .filter_map(|sheet| (sheet.stable_id != 0).then_some(sheet.stable_id))
+        .collect();
+    let nonzero_count = native
+        .sheets
+        .iter()
+        .filter(|sheet| sheet.stable_id != 0)
+        .count();
+    if used_ids.len() != nonzero_count {
+        return Err(JsonError::InvalidStructure(
+            "native workbook contains duplicate stable sheet IDs".into(),
+        ));
     }
-    for sheet in native.sheets.iter().skip(1) {
-        let index = workbook.add_sheet(&sheet.name);
+    let mut next_generated_id = 1u64;
+    for sheet in &native.sheets {
         if sheet.stable_id != 0 {
-            workbook.set_sheet_stable_id(index, sheet.stable_id);
+            assigned_ids.push(sheet.stable_id);
+        } else {
+            while used_ids.contains(&next_generated_id) {
+                next_generated_id = next_generated_id.saturating_add(1);
+            }
+            assigned_ids.push(next_generated_id);
+            used_ids.insert(next_generated_id);
+            next_generated_id = next_generated_id.saturating_add(1);
         }
     }
+
+    let mut workbook = Workbook::new();
+    workbook
+        .rename_sheet(0, &native.sheets[0].name)
+        .map_err(|error| JsonError::InvalidStructure(error.to_string()))?;
+    for sheet in native.sheets.iter().skip(1) {
+        workbook
+            .add_sheet(&sheet.name)
+            .map_err(|error| JsonError::InvalidStructure(error.to_string()))?;
+    }
+    workbook
+        .replace_sheet_stable_ids(&assigned_ids)
+        .map_err(|error| JsonError::InvalidStructure(error.to_string()))?;
     let active_sheet = native.active_sheet;
     let metadata = native.metadata;
     for (index, source) in native.sheets.into_iter().enumerate() {
@@ -160,8 +191,8 @@ mod tests {
     #[test]
     fn native_roundtrip_preserves_sparse_cells_formulas_formats_and_active_sheet() {
         let mut workbook = Workbook::new();
-        workbook.rename_sheet(0, "Data");
-        workbook.add_sheet("Report");
+        workbook.rename_sheet(0, "Data").unwrap();
+        workbook.add_sheet("Report").unwrap();
         workbook.set_active_sheet(1);
         workbook
             .sheet_mut(0)
@@ -196,7 +227,7 @@ mod tests {
     #[test]
     fn native_roundtrip_preserves_feature_metadata() {
         let mut workbook = Workbook::new();
-        workbook.add_sheet("Second");
+        workbook.add_sheet("Second").unwrap();
         let first_id = workbook.sheet(0).unwrap().stable_id();
         let second_id = workbook.sheet(1).unwrap().stable_id();
         let metadata = serde_json::json!({
@@ -210,5 +241,61 @@ mod tests {
         assert_eq!(restored, metadata);
         assert_eq!(restored_workbook.sheet(0).unwrap().stable_id(), first_id);
         assert_eq!(restored_workbook.sheet(1).unwrap().stable_id(), second_id);
+    }
+
+    #[test]
+    fn native_roundtrip_preserves_cross_sheet_formula_text_and_stable_ids() {
+        let mut workbook = Workbook::new();
+        workbook.rename_sheet(0, "Annual Budget").unwrap();
+        let report = workbook.add_sheet("Report").unwrap();
+        workbook.sheet_mut(report).unwrap().set_cell_value(
+            0,
+            0,
+            "=SUM('Annual Budget'!$A$1:$A$2)".into(),
+        );
+        let source_id = workbook.sheet(0).unwrap().stable_id();
+
+        let restored = import_native_workbook(&export_native_workbook(&workbook).unwrap()).unwrap();
+        assert_eq!(restored.sheet(0).unwrap().stable_id(), source_id);
+        assert_eq!(
+            restored.sheet(1).unwrap().cell_value(0, 0),
+            Some("=SUM('Annual Budget'!$A$1:$A$2)".into())
+        );
+    }
+
+    #[test]
+    fn native_import_rejects_duplicate_nonzero_stable_ids() {
+        let data = serde_json::json!({
+            "format": "900Sheets",
+            "version": 1,
+            "active_sheet": 0,
+            "sheets": [
+                {"stable_id": 7, "name": "First", "cells": [], "formats": []},
+                {"stable_id": 7, "name": "Second", "cells": [], "formats": []}
+            ]
+        })
+        .to_string();
+        assert!(matches!(
+            import_native_workbook(&data),
+            Err(JsonError::InvalidStructure(message)) if message.contains("duplicate stable")
+        ));
+    }
+
+    #[test]
+    fn native_import_remaps_legacy_zero_ids_without_colliding_with_explicit_ids() {
+        let data = serde_json::json!({
+            "format": "900Sheets",
+            "version": 1,
+            "active_sheet": 0,
+            "sheets": [
+                {"stable_id": 0, "name": "Legacy", "cells": [], "formats": []},
+                {"stable_id": 1, "name": "Explicit", "cells": [], "formats": []}
+            ]
+        })
+        .to_string();
+        let workbook = import_native_workbook(&data).unwrap();
+        assert_eq!(workbook.sheet(1).unwrap().stable_id(), 1);
+        assert_ne!(workbook.sheet(0).unwrap().stable_id(), 1);
+        assert_ne!(workbook.sheet(0).unwrap().stable_id(), 0);
     }
 }

@@ -27,6 +27,7 @@ npm run tauri:dev --prefix apps/desktop
 - Rust must pass `cargo fmt` and clippy with warnings denied.
 - Behavior changes need tests at the closest reliable layer.
 - File-format regressions need a minimal fixture or generated test archive.
+- Compatibility claims must include the exact test or fixture ID in `docs/COMPATIBILITY_MATRIX.md`.
 - User-visible changes need matching documentation.
 - Do not claim compatibility that the tests do not prove.
 - Keep new prose direct and do not use em dashes.
@@ -40,11 +41,19 @@ Run the complete gate:
 ./scripts/verify-local.sh
 ```
 
-For public-release or packaging changes, also run:
+For public-release or macOS packaging changes, also run on macOS:
 
 ```bash
 ./scripts/verify-public-release.sh
 npm run tauri:build --prefix apps/desktop
+```
+
+On Windows or Linux, validate source without claiming a package:
+
+```bash
+npm run build --prefix apps/desktop
+cargo test -p sheets-desktop --lib
+cargo build --release -p sheets-desktop
 ```
 
 ## Pull requests

@@ -127,8 +127,8 @@ mod tests {
     #[test]
     fn test_export_multiple_sheets() {
         let mut wb = Workbook::new();
-        wb.rename_sheet(0, "First");
-        wb.add_sheet("Second");
+        wb.rename_sheet(0, "First").unwrap();
+        wb.add_sheet("Second").unwrap();
         wb.sheet_mut(0).unwrap().set_cell_value(0, 0, "a".into());
         wb.sheet_mut(1).unwrap().set_cell_value(0, 0, "b".into());
 

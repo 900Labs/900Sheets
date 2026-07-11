@@ -6,6 +6,7 @@
 2. Search existing GitHub issues for the same behavior.
 3. Confirm the problem on the latest tagged release or current `main` branch.
 4. Keep the original workbook private unless it contains no sensitive data.
+5. For recovery problems, note whether the prompt appeared at startup and whether Save Workbook offered a cleanup retry. Do not copy recovery files into a public issue if they contain real data.
 
 ## Bug reports
 

@@ -10,6 +10,22 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  recovery-platform-checks:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.92.0
+      - name: Install Linux Tauri system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev librsvg2-dev
+      - name: Desktop recovery and transaction regression tests
+        run: cargo test -p sheets-desktop --lib
+
   rust-checks:
     runs-on: ubuntu-latest
     steps:

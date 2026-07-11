@@ -145,6 +145,7 @@ impl Parser {
             Token::Number(n) => Ok(Expr::Number(n)),
             Token::String(s) => Ok(Expr::String(s)),
             Token::Boolean(b) => Ok(Expr::Boolean(b)),
+            Token::Error(error) => Ok(Expr::Error(error)),
             Token::CellRef(s) => {
                 let (sheet, col, row, abs_col, abs_row) = parse_cell_ref(&s)
                     .ok_or(FormulaError::ParseError(format!("Invalid cell ref: {}", s)))?;

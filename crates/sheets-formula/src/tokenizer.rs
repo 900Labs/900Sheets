@@ -8,6 +8,7 @@ pub enum Token {
     CellRef(String),
     RangeRef(String),
     Function(String),
+    Error(FormulaError),
     Plus,
     Minus,
     Asterisk,
@@ -127,6 +128,10 @@ impl Tokenizer {
 
         if ch == '#' {
             return self.read_error_literal();
+        }
+
+        if ch == '\'' {
+            return self.read_quoted_sheet_reference();
         }
 
         if ch.is_ascii_alphabetic() || ch == '_' || ch == '$' {
@@ -279,7 +284,16 @@ impl Tokenizer {
             self.pos += 1;
         }
         let s: String = self.input[start..self.pos].iter().collect();
-        Ok(Token::String(s))
+        let error = match s.as_str() {
+            "#REF!" => FormulaError::RefError("Invalid reference".into()),
+            "#DIV/0!" => FormulaError::DivisionByZero,
+            "#NAME?" => FormulaError::UnknownFunction("Invalid name".into()),
+            "#N/A" => FormulaError::NotAvailable("Not available".into()),
+            "#NUM!" => FormulaError::NumError("Invalid number".into()),
+            "#VALUE!" => FormulaError::ValueError("Invalid value".into()),
+            _ => FormulaError::EvalError(s),
+        };
+        Ok(Token::Error(error))
     }
 
     fn read_identifier(&mut self) -> Result<Token, FormulaError> {
@@ -295,9 +309,8 @@ impl Tokenizer {
         let s: String = self.input[start..self.pos].iter().collect();
 
         if self.peek() == Some('!') {
-            return Err(FormulaError::ParseError(
-                "Cross-sheet references are not supported in this release".into(),
-            ));
+            self.advance();
+            return self.read_qualified_reference(s);
         }
 
         if self.peek() == Some('(') {
@@ -332,6 +345,102 @@ impl Tokenizer {
         }
 
         Ok(Token::CellRef(s))
+    }
+
+    fn read_quoted_sheet_reference(&mut self) -> Result<Token, FormulaError> {
+        let start = self.pos;
+        self.advance();
+        loop {
+            match self.advance() {
+                Some('\'') if self.peek() == Some('\'') => {
+                    self.advance();
+                }
+                Some('\'') => break,
+                Some(_) => {}
+                None => {
+                    return Err(FormulaError::ParseError(
+                        "Unterminated quoted sheet name".into(),
+                    ))
+                }
+            }
+        }
+        if self.peek() != Some('!') {
+            return Err(FormulaError::ParseError(
+                "Quoted sheet name must be followed by !".into(),
+            ));
+        }
+        let sheet: String = self.input[start..self.pos].iter().collect();
+        self.advance();
+        self.read_qualified_reference(sheet)
+    }
+
+    fn read_qualified_reference(&mut self, sheet: String) -> Result<Token, FormulaError> {
+        if self.peek() == Some('#') {
+            return self.read_error_literal();
+        }
+        let cell = self.read_cell_component()?;
+        let first = format!("{sheet}!{cell}");
+        self.read_optional_range(first)
+    }
+
+    fn read_cell_component(&mut self) -> Result<String, FormulaError> {
+        let start = self.pos;
+        while self.pos < self.input.len() {
+            let ch = self.input[self.pos];
+            if ch.is_ascii_alphanumeric() || ch == '$' {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        if self.pos == start {
+            return Err(FormulaError::ParseError(
+                "Expected cell reference after sheet name".into(),
+            ));
+        }
+        Ok(self.input[start..self.pos].iter().collect())
+    }
+
+    fn read_optional_range(&mut self, first: String) -> Result<Token, FormulaError> {
+        if self.peek() != Some(':') {
+            return Ok(Token::CellRef(first));
+        }
+        self.advance();
+        let second = if self.peek() == Some('\'') {
+            let token = self.read_quoted_sheet_reference()?;
+            match token {
+                Token::CellRef(reference) => reference,
+                _ => {
+                    return Err(FormulaError::ParseError(
+                        "Invalid range end reference".into(),
+                    ))
+                }
+            }
+        } else {
+            let start = self.pos;
+            while self.pos < self.input.len() {
+                let ch = self.input[self.pos];
+                if ch.is_ascii_alphanumeric() || ch == '_' || ch == '$' || ch == '.' {
+                    self.pos += 1;
+                } else {
+                    break;
+                }
+            }
+            if self.pos == start {
+                return Err(FormulaError::ParseError(
+                    "Expected range end reference".into(),
+                ));
+            }
+            let prefix: String = self.input[start..self.pos].iter().collect();
+            if self.peek() == Some('!') {
+                self.advance();
+                let cell = self.read_cell_component()?;
+                format!("{prefix}!{cell}")
+            } else {
+                prefix
+            }
+        };
+        Ok(Token::RangeRef(format!("{first}:{second}")))
     }
 }
 
@@ -383,9 +492,23 @@ mod tests {
     }
 
     #[test]
-    fn test_cross_sheet_reference_has_clear_error() {
-        let error = tokenize("Sheet2!A1").unwrap_err();
-        assert!(error.to_string().contains("Cross-sheet references"));
+    fn test_tokenize_cross_sheet_references() {
+        assert_eq!(
+            tokenize("Sheet2!$A$1").unwrap(),
+            vec![Token::CellRef("Sheet2!$A$1".into())]
+        );
+        assert_eq!(
+            tokenize("'Annual Budget'!A1:B2").unwrap(),
+            vec![Token::RangeRef("'Annual Budget'!A1:B2".into())]
+        );
+        assert_eq!(
+            tokenize("'Sam''s Data'!A1").unwrap(),
+            vec![Token::CellRef("'Sam''s Data'!A1".into())]
+        );
+        assert!(matches!(
+            tokenize("Data!#REF!").unwrap().as_slice(),
+            [Token::Error(FormulaError::RefError(_))]
+        ));
     }
 
     #[test]

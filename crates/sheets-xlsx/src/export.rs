@@ -533,8 +533,8 @@ mod tests {
     #[test]
     fn test_export_multiple_sheets() {
         let mut wb = Workbook::new();
-        wb.rename_sheet(0, "First");
-        wb.add_sheet("Second");
+        wb.rename_sheet(0, "First").unwrap();
+        wb.add_sheet("Second").unwrap();
         wb.sheet_mut(0).unwrap().set_cell_value(0, 0, "A1".into());
         wb.sheet_mut(1).unwrap().set_cell_value(0, 0, "B1".into());
 
@@ -546,6 +546,24 @@ mod tests {
         assert_eq!(wb2.sheets()[1].name(), "Second");
         assert_eq!(wb2.sheets()[0].cell_value(0, 0), Some("A1".into()));
         assert_eq!(wb2.sheets()[1].cell_value(0, 0), Some("B1".into()));
+    }
+
+    #[test]
+    fn test_cross_sheet_formula_roundtrip_preserves_quoted_absolute_reference() {
+        let mut workbook = Workbook::new();
+        workbook.rename_sheet(0, "Annual Budget").unwrap();
+        let report = workbook.add_sheet("Report").unwrap();
+        workbook.sheet_mut(report).unwrap().set_cell_value(
+            0,
+            0,
+            "=SUM('Annual Budget'!$A$1:$A$2)".into(),
+        );
+
+        let restored = crate::import_workbook(&export_workbook(&workbook).unwrap()).unwrap();
+        assert_eq!(
+            restored.sheet(1).unwrap().cell_value(0, 0),
+            Some("=SUM('Annual Budget'!$A$1:$A$2)".into())
+        );
     }
 
     #[test]
