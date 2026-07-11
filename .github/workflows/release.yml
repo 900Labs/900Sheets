@@ -23,14 +23,19 @@ jobs:
         run: npm ci --prefix apps/desktop
       - name: Build Tauri app
         run: npm run tauri:build --prefix apps/desktop
+      - name: Ad hoc sign and verify complete app bundle
+        run: |
+          codesign --force --deep --sign - target/release/bundle/macos/900Sheets.app
+          codesign --verify --deep --strict --verbose=2 target/release/bundle/macos/900Sheets.app
       - name: Archive app bundle with permissions
         run: ditto -c -k --sequesterRsrc --keepParent target/release/bundle/macos/900Sheets.app "target/release/bundle/macos/900Sheets-${GITHUB_REF_NAME}-macos.zip"
-      - name: Verify archived executable permission
+      - name: Verify extracted app signature and executable permission
         run: |
           mkdir -p "$RUNNER_TEMP/900sheets-archive-check"
           ditto -x -k "target/release/bundle/macos/900Sheets-${GITHUB_REF_NAME}-macos.zip" "$RUNNER_TEMP/900sheets-archive-check"
           test -x "$RUNNER_TEMP/900sheets-archive-check/900Sheets.app/Contents/MacOS/sheets-desktop"
-      - name: Upload unsigned app archive
+          codesign --verify --deep --strict --verbose=2 "$RUNNER_TEMP/900sheets-archive-check/900Sheets.app"
+      - name: Upload ad hoc signed app archive
         uses: actions/upload-artifact@v4
         with:
           name: 900Sheets-${{ github.ref_name }}-macos

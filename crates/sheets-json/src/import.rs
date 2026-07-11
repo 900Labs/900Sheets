@@ -122,19 +122,27 @@ fn import_from_json(
                 if sheets.is_empty() {
                     return Ok(workbook);
                 }
-                workbook.rename_sheet(
-                    0,
-                    sheets[0]
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("Sheet1"),
-                );
-                for (_i, sheet_json) in sheets.iter().enumerate().skip(1) {
-                    let name = sheet_json
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("Sheet");
-                    workbook.add_sheet(name);
+                let first_name = sheets[0]
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "Sheet1".to_string());
+                workbook
+                    .rename_sheet(0, first_name)
+                    .map_err(|error| JsonError::InvalidStructure(error.to_string()))?;
+                for (i, sheet_json) in sheets.iter().enumerate().skip(1) {
+                    let explicit_name = sheet_json.get("name").and_then(|v| v.as_str());
+                    let generated_name;
+                    let name = if let Some(name) = explicit_name {
+                        name
+                    } else {
+                        generated_name =
+                            workbook.next_available_sheet_name(&format!("Sheet{}", i + 1));
+                        &generated_name
+                    };
+                    workbook
+                        .add_sheet(name)
+                        .map_err(|error| JsonError::InvalidStructure(error.to_string()))?;
                 }
                 for (i, sheet_json) in sheets.iter().enumerate() {
                     if let Some(rows) = sheet_json.get("data").and_then(|v| v.as_array()) {
@@ -393,5 +401,24 @@ mod tests {
         };
         let result = import_workbook_json_with_limits("[1,2]", limits);
         assert!(matches!(result, Err(JsonError::FileTooLarge(5, 4))));
+    }
+
+    #[test]
+    fn test_import_rejects_case_insensitive_duplicate_sheet_names() {
+        let result = import_workbook_json(
+            r#"{"sheets":[{"name":"Data","data":[]},{"name":" data ","data":[]}]}"#,
+        );
+        assert!(matches!(
+            result,
+            Err(JsonError::InvalidStructure(message)) if message.contains("already exists")
+        ));
+    }
+
+    #[test]
+    fn test_import_assigns_unique_names_to_three_unnamed_sheets() {
+        let workbook =
+            import_workbook_json(r#"{"sheets":[{"data":[]},{"data":[]},{"data":[]}]}"#).unwrap();
+        let names: Vec<_> = workbook.sheets().iter().map(|sheet| sheet.name()).collect();
+        assert_eq!(names, vec!["Sheet1", "Sheet2", "Sheet3"]);
     }
 }

@@ -2879,7 +2879,7 @@ dependencies = [
 
 [[package]]
 name = "sheets-advanced"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2890,7 +2890,7 @@ dependencies = [
 
 [[package]]
 name = "sheets-chart"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "sheets-core",
@@ -2899,7 +2899,7 @@ dependencies = [
 
 [[package]]
 name = "sheets-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "serde",
@@ -2909,7 +2909,7 @@ dependencies = [
 
 [[package]]
 name = "sheets-csv"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "sheets-core",
  "thiserror 2.0.18",
@@ -2917,8 +2917,9 @@ dependencies = [
 
 [[package]]
 name = "sheets-desktop"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
+ "libc",
  "serde",
  "serde_json",
  "sheets-advanced",
@@ -2935,18 +2936,19 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "sheets-formula"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "sheets-core",
 ]
 
 [[package]]
 name = "sheets-i18n"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2956,7 +2958,7 @@ dependencies = [
 
 [[package]]
 name = "sheets-json"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2966,7 +2968,7 @@ dependencies = [
 
 [[package]]
 name = "sheets-pivot"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "sheets-core",
@@ -2975,7 +2977,7 @@ dependencies = [
 
 [[package]]
 name = "sheets-print"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "sheets-core",
@@ -2984,7 +2986,7 @@ dependencies = [
 
 [[package]]
 name = "sheets-validation"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "sheets-core",
@@ -2993,7 +2995,7 @@ dependencies = [
 
 [[package]]
 name = "sheets-xlsx"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "roxmltree",
  "serde",

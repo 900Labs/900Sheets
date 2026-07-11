@@ -44,15 +44,19 @@ The desktop toolbar exposes native-dialog flows backed by Rust commands:
 
 - Open native workbook: `import_native_file`
 - Save native workbook: `export_native_file`
-- Import XLSX: `import_xlsx_file`
+- Open XLSX as a replacement workbook: `import_xlsx_file`
 - Import CSV or TSV into the active sheet: `import_csv_file`
-- Import JSON workbook: `import_json_file`
+- Open JSON as a replacement workbook: `import_json_file`
 - Export XLSX: `export_xlsx_file`
 - Export active sheet as CSV: `export_csv_file`
 - Export workbook as JSON: `export_json_file`
 
-The backend validates absolute dialog paths and applies importer resource limits before replacing workbook state.
+The backend validates absolute dialog paths and applies importer resource limits before replacing workbook state. XLSX and JSON replace the workbook and clear history. CSV import is one undoable active-sheet transaction.
+
+Dirty workbooks are written to a separate recovery store after a 750 millisecond debounce and again during a close request. Startup recovery preserves unselected snapshots. Recovery writes and cleanup are serialized and use platform-specific atomic replacement.
 
 ## Bundle
 
-The default bundle target is the macOS `.app` bundle. DMG packaging is intentionally not the default until signing, notarization, and packaging prerequisites are configured.
+On macOS, `npm run tauri:build --prefix apps/desktop` creates the `.app` bundle. The release workflow then ad hoc signs and strictly verifies the complete bundle. DMG packaging, Developer ID signing, and notarization are not configured.
+
+On Windows or Linux, use `cargo build --release -p sheets-desktop` for a non-bundle source compile after building the frontend. This release does not publish or claim Windows or Linux packages.

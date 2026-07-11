@@ -1,144 +1,95 @@
-# Architecture Overview
+# Architecture
 
-## System Design
+900Sheets uses a Rust-owned workbook model behind a Tauri v2 command boundary. The Svelte 5 frontend is a projection of that state and coordinates user interactions, transactions, and recovery scheduling.
 
-900Sheets follows the 900 Labs pattern of Rust-owned data models with a Svelte 5 projection UI.
+## Runtime data flow
 
-### Data Flow
-
+```text
+Svelte UI
+  | queued edits and transaction metadata
+  v
+Tauri command boundary
+  | candidate workbook mutation
+  v
+Rust AppState
+  |-- Workbook and stable sheet identities
+  |-- Workbook-wide dependency graph
+  |-- Protection and cell-lock state
+  |-- Sheet-scoped comments and feature metadata
+  `-- Bounded undo and redo history
 ```
-User Input (Svelte UI)
-    ↓ Tauri IPC
-Rust Command Handler (src-tauri/src/lib.rs)
-    ↓
-sheets-core (Workbook → Sheet → Cell)
-    ↓
-sheets-formula (Evaluation Engine) [Sprint 3]
-    ↓
-sheets-xlsx/csv/json (File I/O) [Sprints 4-5]
+
+File operations pass through bounded Rust importers and exporters. The frontend never treats its visible grid as the authoritative workbook.
+
+## Workbook and formula graph
+
+`sheets-core` stores sheets sparsely. Each sheet has a stable identity that is independent of its position and display name. Stable identities keep formula dependencies, comments, protection, locks, and frontend feature metadata attached to the correct sheet through rename, delete, undo, redo, and native reopen operations.
+
+`sheets-formula` tokenizes and parses A1 references with optional sheet qualifiers. The workbook provider resolves a sheet name to a stable identity and evaluates local or cross-sheet values. The dependency graph uses `(stable_sheet_id, row, column)` keys, so a source change can find dependents across the workbook.
+
+Graph construction, formula replacement, transaction commit, and workbook replacement reject circular dependencies. Reference expansion is bounded to 100,000 cells per formula in reference collection, dependency construction, and evaluation.
+
+## Candidate transactions
+
+Every user mutation begins a workbook transaction. The backend clones the current workbook, dependency graph, protection state, cell locks, and comments into a pending candidate. Mutating commands operate only on that candidate.
+
+Commit follows this order:
+
+1. Rebuild the candidate workbook dependency graph.
+2. Derive compact workbook deltas between live and candidate state.
+3. Serialize and validate backend sheet state.
+4. Check the 200,000-coordinate and 32 MiB per-transaction budgets.
+5. Swap the complete candidate state into the live application.
+6. Append one undo record, clear redo, and evict old history to the 100-entry and 64 MiB aggregate limits.
+
+If any validation or budget check fails, live workbook state and history remain unchanged. Abort drops the candidate. Commands that attempt a mutation without an active transaction are rejected.
+
+Undo and redo clone live state, apply the complete transaction to the clone, rebuild and validate the dependency and backend state, then swap on success. History moves only after the state is valid. This prevents a multi-delta restore from applying partially.
+
+Opening a new native, XLSX, or JSON workbook is a session replacement rather than a normal edit transaction. It rebuilds the graph and clears history. CSV import is a normal transaction against the active sheet.
+
+## Recovery design
+
+The frontend marks a workbook dirty only after a successful transaction. `RecoveryAutosave` debounces for 750 milliseconds, serializes writes, flushes the mutation queue and transaction tail, then invokes the recovery command with the same native metadata used by Save Workbook.
+
+The backend stores recoveries under the Tauri per-user app data directory:
+
+```text
+app data/recovery/<recovery-id>.900sheets.recovery
 ```
 
-### Core Crates
+Recovery IDs are validated before path construction. The store rejects a symlink root or target and requires regular files. Writes use a unique create-new temporary path, synchronize file contents, atomically replace the target, and clean up temporary files. Unix synchronizes the parent directory. Windows uses `MoveFileExW` with replace and write-through flags.
 
-#### sheets-core
-The core data model. Owns:
-- `Workbook` - collection of sheets with active sheet tracking
-- `Sheet` - grid of cells with sparse storage via `HashMap<(u32, u32), CellValue>`
-- `CellValue` - tagged union: Number, Text, Boolean, Error, Empty, Formula
-- `CellAddress` - A1 notation parsing and serialization with absolute/relative support
-- `CoreError` - typed errors for out-of-bounds and parse failures
-- `CellFormat` - bold, italic, underline, font size/name/color, background color, alignment, borders, number format
-- `NumberFormat` - general, number, currency, percentage, date, time, scientific
+Discard is a two-stage operation. The discoverable snapshot is first atomically moved to a `.cleanup-pending` path. Deletion follows. If deletion fails, the stale snapshot cannot masquerade as current recovery data, and Save Workbook can retry cleanup under the retained identity.
 
-Sheet dimensions default to 1,000,000 rows × 16,384 columns and cells are stored sparsely - only non-empty cells consume memory.
+Startup discovery returns only current recovery files, newest first. Restoring validates the native payload before replacing the workbook. Invalid data is moved to quarantine. The UI offers each snapshot explicitly, preserves unselected snapshots, and discards only the one a user declines.
 
-#### sheets-formula
-Custom formula engine:
-- Tokenizer → AST → compiled expression tree
-- Evaluator with type coercion and error propagation
-- Dependency graph for incremental recalculation
-- Cycle detection for circular references
-- Extensible function registry (160+ functions across math, logical, text, date/time, lookup, financial, engineering, info)
-- `CellProvider` trait for pluggable cell access
-- `SimpleProvider` for testing and standalone evaluation
+The close handler prevents normal close, flushes pending edits, writes a final recovery for dirty state, and destroys the window only after success. A failed final write requires an explicit user decision.
 
-#### sheets-xlsx
-OOXML import/export boundary:
-- Reads XLSX zip packages (workbook.xml, worksheets, shared strings, styles)
-- Writes XLSX with style tables and number formats
-- Sanitizes all input before reaching frontend
-- Bounded file size, decompressed XML entry size, supported sheet dimensions, and cell count for safety
+## Persistence and file boundaries
 
-#### sheets-csv
-CSV import/export with auto-detection of delimiters and encoding.
+- `sheets-json` owns JSON exchange and native format version 1.
+- `sheets-xlsx` owns bounded OOXML import and export.
+- `sheets-csv` owns delimited data import and export.
+- `sheets-print` owns print layout and PDF output.
+- Native file writes use a sibling temporary file, file synchronization, and atomic rename.
+- Imported content is validated before it can replace the workbook.
+- Recovery never writes to the source path or saved workbook path.
 
-#### sheets-json
-JSON import/export supporting arrays of objects and arrays of arrays, with byte-size, depth, supported sheet dimension, and cell-count limits.
+## Other crates
 
-#### sheets-chart
-Chart rendering and data visualization:
-- Chart types: bar, line, pie, scatter, area, column, doughnut
-- Series extraction from sheet data ranges
-- SVG generation for frontend rendering
-- Configurable titles, axes, legends, colors
+- `sheets-chart`: chart data extraction and SVG previews
+- `sheets-pivot`: grouping, aggregation, filters, totals, and pivot output
+- `sheets-validation`: validation rules and conditional-format matching
+- `sheets-i18n`: locale formatting and accessibility helpers
+- `sheets-advanced`: protection, locks, goal seek, scenarios, and comments
 
-#### sheets-pivot
-Pivot table engine:
-- Row and column grouping by field
-- Aggregation functions: sum, count, average, min, max, product
-- Filtering by field values
-- Grand totals for rows and columns
-- Writing pivot results back to sheet
+## Design rules
 
-#### sheets-validation
-Data validation and conditional formatting:
-- Data validation rules: whole number, decimal, list, text length, date, time, custom formula
-- Input messages and error alerts (stop, warning, information)
-- Conditional formatting: cell value rules, top/bottom, data bars, color scales, icon sets, formula-based rules
-- Rule evaluation and matching
-
-#### sheets-i18n
-Internationalization and accessibility:
-- 22 supported locales (en, es, fr, de, it, pt, ru, zh, ja, ko, ar, hi, tr, nl, sv, pl, fa, he, th, vi, id, uk)
-- 88 translation keys covering UI and accessibility
-- Locale-aware number, currency, percentage, date, and time formatting
-- RTL support for Arabic, Hebrew, Persian, Urdu
-- Accessibility labels: ARIA labels, screen reader support, keyboard navigation metadata
-- Locale formatting and accessibility helpers are backend-ready; the desktop locale settings UI is not fully wired.
-
-#### sheets-print
-Print layout and PDF export:
-- Page sizes: A4, A3, Letter, Legal, Tabloid
-- Portrait and landscape orientation
-- Configurable margins, headers, and footers with `{page}`/`{pages}` templates
-- Scaling: actual size, fit-to-page-width, fit-to-single-page, custom percentage
-- Print area, repeating rows/columns, gridlines, headings
-- HTML print rendering for browser/webview printing
-- Minimal valid PDF 1.4 generation with text, gridlines, and formatting
-- Print preview data for frontend rendering
-
-#### sheets-advanced
-Advanced spreadsheet features:
-- Sheet protection with password hashing and granular permissions (select, format, insert, delete, sort, filter, pivot)
-- Cell locking manager (per-cell and range-based)
-- Goal seek: Newton's method with numerical derivatives, bisection fallback with range expansion
-- Scenario manager: named what-if scenarios with cell values, apply/restore, summary reports
-- Cell comments/notes with author tracking, visibility toggling, and bulk management
-- Protection, goal seek, and comments are wired into the desktop UI. Scenario support is available through the backend/IPC, with the full manager UI still pending.
-
-### Frontend
-
-The Svelte 5 frontend in `apps/desktop/src/` provides:
-- Grid component with CSS grid layout
-- Cell selection, keyboard navigation, inline editing
-- Formula bar
-- Sheet tab management
-- Native-dialog open/save/import/export flows backed by Tauri IPC
-
-### Tauri IPC
-
-Commands exposed to the frontend:
-- **Workbook**: `new_workbook`, `get_sheets`, `add_sheet`, `delete_sheet`, `rename_sheet`
-- **Cells**: `get_cell`, `set_cell`, `clear_cell`, `get_sheet_data`, `evaluate_formula`
-- **File I/O**: `import_xlsx`, `export_xlsx`, `import_xlsx_file`, `export_xlsx_file`, `import_csv_data`, `export_csv`, `import_csv_file`, `export_csv_file`, `import_json_data`, `export_json`, `import_json_file`, `export_json_file`
-- **Data tools**: `sort_data`, `find_in_sheet_cmd`, `replace_in_sheet_cmd`
-- **Charts**: `create_chart`
-- **Pivot tables**: `create_pivot`, `create_pivot_sheet`, `get_pivot_columns`
-- **Validation**: `validate_cell_value`, `validate_range_cmd`, `check_input_value`
-- **Conditional formatting**: `evaluate_conditional_formats`, `find_conditional_format_matches`
-- **i18n**: `get_available_locales`, `get_translations`, `translate_key`, `format_number_i18n`, `format_currency_i18n`, `format_percentage_i18n`, `format_date_i18n`, `format_time_i18n`
-- **Accessibility**: `get_cell_accessibility_label`, `get_selected_cell_label`, `get_editing_cell_label`, `get_navigation_direction_name`
-- **Print & PDF**: `get_print_preview`, `render_print_html`, `export_pdf`, `get_page_count`, `save_pdf_to_file`
-- **Advanced**: `protect_sheet`, `unprotect_sheet`, `set_cell_locked`, `lock_cell_range`, `is_cell_locked`, `goal_seek_cmd`, `apply_scenario`, `get_cell_comment`, `add_cell_comment`, `remove_cell_comment`, `list_comments`
-
-Protected sheets are enforced at the Tauri command boundary for mutating cell edits, clears, formatting, sorting, replace, CSV overwrite, scenario application, protected-sheet deletion, and pivot use. Cell-level locking uses `CellLockManager` - when a sheet is protected, only cells explicitly unlocked via `set_cell_locked` or `lock_cell_range` are editable; all others are locked by default.
-
-### Design Principles
-
-1. **Rust owns the truth** - all data models live in Rust, the frontend is a projection
-2. **Sanitize at the boundary** - all imported content is validated in Rust
-3. **Sparse storage** - only non-empty cells consume memory
-4. **Bounded operations** - resource limits prevent pathological files
-5. **No telemetry** - no data leaves the machine unless explicitly exported
-6. **Offline-first** - all features work without network connectivity
-7. **Low-resource optimized** - designed for modest hardware in developing economies
+1. Rust owns authoritative workbook state.
+2. Imports and formulas are bounded before expansion.
+3. A failed operation must not partially mutate live state.
+4. Sheet-scoped state follows stable sheet identity, not tab position.
+5. Recovery is separate from normal saves and source files.
+6. No telemetry or account is required.
+7. Public compatibility claims must point to deterministic tests.

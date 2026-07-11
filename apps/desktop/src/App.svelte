@@ -1,11 +1,12 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core'
+  import { getCurrentWindow } from '@tauri-apps/api/window'
   import { open, save } from '@tauri-apps/plugin-dialog'
   import { onMount } from 'svelte'
-  import type { SheetInfo, CellData, CellRange, ClipboardData, HistoryEntry, CellFormat, CellFormatMap } from './lib/types'
+  import type { SheetInfo, CellData, CellRange, ClipboardData, CellFormat, CellFormatMap } from './lib/types'
   import { colLabel, cellKey, normalizeRange, rangeContains, rangeSize, rangeLabel, parseCellKey } from './lib/utils/grid'
-  import { UndoRedoStack } from './lib/utils/undoRedo'
   import { MutationQueue } from './lib/utils/mutationQueue.js'
+  import { RecoveryAutosave } from './lib/utils/recoveryAutosave.js'
 
   type EditFocusOptions = { selectText: boolean; cursorPosition?: number }
 
@@ -43,6 +44,22 @@
   let currentFilePath: string | null = $state(null)
   let isDirty: boolean = $state(false)
   const mutationQueue = new MutationQueue()
+  let transactionTail: Promise<void> = Promise.resolve()
+  let recoveryId = $state(newRecoveryId())
+  let recoveryCleanupPending: { id: string; rotateAfterCleanup: boolean } | null = $state(null)
+  const recoveryAutosave = new RecoveryAutosave({
+    delay: 750,
+    flush: () => flushPendingMutations(),
+    write: () => invoke('write_recovery_snapshot', {
+      recoveryId,
+      metadata: nativeMetadata(),
+    }),
+    onError: (error) => console.error('Unable to update recovery snapshot', error),
+  })
+
+  function newRecoveryId(): string {
+    return globalThis.crypto?.randomUUID?.() ?? `session-${Date.now()}-${Math.random().toString(36).slice(2)}`
+  }
   let cellFormats: CellFormatMap = $state({})
   type MenuKey = 'file' | 'edit' | 'view' | 'insert' | 'format' | 'data' | 'tools' | 'help'
   type ToolbarMenuKey = 'data' | 'analyze' | 'output'
@@ -105,6 +122,21 @@
   interface NativeOpenResult {
     sheets: SheetInfo[]
     metadata: Record<string, unknown>
+  }
+
+  interface TransactionStatus {
+    can_undo: boolean
+    can_redo: boolean
+  }
+
+  interface TransactionRestoreResult extends TransactionStatus {
+    sheets: SheetInfo[]
+    metadata: Record<string, unknown>
+  }
+
+  interface RecoveryEntry {
+    id: string
+    modified_millis: number
   }
 
   interface CellComment {
@@ -184,6 +216,9 @@
     chartYColumn: string
     chartLegendPosition: string
     chartSvg: string
+    printPageSize: string
+    printOrientation: string
+    showGridlines: boolean
   }
 
   interface FunctionHelp {
@@ -217,6 +252,12 @@
   let chartYColumn: string = $state('')
   let chartLegendPosition: string = $state('Bottom')
   let chartSvg: string = $state('')
+  let savedChartTitle: string = $state('Chart')
+  let savedChartType: string = $state('Column')
+  let savedChartSeriesName: string = $state('Series 1')
+  let savedChartXColumn: string = $state('')
+  let savedChartYColumn: string = $state('')
+  let savedChartLegendPosition: string = $state('Bottom')
   let pivotAggregation: string = $state('Sum')
   let pivotColumns: ColumnInfo[] = $state([])
   let pivotRowColumn: string = $state('')
@@ -349,9 +390,9 @@
           { label: 'Open 900Sheets Workbook...', action: 'openNative', shortcut: 'Ctrl+O' },
         ],
         [
-          { label: 'Import XLSX...', action: 'openXlsx' },
+          { label: 'Open XLSX...', action: 'openXlsx' },
           { label: 'Import CSV...', action: 'importCsv' },
-          { label: 'Import JSON...', action: 'importJson' },
+          { label: 'Open JSON...', action: 'importJson' },
         ],
         [
           { label: 'Save Workbook', action: 'saveNative', shortcut: 'Ctrl+S' },
@@ -497,8 +538,6 @@
       ],
     },
   ]
-
-  const undoRedo = new UndoRedoStack()
 
   const COLS = 52
   const ROWS = 1000
@@ -695,6 +734,104 @@
 
   function markDirty() {
     isDirty = true
+    recoveryAutosave.schedule()
+  }
+
+  function resumeRecoveryIfDirty() {
+    if (isDirty) recoveryAutosave.schedule()
+  }
+
+  async function cleanupRecovery(
+    id: string,
+    rotateAfterCleanup: boolean,
+    context: string,
+  ): Promise<boolean> {
+    try {
+      await invoke('discard_recovery_snapshot', { recoveryId: id })
+      if (recoveryCleanupPending?.id === id) recoveryCleanupPending = null
+      if (rotateAfterCleanup) recoveryId = newRecoveryId()
+      return true
+    } catch (error) {
+      recoveryId = id
+      recoveryCleanupPending = { id, rotateAfterCleanup }
+      setError(error, `${context}. Choose Save Workbook to retry recovery cleanup`)
+      return false
+    }
+  }
+
+  function finishSuccessfulReplacement(previousRecoveryId: string): Promise<boolean> {
+    return cleanupRecovery(previousRecoveryId, true, 'Replacement succeeded, but recovery cleanup failed')
+  }
+
+  function applyTransactionStatus(status: TransactionStatus) {
+    canUndo = status.can_undo
+    canRedo = status.can_redo
+  }
+
+  function runWorkbookTransaction<T>(operation: () => Promise<T>): Promise<T> {
+    const execution = transactionTail.then(() => executeWorkbookTransaction(operation))
+    transactionTail = execution.then(() => undefined, () => undefined)
+    return execution
+  }
+
+  async function executeWorkbookTransaction<T>(operation: () => Promise<T>): Promise<T> {
+    const metadataBefore = clonePlain(nativeMetadata())
+    await invoke('begin_workbook_transaction', { metadata: metadataBefore })
+    try {
+      const result = await operation()
+      const status = await invoke<TransactionStatus>('commit_workbook_transaction', {
+        metadata: nativeMetadata(),
+      })
+      applyTransactionStatus(status)
+      return result
+    } catch (error) {
+      try {
+        const status = await invoke<TransactionStatus>('abort_workbook_transaction')
+        applyTransactionStatus(status)
+      } catch (abortError) {
+        console.error('Unable to roll back workbook transaction', abortError)
+      }
+      restoreNativeMetadata(metadataBefore)
+      restoreSheetFeatureState(activeSheetStableId)
+      throw error
+    }
+  }
+
+  async function applyMetadataChange(mutation: () => void, context: string): Promise<boolean> {
+    try {
+      await runWorkbookTransaction(async () => mutation())
+      markDirty()
+      return true
+    } catch (error) {
+      setError(error, context)
+      return false
+    }
+  }
+
+  async function toggleGridlines() {
+    const visible = !showGridlines
+    const changed = await applyMetadataChange(() => {
+      showGridlines = visible
+    }, 'Unable to update gridlines')
+    if (changed) setStatus(`Gridlines ${visible ? 'shown' : 'hidden'}`)
+  }
+
+  async function setPrintPageSize(value: string) {
+    if (value === printPageSize) return
+    const changed = await applyMetadataChange(() => {
+      printPageSize = value
+      printPageCount = null
+    }, 'Unable to update print page size')
+    if (changed) setStatus(`Print page size set to ${value}`)
+  }
+
+  async function setPrintOrientation(value: string) {
+    if (value === printOrientation) return
+    const changed = await applyMetadataChange(() => {
+      printOrientation = value
+      printPageCount = null
+    }, 'Unable to update print orientation')
+    if (changed) setStatus(`Print orientation set to ${value}`)
   }
 
   function canDiscardUnsavedChanges(): boolean {
@@ -710,6 +847,7 @@
 
   async function flushPendingMutations() {
     await mutationQueue.flush()
+    await transactionTail
   }
 
   function setError(error: unknown, context: string) {
@@ -722,8 +860,6 @@
   async function loadSheetList(result: SheetInfo[], preferredSheetId: number = 0) {
     sheets = result
     const nextSheet = result.find((sheet) => sheet.id === preferredSheetId) ?? result[0]
-    undoRedo.clear()
-    updateUndoRedoState()
     if (nextSheet) {
       await selectSheet(nextSheet.id)
     } else {
@@ -737,25 +873,11 @@
     markDirty()
     const sheetId = activeSheetId
     enqueueMutation(async () => {
-      await invoke('batch_set_cells', { sheetId, changes: [{ row, col, value }] })
+      await runWorkbookTransaction(() =>
+        invoke('batch_set_cells', { sheetId, changes: [{ row, col, value }] })
+      )
       await refreshSheetData()
     }, context)
-  }
-
-  function queueClearCell(row: number, col: number, context: string) {
-    markDirty()
-    const sheetId = activeSheetId
-    enqueueMutation(async () => {
-      await invoke('batch_set_cells', { sheetId, changes: [{ row, col, value: '' }] })
-      await refreshSheetData()
-    }, context)
-  }
-
-  function clearLocalCell(row: number, col: number) {
-    const key = cellKey(row, col)
-    delete cellContents[key]
-    delete cellDisplays[key]
-    delete cellFormats[key]
   }
 
   async function applyCellValueChanges(
@@ -771,19 +893,11 @@
 
     const nextContents = { ...cellContents }
     const nextDisplays = { ...cellDisplays }
-    const history: HistoryEntry[] = []
     const backendChanges: Array<{ row: number; col: number; value: string }> = []
 
     for (const [key, change] of byKey.entries()) {
       const oldValue = cellContents[key] ?? ''
       if (oldValue === change.value) continue
-      history.push({
-        sheetId: activeSheetId,
-        row: change.row,
-        col: change.col,
-        oldValue,
-        newValue: change.value,
-      })
       if (change.value) {
         nextContents[key] = change.value
         nextDisplays[key] = change.value.startsWith('=') ? (cellDisplays[key] ?? change.value) : change.value
@@ -794,19 +908,19 @@
       backendChanges.push(change)
     }
 
-    if (history.length === 0) {
+    if (backendChanges.length === 0) {
       if (successMessage) setStatus(successMessage)
       return
     }
 
     cellContents = nextContents
     cellDisplays = nextDisplays
-    undoRedo.push(history)
     markDirty()
-    updateUndoRedoState()
 
     try {
-      await invoke('batch_set_cells', { sheetId: activeSheetId, changes: backendChanges })
+      await runWorkbookTransaction(() =>
+        invoke('batch_set_cells', { sheetId: activeSheetId, changes: backendChanges })
+      )
       await refreshSheetData()
       if (successMessage) setStatus(successMessage)
     } catch (e) {
@@ -822,30 +936,16 @@
     context: string,
     successMessage: string,
   ) {
-    const keys = new Set([...Object.keys(cellContents), ...Object.keys(nextContents)])
-    const history: HistoryEntry[] = []
-    for (const key of keys) {
-      const { row, col } = parseCellKey(key)
-      const oldValue = cellContents[key] ?? ''
-      const newValue = nextContents[key] ?? ''
-      if (oldValue !== newValue) {
-        history.push({ sheetId: activeSheetId, row, col, oldValue, newValue })
-      }
-    }
-
     cellContents = nextContents
     cellDisplays = nextDisplays
     cellFormats = nextFormats
     markDirty()
-    if (history.length > 0) {
-      undoRedo.push(history)
-      updateUndoRedoState()
-    }
-
     try {
       const cells = Object.entries(nextContents).map(([key, value]) => ({ ...parseCellKey(key), value }))
       const formats = Object.entries(nextFormats).map(([key, format]) => ({ ...parseCellKey(key), format }))
-      await invoke('replace_sheet_snapshot', { sheetId: activeSheetId, cells, formats })
+      await runWorkbookTransaction(() =>
+        invoke('replace_sheet_snapshot', { sheetId: activeSheetId, cells, formats })
+      )
       await refreshSheetData()
       setStatus(successMessage)
     } catch (e) {
@@ -945,7 +1045,9 @@
       }
     }
     try {
-      await invoke('batch_set_formats', { sheetId: activeSheetId, changes })
+      await runWorkbookTransaction(() =>
+        invoke('batch_set_formats', { sheetId: activeSheetId, changes })
+      )
       markDirty()
     } catch (e) {
       setError(e, 'Failed to apply format')
@@ -996,7 +1098,7 @@
   async function handleSort(ascending: boolean) {
     const r = normalizeRange(currentRange)
     try {
-      await invoke('sort_data', {
+      await runWorkbookTransaction(() => invoke('sort_data', {
         sheetId: activeSheetId,
         range: {
           sort_col: r.startCol,
@@ -1006,7 +1108,7 @@
           end_col: r.endCol,
         },
         ascending,
-      })
+      }))
       await refreshSheetData()
       markDirty()
       setStatus(`Sorted ${ascending ? 'ascending' : 'descending'}`)
@@ -1088,7 +1190,6 @@
       loadPivotColumns()
     }
     if (panel === 'chart') {
-      chartSvg = ''
       const r = normalizeRange(currentRange)
       chartTitle = `${activeSheetName()} ${rangeLabel(r)}`
       loadChartColumns()
@@ -1143,13 +1244,16 @@
       frozenColCount,
       hiddenRows: { ...hiddenRows },
       activeFilterLabel,
-      chartTitle,
-      chartType,
-      chartSeriesName,
-      chartXColumn,
-      chartYColumn,
-      chartLegendPosition,
+      chartTitle: savedChartTitle,
+      chartType: savedChartType,
+      chartSeriesName: savedChartSeriesName,
+      chartXColumn: savedChartXColumn,
+      chartYColumn: savedChartYColumn,
+      chartLegendPosition: savedChartLegendPosition,
       chartSvg,
+      printPageSize,
+      printOrientation,
+      showGridlines,
     }
   }
 
@@ -1167,13 +1271,22 @@
     frozenColCount = state?.frozenColCount ?? 0
     hiddenRows = { ...(state?.hiddenRows ?? {}) }
     activeFilterLabel = state?.activeFilterLabel ?? ''
-    chartTitle = state?.chartTitle ?? 'Chart'
-    chartType = state?.chartType ?? 'Column'
-    chartSeriesName = state?.chartSeriesName ?? 'Series 1'
-    chartXColumn = state?.chartXColumn ?? ''
-    chartYColumn = state?.chartYColumn ?? ''
-    chartLegendPosition = state?.chartLegendPosition ?? 'Bottom'
+    savedChartTitle = state?.chartTitle ?? 'Chart'
+    savedChartType = state?.chartType ?? 'Column'
+    savedChartSeriesName = state?.chartSeriesName ?? 'Series 1'
+    savedChartXColumn = state?.chartXColumn ?? ''
+    savedChartYColumn = state?.chartYColumn ?? ''
+    savedChartLegendPosition = state?.chartLegendPosition ?? 'Bottom'
+    chartTitle = savedChartTitle
+    chartType = savedChartType
+    chartSeriesName = savedChartSeriesName
+    chartXColumn = savedChartXColumn
+    chartYColumn = savedChartYColumn
+    chartLegendPosition = savedChartLegendPosition
     chartSvg = state?.chartSvg ?? ''
+    printPageSize = state?.printPageSize ?? 'Letter'
+    printOrientation = state?.printOrientation ?? 'Portrait'
+    showGridlines = state?.showGridlines ?? true
   }
 
   function clearActiveCoordinateMetadata() {
@@ -1248,14 +1361,6 @@
         if (!editValue.startsWith('=')) {
           cellDisplays[key] = editValue
         }
-        undoRedo.push([{
-          sheetId: activeSheetId,
-          row,
-          col,
-          oldValue,
-          newValue: editValue,
-        }])
-        updateUndoRedoState()
         queueSetCell(row, col, editValue, 'Unable to edit cell')
       }
       formulaBarValue = editValue
@@ -1287,63 +1392,41 @@
     }
   }
 
-  function updateUndoRedoState() {
-    canUndo = undoRedo.canUndo()
-    canRedo = undoRedo.canRedo()
-  }
-
   async function doUndo() {
     if (editingCell) commitEdit()
-    const entries = undoRedo.undo()
-    if (entries) {
-      for (const entry of entries) {
-        const key = cellKey(entry.row, entry.col)
-        if (entry.oldValue) {
-          cellContents[key] = entry.oldValue
-          cellDisplays[key] = entry.oldValue
-        } else {
-          delete cellContents[key]
-          delete cellDisplays[key]
-        }
-      }
-      try {
-        await invoke('batch_set_cells', {
-          sheetId: entries[0].sheetId,
-          changes: entries.map((entry) => ({ row: entry.row, col: entry.col, value: entry.oldValue })),
-        })
-        await refreshSheetData()
-        markDirty()
-      } catch (error) {
-        setError(error, 'Unable to undo edit')
-      }
-      const last = entries[0]
-      selectCell(last.row, last.col)
-      updateUndoRedoState()
+    try {
+      await flushPendingMutations()
+      saveActiveSheetFeatureState()
+      const previousStableId = activeSheetStableId
+      const result = await invoke<TransactionRestoreResult>('undo_workbook_transaction')
+      restoreNativeMetadata(result.metadata)
+      sheets = result.sheets
+      activeSheetStableId = ''
+      const target = sheets.find((sheet) => String(sheet.stable_id) === previousStableId) ?? sheets[0]
+      if (target) await selectSheet(target.id)
+      applyTransactionStatus(result)
+      markDirty()
+    } catch (error) {
+      setError(error, 'Unable to undo transaction')
     }
   }
 
   async function doRedo() {
     if (editingCell) commitEdit()
-    const entries = undoRedo.redo()
-    if (entries) {
-      for (const entry of entries) {
-        const key = cellKey(entry.row, entry.col)
-        cellContents[key] = entry.newValue
-        cellDisplays[key] = entry.newValue
-      }
-      try {
-        await invoke('batch_set_cells', {
-          sheetId: entries[0].sheetId,
-          changes: entries.map((entry) => ({ row: entry.row, col: entry.col, value: entry.newValue })),
-        })
-        await refreshSheetData()
-        markDirty()
-      } catch (error) {
-        setError(error, 'Unable to redo edit')
-      }
-      const last = entries[0]
-      selectCell(last.row, last.col)
-      updateUndoRedoState()
+    try {
+      await flushPendingMutations()
+      saveActiveSheetFeatureState()
+      const previousStableId = activeSheetStableId
+      const result = await invoke<TransactionRestoreResult>('redo_workbook_transaction')
+      restoreNativeMetadata(result.metadata)
+      sheets = result.sheets
+      activeSheetStableId = ''
+      const target = sheets.find((sheet) => String(sheet.stable_id) === previousStableId) ?? sheets[0]
+      if (target) await selectSheet(target.id)
+      applyTransactionStatus(result)
+      markDirty()
+    } catch (error) {
+      setError(error, 'Unable to redo transaction')
     }
   }
 
@@ -1364,31 +1447,25 @@
     navigator.clipboard.writeText(tsv).catch(() => {})
 
     if (isCut) {
-      const history: HistoryEntry[] = []
+      const changes: Array<{ row: number; col: number; value: string }> = []
       for (let row = 0; row < size.rows; row++) {
         for (let col = 0; col < size.cols; col++) {
           const r2 = r.startRow + row
           const c2 = r.startCol + col
-          const key = cellKey(r2, c2)
-          const oldVal = cellContents[key] ?? ''
+          const oldVal = cellContents[cellKey(r2, c2)] ?? ''
           if (oldVal) {
-            history.push({ sheetId: activeSheetId, row: r2, col: c2, oldValue: oldVal, newValue: '' })
-            clearLocalCell(r2, c2)
-            queueClearCell(r2, c2, 'Unable to cut cells')
+            changes.push({ row: r2, col: c2, value: '' })
           }
         }
       }
-      if (history.length > 0) {
-        undoRedo.push(history)
-        updateUndoRedoState()
-      }
+      void applyCellValueChanges(changes, 'Unable to cut cells', `Cut ${changes.length} cell${changes.length === 1 ? '' : 's'}`)
     }
   }
 
   function pasteFromClipboard() {
     if (!clipboard) return
     const r = normalizeRange(currentRange)
-    const history: HistoryEntry[] = []
+    const changes: Array<{ row: number; col: number; value: string }> = []
     for (let row = 0; row < clipboard.cells.length; row++) {
       for (let col = 0; col < clipboard.cells[row].length; col++) {
         const targetRow = r.startRow + row
@@ -1403,17 +1480,11 @@
           continue
         }
         if (oldValue !== newValue) {
-          history.push({ sheetId: activeSheetId, row: targetRow, col: targetCol, oldValue, newValue })
-          cellContents[key] = newValue
-          cellDisplays[key] = newValue.startsWith('=') ? (cellDisplays[key] ?? newValue) : newValue
-          queueSetCell(targetRow, targetCol, newValue, 'Unable to paste cells')
+          changes.push({ row: targetRow, col: targetCol, value: newValue })
         }
       }
     }
-    if (history.length > 0) {
-      undoRedo.push(history)
-      updateUndoRedoState()
-    }
+    void applyCellValueChanges(changes, 'Unable to paste cells', `Pasted ${changes.length} cell${changes.length === 1 ? '' : 's'}`)
   }
 
   async function pasteFromSystemClipboard() {
@@ -1426,7 +1497,7 @@
       }
       const cells = rows.map((r) => r.split('\t'))
       const r = normalizeRange(currentRange)
-      const history: HistoryEntry[] = []
+      const changes: Array<{ row: number; col: number; value: string }> = []
       for (let row = 0; row < cells.length; row++) {
         for (let col = 0; col < cells[row].length; col++) {
           const targetRow = r.startRow + row
@@ -1441,17 +1512,11 @@
             continue
           }
           if (oldValue !== newValue) {
-            history.push({ sheetId: activeSheetId, row: targetRow, col: targetCol, oldValue, newValue })
-            cellContents[key] = newValue
-            cellDisplays[key] = newValue.startsWith('=') ? (cellDisplays[key] ?? newValue) : newValue
-            queueSetCell(targetRow, targetCol, newValue, 'Unable to paste cells')
+            changes.push({ row: targetRow, col: targetCol, value: newValue })
           }
         }
       }
-      if (history.length > 0) {
-        undoRedo.push(history)
-        updateUndoRedoState()
-      }
+      await applyCellValueChanges(changes, 'Unable to paste cells', `Pasted ${changes.length} cell${changes.length === 1 ? '' : 's'}`)
     } catch {
       pasteFromClipboard()
     }
@@ -1460,23 +1525,17 @@
   function deleteSelection() {
     if (editingCell) return
     const r = normalizeRange(currentRange)
-    const history: HistoryEntry[] = []
+    const changes: Array<{ row: number; col: number; value: string }> = []
     for (let row = r.startRow; row <= r.endRow; row++) {
       for (let col = r.startCol; col <= r.endCol; col++) {
         const key = cellKey(row, col)
         const oldValue = cellContents[key] ?? cellDisplays[key] ?? ''
         if (oldValue) {
-          history.push({ sheetId: activeSheetId, row, col, oldValue, newValue: '' })
-          clearLocalCell(row, col)
-          queueClearCell(row, col, 'Unable to delete cells')
+          changes.push({ row, col, value: '' })
         }
       }
     }
-    if (history.length > 0) {
-      undoRedo.push(history)
-      updateUndoRedoState()
-      setStatus(`Cleared ${history.length} cell${history.length === 1 ? '' : 's'}`)
-    }
+    void applyCellValueChanges(changes, 'Unable to delete cells', `Cleared ${changes.length} cell${changes.length === 1 ? '' : 's'}`)
   }
 
   function isClearSelectionKey(e: KeyboardEvent): boolean {
@@ -1645,14 +1704,6 @@
         if (!formulaBarValue.startsWith('=')) {
           cellDisplays[key] = formulaBarValue
         }
-        undoRedo.push([{
-          sheetId: activeSheetId,
-          row: selectedRow,
-          col: selectedCol,
-          oldValue,
-          newValue: formulaBarValue,
-        }])
-        updateUndoRedoState()
         queueSetCell(selectedRow, selectedCol, formulaBarValue, 'Unable to update formula bar')
       }
     }
@@ -1770,9 +1821,8 @@
   }
 
   async function handleAddSheet() {
-    const name = `Sheet${sheets.length + 1}`
     try {
-      const result = await invoke<SheetInfo[]>('add_sheet', { name })
+      const result = await runWorkbookTransaction(() => invoke<SheetInfo[]>('add_generated_sheet'))
       sheets = result
       markDirty()
       const newId = result[result.length - 1].id
@@ -1784,20 +1834,34 @@
 
   async function handleDeleteSheet(id: number) {
     if (sheets.length <= 1) return
+    const previousActiveSheetId = activeSheetId
+    const previousActiveStableId = activeSheetStableId
     try {
       saveActiveSheetFeatureState()
       const deletedStableId = String(sheets.find((sheet) => sheet.id === id)?.stable_id ?? '')
-      const previousActiveStableId = activeSheetStableId
-      const result = await invoke<SheetInfo[]>('delete_sheet', { sheetId: id })
-      if (deletedStableId) delete sheetFeatureStates[deletedStableId]
+      const remaining = sheets.filter((sheet) => sheet.id !== id)
+      const plannedNextActive = remaining.find((sheet) => String(sheet.stable_id) === previousActiveStableId)
+        ?? remaining[Math.min(id, remaining.length - 1)]
+        ?? remaining[0]
+      const result = await runWorkbookTransaction(async () => {
+        if (previousActiveStableId === deletedStableId) {
+          activeSheetStableId = plannedNextActive ? String(plannedNextActive.stable_id) : ''
+          restoreSheetFeatureState(activeSheetStableId)
+        }
+        const next = await invoke<SheetInfo[]>('delete_sheet', { sheetId: id })
+        if (deletedStableId) delete sheetFeatureStates[deletedStableId]
+        return next
+      })
       sheets = result
       markDirty()
-      if (previousActiveStableId === deletedStableId) activeSheetStableId = ''
       const nextActive = result.find((sheet) => String(sheet.stable_id) === previousActiveStableId)
-        ?? result[Math.min(id, result.length - 1)]
+        ?? result.find((sheet) => String(sheet.stable_id) === String(plannedNextActive?.stable_id ?? ''))
         ?? result[0]
       if (nextActive) await selectSheet(nextActive.id)
     } catch (e) {
+      activeSheetId = previousActiveSheetId
+      activeSheetStableId = previousActiveStableId
+      restoreSheetFeatureState(previousActiveStableId)
       setError(e, 'Failed to delete sheet')
     }
   }
@@ -1810,10 +1874,10 @@
   async function commitRename() {
     if (renamingSheetId !== null && renameValue.trim()) {
       try {
-        const result = await invoke<SheetInfo[]>('rename_sheet', {
+        const result = await runWorkbookTransaction(() => invoke<SheetInfo[]>('rename_sheet', {
           sheetId: renamingSheetId,
           name: renameValue.trim(),
-        })
+        }))
         sheets = result
         markDirty()
     } catch (e) {
@@ -1825,105 +1889,136 @@
 
   async function handleNewWorkbook(confirmDiscard: boolean = true) {
     if (confirmDiscard && !canDiscardUnsavedChanges()) return
+    const previousRecoveryId = recoveryId
     try {
+      await recoveryAutosave.cancelAndWait()
       await flushPendingMutations()
       const result = await invoke<SheetInfo[]>('new_workbook')
       currentFilePath = null
       resetWorkbookSessionState({ clearComments: true })
       await loadSheetList(result)
       isDirty = false
-      setStatus('New workbook')
+      const cleaned = await finishSuccessfulReplacement(previousRecoveryId)
+      if (cleaned) setStatus('New workbook')
     } catch (e) {
+      resumeRecoveryIfDirty()
       setError(e, 'Failed to create workbook')
     }
   }
 
   async function handleOpenNative() {
     if (!canDiscardUnsavedChanges()) return
+    const previousRecoveryId = recoveryId
     try {
+      await recoveryAutosave.cancelAndWait()
       await flushPendingMutations()
       const path = selectedPath(await open({
         multiple: false,
         filters: [{ name: '900Sheets Workbook', extensions: ['900sheets'] }],
       }))
-      if (!path) return
+      if (!path) {
+        resumeRecoveryIfDirty()
+        return
+      }
       const result = await invoke<NativeOpenResult>('import_native_file', { filePath: path })
       currentFilePath = path
       resetWorkbookSessionState({ clearComments: true })
       restoreNativeMetadata(result.metadata)
       await loadSheetList(result.sheets)
       isDirty = false
-      setStatus(`Opened ${filename(path)}`)
+      const cleaned = await finishSuccessfulReplacement(previousRecoveryId)
+      if (cleaned) setStatus(`Opened ${filename(path)}`)
     } catch (e) {
+      resumeRecoveryIfDirty()
       setError(e, 'Failed to open workbook')
     }
   }
 
   async function handleOpenXlsx() {
     if (!canDiscardUnsavedChanges()) return
+    const previousRecoveryId = recoveryId
     try {
+      await recoveryAutosave.cancelAndWait()
       await flushPendingMutations()
       const path = selectedPath(await open({
         multiple: false,
         filters: [{ name: 'Excel Workbook', extensions: ['xlsx'] }],
       }))
-      if (!path) return
+      if (!path) {
+        resumeRecoveryIfDirty()
+        return
+      }
       const result = await invoke<SheetInfo[]>('import_xlsx_file', { filePath: path })
       currentFilePath = null
       resetWorkbookSessionState({ clearComments: true })
       await loadSheetList(result)
-      isDirty = true
-      setStatus(`Imported ${filename(path)}. Save as a 900Sheets workbook to keep editing.`)
+      const cleaned = await finishSuccessfulReplacement(previousRecoveryId)
+      markDirty()
+      if (cleaned) setStatus(`Opened ${filename(path)} as a replacement workbook. Save as 900Sheets to keep editing.`)
     } catch (e) {
+      resumeRecoveryIfDirty()
       setError(e, 'Failed to open XLSX')
     }
   }
 
   async function handleImportCsv() {
     try {
+      await recoveryAutosave.cancelAndWait()
       await flushPendingMutations()
       const path = selectedPath(await open({
         multiple: false,
         filters: [{ name: 'CSV', extensions: ['csv', 'tsv', 'txt'] }],
       }))
-      if (!path) return
+      if (!path) {
+        resumeRecoveryIfDirty()
+        return
+      }
       const delimiter = path.toLowerCase().endsWith('.tsv') ? '\t' : ','
-      const result = await invoke<SheetInfo[]>('import_csv_file', {
+      const result = await runWorkbookTransaction(() => invoke<SheetInfo[]>('import_csv_file', {
         filePath: path,
         delimiter,
         sheetId: activeSheetId,
-      })
+      }))
       await loadSheetList(result, activeSheetId)
       markDirty()
       setStatus(`Imported ${filename(path)}`)
     } catch (e) {
+      resumeRecoveryIfDirty()
       setError(e, 'Failed to import CSV')
     }
   }
 
   async function handleImportJson() {
     if (!canDiscardUnsavedChanges()) return
+    const previousRecoveryId = recoveryId
     try {
+      await recoveryAutosave.cancelAndWait()
       await flushPendingMutations()
       const path = selectedPath(await open({
         multiple: false,
         filters: [{ name: 'JSON', extensions: ['json'] }],
       }))
-      if (!path) return
+      if (!path) {
+        resumeRecoveryIfDirty()
+        return
+      }
       const result = await invoke<SheetInfo[]>('import_json_file', { filePath: path })
       currentFilePath = null
       resetWorkbookSessionState({ clearComments: true })
       await loadSheetList(result)
-      isDirty = true
-      setStatus(`Imported ${filename(path)}`)
+      const cleaned = await finishSuccessfulReplacement(previousRecoveryId)
+      markDirty()
+      if (cleaned) setStatus(`Opened ${filename(path)} as a replacement workbook`)
     } catch (e) {
-      setError(e, 'Failed to import JSON')
+      resumeRecoveryIfDirty()
+      setError(e, 'Failed to open JSON')
     }
   }
 
   async function handleSaveNative() {
     try {
       if (editingCell) commitEdit()
+      await recoveryAutosave.cancelAndWait()
       await flushPendingMutations()
       let path = currentFilePath
       if (!path) {
@@ -1932,12 +2027,22 @@
           filters: [{ name: '900Sheets Workbook', extensions: ['900sheets'] }],
         })
       }
-      if (!path) return
+      if (!path) {
+        resumeRecoveryIfDirty()
+        return
+      }
       await invoke('export_native_file', { filePath: path, metadata: nativeMetadata() })
       currentFilePath = path
       isDirty = false
-      setStatus(`Saved ${filename(path)}`)
+      const pendingCleanup = recoveryCleanupPending
+      const cleaned = await cleanupRecovery(
+        recoveryId,
+        pendingCleanup?.rotateAfterCleanup ?? false,
+        'Workbook saved, but recovery cleanup failed',
+      )
+      if (cleaned) setStatus(`Saved ${filename(path)}`)
     } catch (e) {
+      resumeRecoveryIfDirty()
       setError(e, 'Failed to save workbook')
     }
   }
@@ -1963,7 +2068,10 @@
         defaultPath: '900Sheets.xlsx',
         filters: [{ name: 'Excel Workbook', extensions: ['xlsx'] }],
       })
-      if (!path) return
+      if (!path) {
+        resumeRecoveryIfDirty()
+        return
+      }
       await invoke('export_xlsx_file', { filePath: path })
       setStatus(`Exported ${filename(path)}`)
     } catch (e) {
@@ -1979,7 +2087,10 @@
         defaultPath: `${sheets.find((sheet) => sheet.id === activeSheetId)?.name ?? 'Sheet'}.csv`,
         filters: [{ name: 'CSV', extensions: ['csv'] }],
       })
-      if (!path) return
+      if (!path) {
+        resumeRecoveryIfDirty()
+        return
+      }
       await invoke('export_csv_file', {
         sheetId: activeSheetId,
         delimiter: ',',
@@ -1999,7 +2110,10 @@
         defaultPath: '900Sheets.json',
         filters: [{ name: 'JSON', extensions: ['json'] }],
       })
-      if (!path) return
+      if (!path) {
+        resumeRecoveryIfDirty()
+        return
+      }
       await invoke('export_json_file', { filePath: path })
       setStatus(`Exported ${filename(path)}`)
     } catch (e) {
@@ -2015,7 +2129,10 @@
         defaultPath: `${activeSheetName()}.pdf`,
         filters: [{ name: 'PDF', extensions: ['pdf'] }],
       })
-      if (!path) return
+      if (!path) {
+        resumeRecoveryIfDirty()
+        return
+      }
       await invoke('save_pdf_to_file', {
         sheetId: activeSheetId,
         config: defaultPrintConfig(),
@@ -2048,12 +2165,12 @@
   async function runReplace() {
     if (!findQuery.trim()) return
     try {
-      const count = await invoke<number>('replace_in_sheet_cmd', {
+      const count = await runWorkbookTransaction(() => invoke<number>('replace_in_sheet_cmd', {
         sheetId: activeSheetId,
         find: findQuery,
         replace: replaceValue,
         matchCase: findMatchCase,
-      })
+      }))
       await refreshSheetData()
       markDirty()
       findResults = []
@@ -2101,9 +2218,16 @@
           legend_position: chartLegendPosition,
         },
       })
-      chartSvg = result.svg
-      markDirty()
-      setStatus(`Created ${chartType.toLowerCase()} chart from ${rangeLabel(r)}`)
+      const changed = await applyMetadataChange(() => {
+        savedChartTitle = chartTitle
+        savedChartType = chartType
+        savedChartSeriesName = chartSeriesName
+        savedChartXColumn = chartXColumn
+        savedChartYColumn = chartYColumn
+        savedChartLegendPosition = chartLegendPosition
+        chartSvg = result.svg
+      }, 'Chart failed')
+      if (changed) setStatus(`Created ${chartType.toLowerCase()} chart from ${rangeLabel(r)}`)
     } catch (e) {
       setError(e, 'Chart failed')
     }
@@ -2164,7 +2288,7 @@
       return
     }
     try {
-      const result = await invoke<SheetInfo[]>('create_pivot_sheet', {
+      const result = await runWorkbookTransaction(() => invoke<SheetInfo[]>('create_pivot_sheet', {
         sheetId: activeSheetId,
         config: {
           source_sheet: activeSheetId,
@@ -2180,7 +2304,7 @@
           filter_field: filterCol == null ? null : { column: filterCol, label: pivotColumns.find((c) => c.col === filterCol)?.name ?? colLabel(filterCol) },
           filter_values: pivotFilterValue.trim() ? pivotFilterValue.split(',').map((value) => value.trim()).filter(Boolean) : [],
         },
-      })
+      }))
       await loadSheetList(result, result[result.length - 1]?.id ?? activeSheetId)
       markDirty()
       setStatus(`Created pivot sheet from ${rangeLabel(r)}`)
@@ -2212,7 +2336,7 @@
     }
   }
 
-  function applyFilter() {
+  async function applyFilter() {
     const r = normalizeRange(currentRange)
     const col = Number(filterColumn || r.startCol)
     if (!Number.isInteger(col) || col < r.startCol || col > r.endCol) {
@@ -2228,17 +2352,19 @@
         hidden += 1
       }
     }
-    hiddenRows = nextHidden
-    activeFilterLabel = `${colLabel(col)} ${filterCondition}${filterCondition === 'Empty' || filterCondition === 'NotEmpty' ? '' : ` "${filterValue}"`}`
-    markDirty()
-    setStatus(`Filter applied to ${rangeLabel(r)}; ${hidden} row${hidden === 1 ? '' : 's'} hidden`)
+    const changed = await applyMetadataChange(() => {
+      hiddenRows = nextHidden
+      activeFilterLabel = `${colLabel(col)} ${filterCondition}${filterCondition === 'Empty' || filterCondition === 'NotEmpty' ? '' : ` "${filterValue}"`}`
+    }, 'Filter failed')
+    if (changed) setStatus(`Filter applied to ${rangeLabel(r)}; ${hidden} row${hidden === 1 ? '' : 's'} hidden`)
   }
 
-  function clearFilter() {
-    hiddenRows = {}
-    activeFilterLabel = ''
-    markDirty()
-    setStatus('Filter cleared')
+  async function clearFilter() {
+    const changed = await applyMetadataChange(() => {
+      hiddenRows = {}
+      activeFilterLabel = ''
+    }, 'Clear filter failed')
+    if (changed) setStatus('Filter cleared')
   }
 
   async function removeDuplicateRows() {
@@ -2300,7 +2426,7 @@
     return name
   }
 
-  function addNamedRange() {
+  async function addNamedRange() {
     const name = namedRangeName.trim()
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
       setError('Use letters, numbers, and underscores; start with a letter or underscore', 'Named range failed')
@@ -2314,17 +2440,21 @@
       setError('A named range with that name already exists', 'Named range failed')
       return
     }
-    namedRanges = [...namedRanges, { id: `named-${Date.now()}`, name, range: normalizeRange(currentRange) }]
-    markDirty()
-    namedRangeName = nextNamedRangeName()
-    setStatus(`Named ${rangeLabel(currentRange)} as ${name}`)
+    const changed = await applyMetadataChange(() => {
+      namedRanges = [...namedRanges, { id: `named-${Date.now()}`, name, range: normalizeRange(currentRange) }]
+    }, 'Named range failed')
+    if (changed) {
+      namedRangeName = nextNamedRangeName()
+      setStatus(`Named ${rangeLabel(currentRange)} as ${name}`)
+    }
   }
 
-  function removeNamedRange(id: string) {
+  async function removeNamedRange(id: string) {
     const removed = namedRanges.find((range) => range.id === id)
-    namedRanges = namedRanges.filter((range) => range.id !== id)
-    markDirty()
-    if (removed) setStatus(`Removed named range ${removed.name}`)
+    const changed = await applyMetadataChange(() => {
+      namedRanges = namedRanges.filter((range) => range.id !== id)
+    }, 'Named range removal failed')
+    if (changed && removed) setStatus(`Removed named range ${removed.name}`)
   }
 
   function selectNamedRange(range: NamedRange) {
@@ -2356,9 +2486,11 @@
   async function insertRowAbove() {
     const rowIndex = selectedRow
     try {
-      await invoke('edit_sheet_structure', { sheetId: activeSheetId, operation: 'insert_row', index: rowIndex })
+      await runWorkbookTransaction(async () => {
+        await invoke('edit_sheet_structure', { sheetId: activeSheetId, operation: 'insert_row', index: rowIndex })
+        clearActiveCoordinateMetadata()
+      })
       await refreshSheetData()
-      clearActiveCoordinateMetadata()
       markDirty()
       setStatus(`Inserted row above ${rowIndex + 1}`)
     } catch (e) {
@@ -2370,9 +2502,11 @@
   async function deleteSelectedRow() {
     const rowIndex = selectedRow
     try {
-      await invoke('edit_sheet_structure', { sheetId: activeSheetId, operation: 'delete_row', index: rowIndex })
+      await runWorkbookTransaction(async () => {
+        await invoke('edit_sheet_structure', { sheetId: activeSheetId, operation: 'delete_row', index: rowIndex })
+        clearActiveCoordinateMetadata()
+      })
       await refreshSheetData()
-      clearActiveCoordinateMetadata()
       markDirty()
       setStatus(`Deleted row ${rowIndex + 1}`)
     } catch (e) {
@@ -2384,9 +2518,11 @@
   async function insertColumnLeft() {
     const colIndex = selectedCol
     try {
-      await invoke('edit_sheet_structure', { sheetId: activeSheetId, operation: 'insert_column', index: colIndex })
+      await runWorkbookTransaction(async () => {
+        await invoke('edit_sheet_structure', { sheetId: activeSheetId, operation: 'insert_column', index: colIndex })
+        clearActiveCoordinateMetadata()
+      })
       await refreshSheetData()
-      clearActiveCoordinateMetadata()
       markDirty()
       setStatus(`Inserted column before ${colLabel(colIndex)}`)
     } catch (e) {
@@ -2398,9 +2534,11 @@
   async function deleteSelectedColumn() {
     const colIndex = selectedCol
     try {
-      await invoke('edit_sheet_structure', { sheetId: activeSheetId, operation: 'delete_column', index: colIndex })
+      await runWorkbookTransaction(async () => {
+        await invoke('edit_sheet_structure', { sheetId: activeSheetId, operation: 'delete_column', index: colIndex })
+        clearActiveCoordinateMetadata()
+      })
       await refreshSheetData()
-      clearActiveCoordinateMetadata()
       markDirty()
       setStatus(`Deleted column ${colLabel(colIndex)}`)
     } catch (e) {
@@ -2409,21 +2547,21 @@
     selectCell(selectedRow, Math.min(colIndex, COLS - 1))
   }
 
-  function freezePanesAtSelection() {
-    frozenRowCount = selectedRow
-    frozenColCount = selectedCol
-    if (selectedRow === 0 && selectedCol === 0) {
-      frozenRowCount = 1
-    }
-    markDirty()
-    setStatus(`Frozen ${frozenRowCount} row${frozenRowCount === 1 ? '' : 's'} and ${frozenColCount} column${frozenColCount === 1 ? '' : 's'}`)
+  async function freezePanesAtSelection() {
+    const changed = await applyMetadataChange(() => {
+      frozenRowCount = selectedRow
+      frozenColCount = selectedCol
+      if (selectedRow === 0 && selectedCol === 0) frozenRowCount = 1
+    }, 'Freeze panes failed')
+    if (changed) setStatus(`Frozen ${frozenRowCount} row${frozenRowCount === 1 ? '' : 's'} and ${frozenColCount} column${frozenColCount === 1 ? '' : 's'}`)
   }
 
-  function unfreezePanes() {
-    frozenRowCount = 0
-    frozenColCount = 0
-    markDirty()
-    setStatus('Panes unfrozen')
+  async function unfreezePanes() {
+    const changed = await applyMetadataChange(() => {
+      frozenRowCount = 0
+      frozenColCount = 0
+    }, 'Unfreeze panes failed')
+    if (changed) setStatus('Panes unfrozen')
   }
 
   async function applyTemplate(key: string) {
@@ -2542,17 +2680,20 @@
       range: r,
       validation: buildValidation(),
     }
-    validationRules = [...validationRules, rule]
-    markDirty()
+    const changed = await applyMetadataChange(() => {
+      validationRules = [...validationRules, rule]
+    }, 'Validation rule save failed')
+    if (!changed) return
     await runValidation()
     setStatus(`Saved validation rule for ${rangeLabel(r)}`)
   }
 
-  function removeValidationRule(id: string) {
+  async function removeValidationRule(id: string) {
     const removed = validationRules.find((rule) => rule.id === id)
-    validationRules = validationRules.filter((rule) => rule.id !== id)
-    markDirty()
-    if (removed) setStatus(`Removed ${removed.label}`)
+    const changed = await applyMetadataChange(() => {
+      validationRules = validationRules.filter((rule) => rule.id !== id)
+    }, 'Validation rule removal failed')
+    if (changed && removed) setStatus(`Removed ${removed.label}`)
   }
 
   function buildConditionalRule(): ConditionalRuleDefinition {
@@ -2640,22 +2781,24 @@
         sheetId: activeSheetId,
         rule,
       })
-      conditionalMatches = matches
       const label = conditionalRuleName.trim() || `Highlight ${conditionalRules.length + 1}`
-      conditionalRules = [...conditionalRules, { id: rule.id, label, rule }]
-      markDirty()
-      setStatus(`Saved conditional rule; ${matches.length} current match${matches.length === 1 ? '' : 'es'}`)
+      const changed = await applyMetadataChange(() => {
+        conditionalMatches = matches
+        conditionalRules = [...conditionalRules, { id: rule.id, label, rule }]
+      }, 'Conditional formatting failed')
+      if (changed) setStatus(`Saved conditional rule; ${matches.length} current match${matches.length === 1 ? '' : 'es'}`)
     } catch (e) {
       setError(e, 'Conditional formatting failed')
     }
   }
 
-  function removeConditionalRule(id: string) {
+  async function removeConditionalRule(id: string) {
     const removed = conditionalRules.find((rule) => rule.id === id)
-    conditionalRules = conditionalRules.filter((rule) => rule.id !== id)
-    markDirty()
-    conditionalMatches = []
-    if (removed) setStatus(`Removed ${removed.label}`)
+    const changed = await applyMetadataChange(() => {
+      conditionalRules = conditionalRules.filter((rule) => rule.id !== id)
+      conditionalMatches = []
+    }, 'Conditional rule removal failed')
+    if (changed && removed) setStatus(`Removed ${removed.label}`)
   }
 
   async function updatePrintPreview() {
@@ -2677,11 +2820,15 @@
     }
     try {
       if (protectedSheet) {
-        await invoke('protect_sheet', { sheetId: activeSheetId, password: protectionPassword })
+        await runWorkbookTransaction(() =>
+          invoke('protect_sheet', { sheetId: activeSheetId, password: protectionPassword })
+        )
         markDirty()
         setStatus('Sheet protected')
       } else {
-        const ok = await invoke<boolean>('unprotect_sheet', { sheetId: activeSheetId, password: protectionPassword })
+        const ok = await runWorkbookTransaction(() =>
+          invoke<boolean>('unprotect_sheet', { sheetId: activeSheetId, password: protectionPassword })
+        )
         if (ok) markDirty()
         setStatus(ok ? 'Sheet unprotected' : 'Password did not match')
       }
@@ -2694,14 +2841,14 @@
   async function setRangeLock(locked: boolean) {
     const r = normalizeRange(currentRange)
     try {
-      await invoke('lock_cell_range', {
+      await runWorkbookTransaction(() => invoke('lock_cell_range', {
         sheetId: activeSheetId,
         startRow: r.startRow,
         startCol: r.startCol,
         endRow: r.endRow,
         endCol: r.endCol,
         locked,
-      })
+      }))
       markDirty()
       setStatus(`${locked ? 'Locked' : 'Unlocked'} ${rangeLabel(r)}`)
     } catch (e) {
@@ -2739,13 +2886,13 @@
 
   async function saveComment() {
     try {
-      await invoke('add_cell_comment', {
+      await runWorkbookTransaction(() => invoke('add_cell_comment', {
         sheetId: activeSheetId,
         row: selectedRow,
         col: selectedCol,
         text: commentText,
         author: commentAuthor || '900Sheets user',
-      })
+      }))
       await loadCommentPanel()
       markDirty()
       setStatus(`Saved comment on ${cellKey(selectedRow, selectedCol)}`)
@@ -2756,7 +2903,9 @@
 
   async function removeCurrentComment() {
     try {
-      const removed = await invoke<boolean>('remove_cell_comment', { sheetId: activeSheetId, row: selectedRow, col: selectedCol })
+      const removed = await runWorkbookTransaction(() =>
+        invoke<boolean>('remove_cell_comment', { sheetId: activeSheetId, row: selectedRow, col: selectedCol })
+      )
       commentText = ''
       await loadCommentPanel()
       if (removed) markDirty()
@@ -2789,16 +2938,13 @@
         },
       })
       if (goalSeekResult.success) {
-        const oldValue = cellContents[cellKey(input.row, input.col)] ?? ''
         const newValue = String(goalSeekResult.input_value)
-        await invoke('set_cell', {
+        await runWorkbookTransaction(() => invoke('set_cell', {
           sheetId: activeSheetId,
           row: input.row,
           col: input.col,
           value: newValue,
-        })
-        undoRedo.push([{ sheetId: activeSheetId, row: input.row, col: input.col, oldValue, newValue }])
-        updateUndoRedoState()
+        }))
         await refreshSheetData()
         markDirty()
         selectCell(input.row, input.col)
@@ -2831,7 +2977,7 @@
       case 'delete': return deleteSelection()
       case 'findReplace': return openPanel('find')
       case 'toggleFormulaBar': showFormulaBar = !showFormulaBar; return
-      case 'toggleGridlines': showGridlines = !showGridlines; return
+      case 'toggleGridlines': return toggleGridlines()
       case 'toggleCompact': compactControls = !compactControls; return
       case 'zoomIn': zoomPercent = Math.min(150, zoomPercent + 10); return
       case 'zoomOut': zoomPercent = Math.max(70, zoomPercent - 10); return
@@ -2879,6 +3025,71 @@
     }
   }
 
+  async function initializeWorkbook() {
+    try {
+      const recoveries = await invoke<RecoveryEntry[]>('list_recovery_snapshots')
+      if (recoveries.length > 0) {
+        window.alert([
+          `900Sheets found ${recoveries.length} autosaved recover${recoveries.length === 1 ? 'y' : 'ies'}:`,
+          ...recoveries.map((entry, index) => `${index + 1}. ${new Date(entry.modified_millis).toLocaleString()} (${entry.id})`),
+          'Each recovery will be offered in newest-first order.',
+        ].join('\n'))
+        for (let index = 0; index < recoveries.length; index++) {
+          const entry = recoveries[index]
+          const restore = window.confirm(
+            `Restore recovery ${index + 1} of ${recoveries.length} from ${new Date(entry.modified_millis).toLocaleString()}?\n\nCancel discards this recovery and shows the next one.`
+          )
+          if (restore) {
+            try {
+              recoveryId = entry.id
+              const result = await invoke<NativeOpenResult>('restore_recovery_snapshot', {
+                recoveryId: entry.id,
+              })
+              resetWorkbookSessionState({ clearComments: true })
+              restoreNativeMetadata(result.metadata)
+              await loadSheetList(result.sheets)
+              canUndo = false
+              canRedo = false
+              markDirty()
+              setStatus('Restored autosaved recovery. Save to keep it.')
+              return
+            } catch (error) {
+              window.alert(`Recovery could not be restored: ${describeError(error)}`)
+              continue
+            }
+          }
+          await invoke('discard_recovery_snapshot', { recoveryId: entry.id })
+        }
+      }
+    } catch (error) {
+      console.error('Recovery discovery failed', error)
+      window.alert(`Recovery could not be restored: ${describeError(error)}`)
+    }
+    await handleNewWorkbook(false)
+  }
+
+  let removeCloseListener: (() => void) | null = null
+  let closeInProgress = false
+
+  async function handleAppClose(event: { preventDefault: () => void }) {
+    if (closeInProgress) return
+    event.preventDefault()
+    closeInProgress = true
+    try {
+      if (editingCell) commitEdit()
+      await recoveryAutosave.cancelAndWait()
+      await flushPendingMutations()
+      if (isDirty) await recoveryAutosave.runNow()
+      await getCurrentWindow().destroy()
+    } catch (error) {
+      closeInProgress = false
+      setError(error, 'Could not create a final recovery snapshot')
+      if (window.confirm('900Sheets could not preserve the latest edits. Close anyway?')) {
+        await getCurrentWindow().destroy()
+      }
+    }
+  }
+
   onMount(() => {
     const warnBeforeClose = (event: BeforeUnloadEvent) => {
       if (!isDirty) return
@@ -2886,8 +3097,16 @@
       event.returnValue = ''
     }
     window.addEventListener('beforeunload', warnBeforeClose)
-    void handleNewWorkbook(false)
-    return () => window.removeEventListener('beforeunload', warnBeforeClose)
+    void getCurrentWindow()
+      .onCloseRequested(handleAppClose)
+      .then((remove) => { removeCloseListener = remove })
+      .catch((error) => console.error('Unable to register close recovery handler', error))
+    void initializeWorkbook()
+    return () => {
+      window.removeEventListener('beforeunload', warnBeforeClose)
+      removeCloseListener?.()
+      void recoveryAutosave.cancelAndWait()
+    }
   })
 </script>
 
@@ -3566,7 +3785,7 @@
         {:else if activePanel === 'print'}
           <div class="panel-body form-grid">
             <label>Page size
-              <select class="panel-input" bind:value={printPageSize}>
+              <select class="panel-input" value={printPageSize} onchange={(event) => setPrintPageSize(event.currentTarget.value)}>
                 <option>Letter</option>
                 <option>A4</option>
                 <option>A3</option>
@@ -3575,7 +3794,7 @@
               </select>
             </label>
             <label>Orientation
-              <select class="panel-input" bind:value={printOrientation}>
+              <select class="panel-input" value={printOrientation} onchange={(event) => setPrintOrientation(event.currentTarget.value)}>
                 <option>Portrait</option>
                 <option>Landscape</option>
               </select>
@@ -3646,9 +3865,10 @@
           </div>
         {:else if activePanel === 'about'}
           <div class="panel-body">
+            <p class="panel-note">Version 0.4.0</p>
             <p class="panel-note">900Sheets is a local-first spreadsheet editor from 900 Labs. It works without an account or subscription and keeps workbook processing on your computer.</p>
             <p class="panel-note">900 Labs builds enterprise-grade open-source tools for people and communities priced out of modern software, especially in developing economies. 900Sheets is part of that work.</p>
-            <p class="panel-note">Create or edit a workbook in the grid, then use File &gt; Save Workbook to keep an editable .900sheets file. Use the import and export commands to exchange XLSX, CSV, JSON, and PDF files.</p>
+            <p class="panel-note">Create or edit a workbook in the grid, use cross-sheet formulas when needed, then choose File &gt; Save Workbook to keep an editable .900sheets file. Open XLSX or JSON as a replacement workbook, import CSV into the active sheet, and use export commands for exchange files. Unsaved edits receive local recovery snapshots.</p>
             <div class="chip-row">
               <span class="chip">Tauri</span>
               <span class="chip">Svelte</span>

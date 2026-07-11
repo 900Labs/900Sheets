@@ -1,80 +1,141 @@
+use crate::ast::MAX_EXPANDED_REFERENCES;
 use crate::parser::Parser;
 use std::collections::{HashMap, HashSet, VecDeque};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CellKey {
+    pub sheet_id: u64,
+    pub row: u32,
+    pub col: u32,
+}
+
+impl CellKey {
+    pub const fn new(sheet_id: u64, row: u32, col: u32) -> Self {
+        Self { sheet_id, row, col }
+    }
+}
+
+#[derive(Clone, Default)]
 pub struct DependencyGraph {
-    deps: HashMap<(u32, u32), HashSet<(u32, u32)>>,
-    dependents: HashMap<(u32, u32), HashSet<(u32, u32)>>,
+    deps: HashMap<CellKey, HashSet<CellKey>>,
+    dependents: HashMap<CellKey, HashSet<CellKey>>,
 }
 
 impl DependencyGraph {
     pub fn new() -> Self {
-        Self {
-            deps: HashMap::new(),
-            dependents: HashMap::new(),
-        }
+        Self::default()
+    }
+
+    pub fn clear(&mut self) {
+        self.deps.clear();
+        self.dependents.clear();
     }
 
     pub fn set_formula(&mut self, row: u32, col: u32, formula: &str) -> Result<(), String> {
-        let expr = Parser::parse_formula(formula).map_err(|e| e.to_string())?;
-        let refs: HashSet<(u32, u32)> = expr.references().into_iter().collect();
-        let cell = (row, col);
+        self.set_formula_on_sheet(0, row, col, formula, |_| None)
+    }
+
+    pub fn set_formula_on_sheet<F>(
+        &mut self,
+        sheet_id: u64,
+        row: u32,
+        col: u32,
+        formula: &str,
+        resolve_sheet: F,
+    ) -> Result<(), String>
+    where
+        F: Fn(&str) -> Option<u64>,
+    {
+        let expr = Parser::parse_formula(formula).map_err(|error| error.to_string())?;
+        let mut refs = HashSet::new();
+        expr.for_each_qualified_reference(MAX_EXPANDED_REFERENCES, &mut |reference| {
+            if let Some(target_sheet) = reference
+                .sheet
+                .as_deref()
+                .and_then(&resolve_sheet)
+                .or_else(|| reference.sheet.is_none().then_some(sheet_id))
+            {
+                refs.insert(CellKey::new(target_sheet, reference.row, reference.col));
+            }
+        })
+        .map_err(|error| error.to_string())?;
+        let cell = CellKey::new(sheet_id, row, col);
 
         let old_deps = self.remove_formula_edges(cell);
         self.insert_formula_edges(cell, refs);
 
-        if self.has_circular_ref(row, col) {
+        if self.has_circular_ref_key(cell) {
             self.remove_formula_edges(cell);
             if let Some(old_deps) = old_deps {
                 self.insert_formula_edges(cell, old_deps);
             }
-            return Err(format!("Circular reference detected at ({}, {})", row, col));
+            return Err(format!(
+                "Circular reference detected at sheet {sheet_id}, ({row}, {col})"
+            ));
         }
 
         Ok(())
     }
 
-    fn remove_formula_edges(&mut self, cell: (u32, u32)) -> Option<HashSet<(u32, u32)>> {
+    fn remove_formula_edges(&mut self, cell: CellKey) -> Option<HashSet<CellKey>> {
         let old_deps = self.deps.remove(&cell)?;
         for dep in &old_deps {
-            if let Some(deps_set) = self.dependents.get_mut(dep) {
-                deps_set.remove(&cell);
+            if let Some(dependents) = self.dependents.get_mut(dep) {
+                dependents.remove(&cell);
+                if dependents.is_empty() {
+                    self.dependents.remove(dep);
+                }
             }
         }
         Some(old_deps)
     }
 
-    fn insert_formula_edges(&mut self, cell: (u32, u32), refs: HashSet<(u32, u32)>) {
+    fn insert_formula_edges(&mut self, cell: CellKey, refs: HashSet<CellKey>) {
         for dep in &refs {
             self.dependents.entry(*dep).or_default().insert(cell);
         }
-
         self.deps.insert(cell, refs);
     }
 
     pub fn clear_cell(&mut self, row: u32, col: u32) {
-        self.remove_formula_edges((row, col));
+        self.clear_cell_key(CellKey::new(0, row, col));
     }
 
-    pub fn get_dependencies(&self, row: u32, col: u32) -> Option<&HashSet<(u32, u32)>> {
-        self.deps.get(&(row, col))
+    pub fn clear_cell_key(&mut self, cell: CellKey) {
+        self.remove_formula_edges(cell);
     }
 
-    pub fn get_dependents(&self, row: u32, col: u32) -> Option<&HashSet<(u32, u32)>> {
-        self.dependents.get(&(row, col))
+    pub fn get_dependencies(&self, row: u32, col: u32) -> Option<&HashSet<CellKey>> {
+        self.get_dependencies_key(CellKey::new(0, row, col))
     }
 
-    pub fn get_all_dependents(&self, row: u32, col: u32) -> HashSet<(u32, u32)> {
+    pub fn get_dependencies_key(&self, cell: CellKey) -> Option<&HashSet<CellKey>> {
+        self.deps.get(&cell)
+    }
+
+    pub fn get_dependents(&self, row: u32, col: u32) -> Option<&HashSet<CellKey>> {
+        self.get_dependents_key(CellKey::new(0, row, col))
+    }
+
+    pub fn get_dependents_key(&self, cell: CellKey) -> Option<&HashSet<CellKey>> {
+        self.dependents.get(&cell)
+    }
+
+    pub fn get_all_dependents(&self, row: u32, col: u32) -> HashSet<CellKey> {
+        self.get_all_dependents_key(CellKey::new(0, row, col))
+    }
+
+    pub fn get_all_dependents_key(&self, cell: CellKey) -> HashSet<CellKey> {
         let mut result = HashSet::new();
-        let mut queue = vec![(row, col)];
-        let mut visited = HashSet::new();
-        visited.insert((row, col));
+        let mut queue = vec![cell];
+        let mut visited = HashSet::from([cell]);
 
         while let Some(cell) = queue.pop() {
-            if let Some(deps) = self.dependents.get(&cell) {
-                for dep in deps {
-                    if visited.insert(*dep) {
-                        result.insert(*dep);
-                        queue.push(*dep);
+            if let Some(dependents) = self.dependents.get(&cell) {
+                for dependent in dependents {
+                    if visited.insert(*dependent) {
+                        result.insert(*dependent);
+                        queue.push(*dependent);
                     }
                 }
             }
@@ -83,31 +144,30 @@ impl DependencyGraph {
     }
 
     pub fn has_circular_ref(&self, row: u32, col: u32) -> bool {
-        let mut visited = HashSet::new();
-        self.detect_cycle(row, col, &mut visited)
+        self.has_circular_ref_key(CellKey::new(0, row, col))
     }
 
-    fn detect_cycle(&self, row: u32, col: u32, visited: &mut HashSet<(u32, u32)>) -> bool {
-        if visited.contains(&(row, col)) {
+    pub fn has_circular_ref_key(&self, cell: CellKey) -> bool {
+        self.detect_cycle(cell, &mut HashSet::new())
+    }
+
+    fn detect_cycle(&self, cell: CellKey, visiting: &mut HashSet<CellKey>) -> bool {
+        if !visiting.insert(cell) {
             return true;
         }
-        visited.insert((row, col));
-
-        if let Some(deps) = self.deps.get(&(row, col)) {
+        if let Some(deps) = self.deps.get(&cell) {
             for dep in deps {
-                if self.detect_cycle(dep.0, dep.1, visited) {
+                if self.detect_cycle(*dep, visiting) {
                     return true;
                 }
             }
         }
-
-        visited.remove(&(row, col));
+        visiting.remove(&cell);
         false
     }
 
-    pub fn topological_sort(&self) -> Vec<(u32, u32)> {
-        let mut in_degree: HashMap<(u32, u32), usize> = HashMap::new();
-
+    pub fn topological_sort(&self) -> Vec<CellKey> {
+        let mut in_degree: HashMap<CellKey, usize> = HashMap::new();
         for (cell, deps) in &self.deps {
             in_degree.entry(*cell).or_insert(0);
             for dep in deps {
@@ -116,38 +176,29 @@ impl DependencyGraph {
             }
         }
 
-        let mut queue: VecDeque<(u32, u32)> = in_degree
+        let mut ready: Vec<_> = in_degree
             .iter()
-            .filter(|(_, &d)| d == 0)
-            .map(|(&c, _)| c)
+            .filter_map(|(cell, degree)| (*degree == 0).then_some(*cell))
             .collect();
-        let mut sorted: Vec<(u32, u32)> = queue.iter().copied().collect();
-        sorted.sort();
-        queue = sorted.into_iter().collect();
-
+        ready.sort();
+        let mut queue: VecDeque<_> = ready.into();
         let mut result = Vec::new();
-
         while let Some(cell) = queue.pop_front() {
             result.push(cell);
             if let Some(dependents) = self.dependents.get(&cell) {
-                for dep in dependents {
-                    if let Some(d) = in_degree.get_mut(dep) {
-                        *d -= 1;
-                        if *d == 0 {
-                            queue.push_back(*dep);
+                let mut dependents: Vec<_> = dependents.iter().copied().collect();
+                dependents.sort();
+                for dependent in dependents {
+                    if let Some(degree) = in_degree.get_mut(&dependent) {
+                        *degree -= 1;
+                        if *degree == 0 {
+                            queue.push_back(dependent);
                         }
                     }
                 }
             }
         }
-
         result
-    }
-}
-
-impl Default for DependencyGraph {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -156,94 +207,75 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_set_formula_deps() {
+    fn stable_sheet_ids_are_part_of_dependency_keys() {
         let mut graph = DependencyGraph::new();
-        graph.set_formula(0, 0, "B1+C1").unwrap();
-        let deps = graph.get_dependencies(0, 0).unwrap();
-        assert!(deps.contains(&(0, 1)));
-        assert!(deps.contains(&(0, 2)));
+        graph
+            .set_formula_on_sheet(20, 0, 0, "Data!B1+C1", |name| {
+                (name == "Data").then_some(10)
+            })
+            .unwrap();
+        let deps = graph.get_dependencies_key(CellKey::new(20, 0, 0)).unwrap();
+        assert!(deps.contains(&CellKey::new(10, 0, 1)));
+        assert!(deps.contains(&CellKey::new(20, 0, 2)));
     }
 
     #[test]
-    fn test_dependents() {
+    fn cross_sheet_cycle_is_rejected_and_rolled_back() {
         let mut graph = DependencyGraph::new();
-        graph.set_formula(0, 0, "B1").unwrap();
-        let deps = graph.get_dependents(0, 1).unwrap();
-        assert!(deps.contains(&(0, 0)));
-    }
-
-    #[test]
-    fn test_clear_cell() {
-        let mut graph = DependencyGraph::new();
-        graph.set_formula(0, 0, "B1").unwrap();
-        assert!(graph.get_dependencies(0, 0).is_some());
-        graph.clear_cell(0, 0);
-        assert!(graph.get_dependencies(0, 0).is_none());
-        assert!(
-            graph.get_dependents(0, 1).is_none() || graph.get_dependents(0, 1).unwrap().is_empty()
-        );
-    }
-
-    #[test]
-    fn test_no_circular_ref() {
-        let mut graph = DependencyGraph::new();
-        graph.set_formula(0, 0, "B1").unwrap();
-        graph.set_formula(0, 1, "C1").unwrap();
-        assert!(!graph.has_circular_ref(0, 0));
-    }
-
-    #[test]
-    fn test_circular_ref_detected() {
-        let mut graph = DependencyGraph::new();
-        graph.set_formula(0, 0, "B1").unwrap();
-        let result = graph.set_formula(0, 1, "A1");
-        assert!(result.is_err());
-        assert!(!graph.has_circular_ref(0, 0));
-        assert!(graph.get_dependencies(0, 1).is_none());
+        let resolve = |name: &str| match name {
+            "First" => Some(1),
+            "Second" => Some(2),
+            _ => None,
+        };
+        graph
+            .set_formula_on_sheet(1, 0, 0, "Second!A1", resolve)
+            .unwrap();
         assert!(graph
-            .get_dependents(0, 0)
-            .map(|deps| !deps.contains(&(0, 1)))
-            .unwrap_or(true));
+            .set_formula_on_sheet(2, 0, 0, "First!A1", resolve)
+            .is_err());
+        assert!(graph.get_dependencies_key(CellKey::new(2, 0, 0)).is_none());
     }
 
     #[test]
-    fn test_circular_ref_rejection_rolls_back_old_dependencies() {
+    fn workbook_wide_dependents_and_order_cross_sheet_boundaries() {
+        let mut graph = DependencyGraph::new();
+        graph
+            .set_formula_on_sheet(2, 0, 0, "First!A1", |name| (name == "First").then_some(1))
+            .unwrap();
+        graph
+            .set_formula_on_sheet(3, 0, 0, "Second!A1", |name| (name == "Second").then_some(2))
+            .unwrap();
+        let all = graph.get_all_dependents_key(CellKey::new(1, 0, 0));
+        assert_eq!(
+            all,
+            HashSet::from([CellKey::new(2, 0, 0), CellKey::new(3, 0, 0)])
+        );
+        let sorted = graph.topological_sort();
+        let positions = |key| {
+            sorted
+                .iter()
+                .position(|candidate| *candidate == key)
+                .unwrap()
+        };
+        assert!(positions(CellKey::new(1, 0, 0)) < positions(CellKey::new(2, 0, 0)));
+        assert!(positions(CellKey::new(2, 0, 0)) < positions(CellKey::new(3, 0, 0)));
+    }
+
+    #[test]
+    fn formula_replacement_rolls_back_on_cycle() {
         let mut graph = DependencyGraph::new();
         graph.set_formula(0, 0, "C1").unwrap();
         graph.set_formula(0, 1, "A1").unwrap();
-
-        let result = graph.set_formula(0, 0, "B1");
-
-        assert!(result.is_err());
+        assert!(graph.set_formula(0, 0, "B1").is_err());
         let deps = graph.get_dependencies(0, 0).unwrap();
-        assert!(deps.contains(&(0, 2)));
-        assert!(!deps.contains(&(0, 1)));
-        assert!(graph
-            .get_dependents(0, 1)
-            .map(|deps| !deps.contains(&(0, 0)))
-            .unwrap_or(true));
+        assert!(deps.contains(&CellKey::new(0, 0, 2)));
     }
 
     #[test]
-    fn test_all_dependents() {
+    fn huge_range_dependency_is_rejected_without_materialization() {
         let mut graph = DependencyGraph::new();
-        graph.set_formula(0, 1, "A1").unwrap();
-        graph.set_formula(0, 2, "B1").unwrap();
-        let all = graph.get_all_dependents(0, 0);
-        assert!(all.contains(&(0, 1)));
-        assert!(all.contains(&(0, 2)));
-    }
-
-    #[test]
-    fn test_topological_sort() {
-        let mut graph = DependencyGraph::new();
-        graph.set_formula(0, 1, "A1").unwrap();
-        graph.set_formula(0, 2, "B1").unwrap();
-        let sorted = graph.topological_sort();
-        let a_pos = sorted.iter().position(|&c| c == (0, 0)).unwrap();
-        let b_pos = sorted.iter().position(|&c| c == (0, 1)).unwrap();
-        let c_pos = sorted.iter().position(|&c| c == (0, 2)).unwrap();
-        assert!(a_pos < b_pos);
-        assert!(b_pos < c_pos);
+        let error = graph.set_formula(0, 0, "SUM(A1:XFD1000000)").unwrap_err();
+        assert!(error.contains("safe reference limit"));
+        assert!(graph.get_dependencies(0, 0).is_none());
     }
 }

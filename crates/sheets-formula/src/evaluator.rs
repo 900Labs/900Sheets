@@ -172,10 +172,22 @@ impl std::fmt::Display for Value {
 pub trait CellProvider {
     fn get_cell(&self, row: u32, col: u32) -> Value;
     fn get_raw(&self, row: u32, col: u32) -> String;
+
+    fn get_cell_on_sheet(&self, sheet: &str, row: u32, col: u32) -> Value {
+        let _ = (row, col);
+        Value::Error(FormulaError::RefError(format!(
+            "Sheet '{sheet}' was not found"
+        )))
+    }
+
+    fn get_raw_on_sheet(&self, sheet: &str, row: u32, col: u32) -> String {
+        self.get_cell_on_sheet(sheet, row, col).to_display()
+    }
 }
 
 pub struct SimpleProvider {
     cells: std::collections::HashMap<(u32, u32), Value>,
+    sheets: std::collections::HashMap<String, std::collections::HashMap<(u32, u32), Value>>,
 }
 
 impl Default for SimpleProvider {
@@ -188,6 +200,7 @@ impl SimpleProvider {
     pub fn new() -> Self {
         Self {
             cells: std::collections::HashMap::new(),
+            sheets: std::collections::HashMap::new(),
         }
     }
 
@@ -202,6 +215,13 @@ impl SimpleProvider {
     pub fn set_string(&mut self, row: u32, col: u32, s: &str) {
         self.cells.insert((row, col), Value::String(s.into()));
     }
+
+    pub fn set_on_sheet(&mut self, sheet: &str, row: u32, col: u32, value: Value) {
+        self.sheets
+            .entry(sheet.to_ascii_lowercase())
+            .or_default()
+            .insert((row, col), value);
+    }
 }
 
 impl CellProvider for SimpleProvider {
@@ -214,6 +234,15 @@ impl CellProvider for SimpleProvider {
             .get(&(row, col))
             .map(|v| v.to_display())
             .unwrap_or_default()
+    }
+
+    fn get_cell_on_sheet(&self, sheet: &str, row: u32, col: u32) -> Value {
+        let Some(cells) = self.sheets.get(&sheet.to_ascii_lowercase()) else {
+            return Value::Error(FormulaError::RefError(format!(
+                "Sheet '{sheet}' was not found"
+            )));
+        };
+        cells.get(&(row, col)).cloned().unwrap_or(Value::Empty)
     }
 }
 
@@ -252,24 +281,42 @@ impl Evaluator {
             Expr::String(s) => Value::String(s.clone()),
             Expr::Boolean(b) => Value::Boolean(*b),
             Expr::Error(e) => Value::Error(e.clone()),
-            Expr::CellRef { col, row, .. } => {
+            Expr::CellRef {
+                sheet, col, row, ..
+            } => {
                 let key = (*row, *col);
                 if visited.contains(&key) {
                     return Value::Error(FormulaError::CircularReference);
                 }
-                provider.get_cell(*row, *col)
+                if let Some(sheet) = sheet {
+                    provider.get_cell_on_sheet(sheet, *row, *col)
+                } else {
+                    provider.get_cell(*row, *col)
+                }
             }
             Expr::RangeRef {
+                sheet,
                 start_col,
                 start_row,
                 end_col,
                 end_row,
-                ..
             } => {
-                let mut values = Vec::new();
+                let count = u64::from(end_row - start_row + 1)
+                    .saturating_mul(u64::from(end_col - start_col + 1));
+                if count > MAX_EXPANDED_REFERENCES as u64 {
+                    return Value::Error(FormulaError::RefError(format!(
+                        "Range exceeds safe evaluation limit of {} cells",
+                        MAX_EXPANDED_REFERENCES
+                    )));
+                }
+                let mut values = Vec::with_capacity(count as usize);
                 for r in *start_row..=*end_row {
                     for c in *start_col..=*end_col {
-                        values.push(provider.get_cell(r, c));
+                        values.push(if let Some(sheet) = sheet {
+                            provider.get_cell_on_sheet(sheet, r, c)
+                        } else {
+                            provider.get_cell(r, c)
+                        });
                     }
                 }
                 Value::Array(values)
@@ -576,6 +623,38 @@ mod tests {
         let expr = Parser::parse_formula("A1+B1").unwrap();
         let result = evaluator.evaluate(&expr, &provider);
         assert_eq!(result, Value::Number(30.0));
+    }
+
+    #[test]
+    fn test_eval_qualified_cell_and_range_refs() {
+        let evaluator = Evaluator::new();
+        let mut provider = SimpleProvider::new();
+        provider.set_on_sheet("Annual Budget", 0, 0, Value::Number(10.0));
+        provider.set_on_sheet("Annual Budget", 1, 0, Value::Number(20.0));
+        let expr = Parser::parse_formula("SUM('Annual Budget'!A1:A2)").unwrap();
+        assert_eq!(evaluator.evaluate(&expr, &provider), Value::Number(30.0));
+    }
+
+    #[test]
+    fn test_missing_qualified_sheet_is_ref_error() {
+        let evaluator = Evaluator::new();
+        let provider = SimpleProvider::new();
+        let expr = Parser::parse_formula("Missing!A1").unwrap();
+        assert!(matches!(
+            evaluator.evaluate(&expr, &provider),
+            Value::Error(FormulaError::RefError(_))
+        ));
+    }
+
+    #[test]
+    fn test_huge_range_is_rejected_before_materialization() {
+        let evaluator = Evaluator::new();
+        let provider = SimpleProvider::new();
+        let expr = Parser::parse_formula("SUM(A1:XFD1000000)").unwrap();
+        assert!(matches!(
+            evaluator.evaluate(&expr, &provider),
+            Value::Error(FormulaError::RefError(_))
+        ));
     }
 
     #[test]
