@@ -1,15 +1,35 @@
 export class RecoveryAutosave {
   /**
-   * @param {{delay?: number, flush: () => Promise<unknown>, write: () => Promise<unknown>, onError?: (error: unknown) => void}} options
+   * @param {{delay?: number, flush: () => Promise<unknown>, write: () => Promise<unknown>, onError?: (error: unknown) => void, onSuccess?: () => void}} options
    */
-  constructor({ delay = 750, flush, write, onError }) {
+  constructor({ delay = 750, flush, write, onError, onSuccess }) {
     this.delay = delay
     this.flush = flush
     this.write = write
     this.onError = onError ?? (() => {})
+    this.onSuccess = onSuccess ?? (() => {})
     this.timer = null
     this.generation = 0
     this.tail = Promise.resolve()
+  }
+
+  /**
+   * Update the debounce interval without allowing an old timer to write stale
+   * state. A pending autosave is rescheduled and in-flight work remains on the
+   * same serialized promise chain.
+   * @param {number} delay
+   */
+  setDelay(delay) {
+    if (!Number.isFinite(delay) || delay < 0) {
+      throw new RangeError('Autosave delay must be a non-negative finite number')
+    }
+    const hadPendingTimer = this.timer !== null
+    this.delay = delay
+    if (hadPendingTimer) this.schedule()
+  }
+
+  getDelay() {
+    return this.delay
   }
 
   schedule() {
@@ -52,6 +72,7 @@ export class RecoveryAutosave {
       await this.flush()
       if (generation !== this.generation) return
       await this.write()
+      this.onSuccess()
     })
     this.tail = execution.catch((error) => {
       this.onError(error)

@@ -4,7 +4,8 @@
 
 - [User guide](USER_GUIDE.md)
 - [Compatibility and known limitations](COMPATIBILITY.md)
-- [v0.4.0 compatibility matrix](COMPATIBILITY_MATRIX.md)
+- [v0.5.0 compatibility matrix](COMPATIBILITY_MATRIX.md)
+- [XLSX compatibility check](XLSX_COMPATIBILITY_CHECK.md)
 - [Support](../SUPPORT.md)
 - [Security policy](../SECURITY.md)
 
@@ -14,6 +15,7 @@
 - [Architecture](ARCHITECTURE.md)
 - [Quality gate](QUALITY_GATE.md)
 - [Roadmap](ROADMAP.md)
+- [Community contribution plan](COMMUNITY_PLAN.md)
 - [Release process](RELEASING.md)
 - [Changelog](../CHANGELOG.md)
 

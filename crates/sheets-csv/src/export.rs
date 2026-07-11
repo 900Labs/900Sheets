@@ -1,7 +1,7 @@
 use crate::error::CsvError;
 use sheets_core::sheet::Sheet;
 
-const MAX_DENSE_EXPORT_CELLS: usize = 5_000_000;
+pub const MAX_DENSE_EXPORT_CELLS: usize = 5_000_000;
 
 pub fn export_sheet_csv(sheet: &Sheet, delimiter: char) -> Result<String, CsvError> {
     let mut rows: std::collections::BTreeMap<u32, std::collections::BTreeMap<u32, String>> =

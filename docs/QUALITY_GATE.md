@@ -17,7 +17,7 @@ It runs:
 7. `npm run test:unit --prefix apps/desktop`
 8. `npm run test:e2e --prefix apps/desktop`
 
-The v0.4.0 release-prep baseline is 462 Rust tests, 9 frontend unit tests, and 16 Playwright tests. A higher count is expected when new tests are added. The gate must remain free of Rust warnings and Svelte or TypeScript diagnostics.
+The current v0.5.0 tree has 501 verified Rust tests, 21 verified frontend unit tests, and 0 Svelte or TypeScript diagnostics. The browser suite contains 32 Playwright tests and must pass as part of the final release gate before tagging. A higher count is expected when new tests are added. The gate must remain free of Rust warnings and Svelte or TypeScript diagnostics.
 
 The XLSX compatibility test opens and re-saves a generated workbook with LibreOffice. CI installs LibreOffice and fails if `soffice` is unavailable. Local runs report a skip when LibreOffice is not installed.
 
@@ -33,7 +33,7 @@ npm audit --prefix apps/desktop --audit-level=high
 cargo audit
 ```
 
-On macOS, also build and verify the release bundle with `npm run tauri:build --prefix apps/desktop`, then follow the signing and archive checks in [RELEASING.md](RELEASING.md). On Windows or Linux, `cargo build --release -p sheets-desktop` is a valid non-bundle compile check. It does not produce a supported package.
+On macOS, also build and verify the release bundle with `npm run tauri:build --prefix apps/desktop -- --bundles app`, then follow the signing and archive checks in [RELEASING.md](RELEASING.md). On Windows, build the NSIS package with `npm run tauri:build --prefix apps/desktop -- --bundles nsis` and perform the documented install/uninstall smoke. On Linux, `cargo build --release -p sheets-desktop` is a valid non-bundle compile check. It does not produce a supported package.
 
 Confirm that:
 
@@ -43,5 +43,10 @@ Confirm that:
 - Representative XLSX import and export fixtures behave as documented.
 - The built app reports the intended release version.
 - Known distribution limits, including signing and platform coverage, are stated in the release notes.
+- The release workflow validation passes with `./scripts/verify-release-workflow.sh`.
+- The tagged workflow verifies the macOS archive and Windows installer before the publication job starts.
+- The published checksums match both release packages.
+- The macOS and Windows provenance files describe the signing state actually verified by the workflow.
+- A partial signing-secret configuration, tag/version mismatch, lightweight tag, non-main release commit, package smoke failure, macOS notarization failure, ad hoc macOS artifact, or existing GitHub Release stops publication.
 
 Any failed check or unresolved release-blocking review finding stops the release.

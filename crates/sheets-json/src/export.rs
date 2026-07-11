@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use sheets_core::cell::CellType;
 use sheets_core::workbook::Workbook;
 
-const MAX_DENSE_EXPORT_CELLS: usize = 5_000_000;
+pub const MAX_DENSE_EXPORT_CELLS: usize = 5_000_000;
 
 pub fn export_workbook_json(workbook: &Workbook) -> Result<String, JsonError> {
     let mut sheets_arr = Vec::new();

@@ -4,10 +4,20 @@ interface MockOptions {
   recoveries?: Array<{ id: string; modified_millis: number }>
   discardFailures?: number
   discardFailuresAfter?: number
+  populatedCellCount?: number
+  nativeSaveDelayMs?: number
+  nativeOpenDelayMs?: number
+  dialogOpenResult?: string | null
+  sheetDataById?: Record<string, Record<string, string>>
+  sheetDataDelayMsById?: Record<string, number>
+  setActiveSheetDelayMs?: number
+  recoveryWriteDelayMs?: number
+  showFirstRun?: boolean
 }
 
 async function installTauriMock(page: Page, options: MockOptions = {}) {
   await page.addInitScript((options: MockOptions) => {
+    if (!options.showFirstRun) localStorage.setItem('900sheets.first-run.v1', 'complete')
     type CellRecord = { value: string; display: string }
     type TauriWindow = Window & {
       __TAURI_INTERNALS__?: {
@@ -24,6 +34,10 @@ async function installTauriMock(page: Page, options: MockOptions = {}) {
     }
 
     const cells = new Map<string, CellRecord>()
+    const sheetCells = new Map<string, Map<string, CellRecord>>()
+    for (const [sheetId, values] of Object.entries(options.sheetDataById ?? {})) {
+      sheetCells.set(sheetId, new Map(Object.entries(values).map(([key, value]) => [key, { value, display: value }])))
+    }
     const formats = new Map<string, Record<string, unknown>>()
     const comments = new Map<string, { row: number; col: number; text: string; author: string }>()
     const callbacks = new Map<number, (data: unknown) => unknown>()
@@ -31,6 +45,9 @@ async function installTauriMock(page: Page, options: MockOptions = {}) {
       { id: 0, stable_id: 1, name: 'Sheet1' },
       { id: 1, stable_id: 2, name: 'Sheet2' },
     ]
+    for (let index = 0; index < (options.populatedCellCount ?? 0); index++) {
+      cells.set(`${Math.floor(index / 100)}:${index % 100}`, { value: String(index), display: String(index) })
+    }
     const sheets = structuredClone(initialSheets)
     comments.set('0:0:1', { row: 0, col: 1, text: 'existing B1 comment', author: 'tester' })
     let callbackId = 1
@@ -49,8 +66,13 @@ async function installTauriMock(page: Page, options: MockOptions = {}) {
       restored: [] as string[],
       writes: [] as Array<Record<string, unknown>>,
       nativeSaves: [] as Array<Record<string, unknown>>,
+      destroyed: 0,
     }
     ;(window as Window & { __RECOVERY_TEST__?: typeof recoveryEvents }).__RECOVERY_TEST__ = recoveryEvents
+    let closeCallbackId: number | null = null
+    ;(window as Window & { __TRIGGER_CLOSE__?: () => void }).__TRIGGER_CLOSE__ = () => {
+      if (closeCallbackId !== null) callbacks.get(closeCallbackId)?.({ id: 1, event: 'tauri://close-requested', payload: null })
+    }
     const undoStack: Array<{ before: MockSnapshot; after: MockSnapshot }> = []
     const redoStack: Array<{ before: MockSnapshot; after: MockSnapshot }> = []
     const cloneJson = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T
@@ -97,16 +119,37 @@ async function installTauriMock(page: Page, options: MockOptions = {}) {
       invoke: async (cmd: string, args: Record<string, unknown> = {}) => {
         switch (cmd) {
           case 'plugin:dialog|open':
+            return options.dialogOpenResult === undefined ? '/tmp/mock-workbook.900sheets' : options.dialogOpenResult
           case 'plugin:dialog|save':
             return '/tmp/mock-workbook.900sheets'
           case 'plugin:event|listen':
+            if (args.event === 'tauri://close-requested') closeCallbackId = Number(args.handler)
             return 1
           case 'plugin:event|unlisten':
             return null
           case 'list_recovery_snapshots':
             return cloneJson(options.recoveries ?? [])
+          case 'list_native_backups':
+            return []
+          case 'get_export_preflight':
+            return {
+              format: String(args.format ?? '').toUpperCase(),
+              estimated_dense_cells: 0,
+              populated_cells: cells.size,
+              max_row: null,
+              max_col: null,
+              limit: null,
+              blocked: false,
+              message: 'Export is within the configured safety limit.',
+            }
           case 'write_recovery_snapshot':
+            if ((options.recoveryWriteDelayMs ?? 0) > 0) {
+              await new Promise((resolve) => setTimeout(resolve, options.recoveryWriteDelayMs))
+            }
             recoveryEvents.writes.push(cloneJson((args.metadata as Record<string, unknown>) ?? {}))
+            return null
+          case 'plugin:window|destroy':
+            recoveryEvents.destroyed += 1
             return null
           case 'discard_recovery_snapshot':
             recoveryEvents.discardAttempts.push(String(args.recoveryId))
@@ -167,12 +210,18 @@ async function installTauriMock(page: Page, options: MockOptions = {}) {
           }
           case 'new_workbook':
             cells.clear()
+            for (let index = 0; index < (options.populatedCellCount ?? 0); index++) {
+              cells.set(`${Math.floor(index / 100)}:${index % 100}`, { value: String(index), display: String(index) })
+            }
             formats.clear()
             sheets.splice(0, sheets.length, ...cloneJson(initialSheets))
             undoStack.length = 0
             redoStack.length = 0
             return sheets
           case 'set_active_sheet':
+            if ((options.setActiveSheetDelayMs ?? 0) > 0) {
+              await new Promise((resolve) => setTimeout(resolve, options.setActiveSheetDelayMs))
+            }
             return null
           case 'add_generated_sheet': {
             const nextId = sheets.length
@@ -192,11 +241,20 @@ async function installTauriMock(page: Page, options: MockOptions = {}) {
             return cloneJson(sheets)
           }
           case 'export_native_file':
-            savedNative = snapshot((args.metadata as Record<string, unknown>) ?? {})
-            recoveryEvents.nativeSaves.push(cloneJson(savedNative.metadata))
-            return null
+            {
+              const captured = snapshot((args.metadata as Record<string, unknown>) ?? {})
+              if ((options.nativeSaveDelayMs ?? 0) > 0) {
+                await new Promise((resolve) => setTimeout(resolve, options.nativeSaveDelayMs))
+              }
+              savedNative = captured
+              recoveryEvents.nativeSaves.push(cloneJson(savedNative.metadata))
+              return { backup: { id: 'backup-1' } }
+            }
           case 'import_native_file':
             if (!savedNative) throw new Error('No saved native workbook')
+            if ((options.nativeOpenDelayMs ?? 0) > 0) {
+              await new Promise((resolve) => setTimeout(resolve, options.nativeOpenDelayMs))
+            }
             restore(savedNative)
             undoStack.length = 0
             redoStack.length = 0
@@ -204,8 +262,12 @@ async function installTauriMock(page: Page, options: MockOptions = {}) {
               sheets: cloneJson(sheets),
               metadata: cloneJson(savedNative.metadata),
             }
-          case 'get_sheet_data':
-            return Array.from(cells.entries()).map(([key, cell]) => {
+          case 'get_sheet_data': {
+            const sheetId = String(args.sheetId ?? 0)
+            const delay = options.sheetDataDelayMsById?.[sheetId] ?? 0
+            if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay))
+            const source = sheetCells.get(sheetId) ?? cells
+            return Array.from(source.entries()).map(([key, cell]) => {
               const [row, col] = key.split(':').map(Number)
               return {
                 row,
@@ -216,9 +278,11 @@ async function installTauriMock(page: Page, options: MockOptions = {}) {
                 format: formats.get(key) ?? null,
               }
             })
+          }
           case 'set_cell': {
             const value = String(args.value ?? '')
-            cells.set(keyFor(args.row, args.col), { value, display: value })
+            const source = sheetCells.get(String(args.sheetId ?? 0)) ?? cells
+            source.set(keyFor(args.row, args.col), { value, display: value })
             return null
           }
           case 'batch_set_cells': {
@@ -321,6 +385,67 @@ test('typing into a selected cell preserves the first character', async ({ page 
   await expect(a1).toHaveAccessibleName('A1, 12, not selected')
 })
 
+test('first run offers local templates and records completion without an account', async ({ page }) => {
+  await installTauriMock(page, { showFirstRun: true })
+  await page.goto('/')
+
+  await expect(page.getByRole('heading', { name: 'Make a useful workbook' })).toBeVisible()
+  await page.getByRole('button', { name: /Household Planning/ }).click()
+  await expect(page.getByRole('heading', { name: 'Make a useful workbook' })).toHaveCount(0)
+  await expect(cell(page, 'A1')).toHaveText('Household Plan')
+  await expect.poll(() => page.evaluate(() => localStorage.getItem('900sheets.first-run.v1'))).toBe('complete')
+})
+
+test('an edit committed during a slow save remains dirty and recoverable', async ({ page }) => {
+  await installTauriMock(page, { nativeSaveDelayMs: 1_500 })
+  await page.goto('/')
+  await expect(cell(page, 'A1')).toBeVisible()
+  await enterCellText(page, 'A1', 'before save')
+
+  await page.keyboard.press('Control+S')
+  await page.waitForTimeout(50)
+  await enterCellText(page, 'B1', 'newer edit')
+
+  await expect(page.locator('.toolbar-status')).toContainText('newer edits pending')
+  await expect(page.locator('.app-title')).toContainText('•')
+  await expect.poll(() => page.evaluate(() => {
+    const writes = (window as Window & { __RECOVERY_TEST__?: { writes: unknown[] } })
+      .__RECOVERY_TEST__?.writes ?? []
+    return writes.length
+  }), { timeout: 3_000 }).toBeGreaterThan(0)
+  await expect(cell(page, 'B1')).toHaveText('newer edit')
+})
+
+test('a slow save cannot take ownership of a replacement workbook session', async ({ page }) => {
+  await installTauriMock(page, { nativeSaveDelayMs: 1_500 })
+  await page.goto('/')
+  await expect(cell(page, 'A1')).toBeVisible()
+  await enterCellText(page, 'A1', 'old workbook')
+  const cleanupCountBefore = await page.evaluate(() => {
+    const events = (window as Window & { __RECOVERY_TEST__?: { discardAttempts: string[] } })
+      .__RECOVERY_TEST__
+    return events?.discardAttempts.length ?? 0
+  })
+
+  await page.keyboard.press('Control+S')
+  await page.waitForTimeout(50)
+  await page.locator('.menu-bar button').filter({ hasText: /^File$/ }).click()
+  const confirmation = page.waitForEvent('dialog')
+  const newWorkbook = page.getByRole('button', { name: 'New Workbook' }).click()
+  const dialog = await confirmation
+  await dialog.accept()
+  await newWorkbook
+
+  await expect(cell(page, 'A1')).toHaveText('')
+  await expect(page.locator('.toolbar-status')).toContainText('previous workbook finished saving')
+  await expect(page.locator('.app-title')).not.toContainText('•')
+  await expect.poll(() => page.evaluate(() => {
+    const events = (window as Window & { __RECOVERY_TEST__?: { discardAttempts: string[] } })
+      .__RECOVERY_TEST__
+    return events?.discardAttempts.length ?? 0
+  })).toBe(cleanupCountBefore + 1)
+})
+
 test('new sheet uses the backend generated name path', async ({ page }) => {
   await openWorkbook(page)
 
@@ -350,7 +475,7 @@ test('delete and backspace clear the selected cell visibly', async ({ page }) =>
 test('formula bar typing and enter do not leak into inline cell editing', async ({ page }) => {
   await openWorkbook(page)
 
-  const formulaInput = page.locator('.formula-bar input')
+  const formulaInput = page.getByRole('textbox', { name: 'Formula bar' })
   await formulaInput.click()
   await formulaInput.press('h')
   await formulaInput.press('i')
@@ -361,6 +486,263 @@ test('formula bar typing and enter do not leak into inline cell editing', async 
   await formulaInput.press('Enter')
   await expect(cell(page, 'A1')).toHaveText('hi')
   await expect(page.locator('input.cell-input')).toHaveCount(0)
+})
+
+test('formula bar drafts commit before navigation and native save', async ({ page }) => {
+  await openWorkbook(page)
+
+  const formulaInput = page.getByRole('textbox', { name: 'Formula bar' })
+  await formulaInput.fill('draft for A1')
+  await cell(page, 'B1').click()
+  await expect(cell(page, 'A1')).toHaveText('draft for A1')
+
+  await formulaInput.fill('saved from B1')
+  await page.keyboard.press('Control+S')
+  await expect(cell(page, 'B1')).toHaveText('saved from B1')
+  await expect(page.locator('.toolbar-status')).toContainText('Saved mock-workbook.900sheets')
+})
+
+test('sheet switching never writes a stale formula bar value into the destination', async ({ page }) => {
+  await installTauriMock(page, {
+    sheetDataById: {
+      0: { '0:0': 'one' },
+      1: { '0:0': 'two' },
+    },
+  })
+  await page.goto('/')
+  await expect(cell(page, 'A1')).toHaveText('one')
+
+  await page.getByRole('button', { name: 'Sheet2', exact: true }).click()
+  await expect(cell(page, 'A1')).toHaveText('two')
+  await page.getByRole('button', { name: 'Sheet1', exact: true }).click()
+  await expect(cell(page, 'A1')).toHaveText('one')
+  await page.getByRole('button', { name: 'Sheet2', exact: true }).click()
+  await expect(cell(page, 'A1')).toHaveText('two')
+})
+
+test('canceling Open after a delayed sheet switch keeps tab and cells paired', async ({ page }) => {
+  await installTauriMock(page, {
+    dialogOpenResult: null,
+    sheetDataById: {
+      0: { '0:0': 'one' },
+      1: { '0:0': 'two' },
+    },
+    sheetDataDelayMsById: { 1: 350 },
+  })
+  await page.goto('/')
+  await expect(cell(page, 'A1')).toHaveText('one')
+
+  await page.getByRole('button', { name: 'Sheet2', exact: true }).click()
+  await page.locator('.menu-bar button').filter({ hasText: /^File$/ }).click()
+  await page.getByRole('button', { name: 'Open Workbook...' }).click()
+
+  await expect(page.getByRole('button', { name: 'Sheet2', exact: true })).toHaveClass(/active/)
+  await expect(cell(page, 'A1')).toHaveText('two')
+  await expect(page.getByRole('status', { name: 'Workbook replacement in progress' })).toHaveCount(0)
+})
+
+test('slow replacement blocks edits until the restored workbook is coherent', async ({ page }) => {
+  await installTauriMock(page, { nativeOpenDelayMs: 700 })
+  await page.goto('/')
+  await enterCellText(page, 'A1', 'saved baseline')
+  await page.keyboard.press('Control+S')
+  await expect(page.locator('.toolbar-status')).toContainText('Saved mock-workbook.900sheets')
+  await enterCellText(page, 'A1', 'discard this')
+
+  await page.locator('.menu-bar button').filter({ hasText: /^File$/ }).click()
+  const confirmation = page.waitForEvent('dialog')
+  const opening = page.getByRole('button', { name: 'Open Workbook...' }).click()
+  const dialog = await confirmation
+  await dialog.accept()
+  await opening
+  await expect(page.getByRole('status', { name: 'Workbook replacement in progress' })).toBeVisible()
+  await page.keyboard.press('x')
+
+  await expect(page.getByRole('status', { name: 'Workbook replacement in progress' })).toHaveCount(0)
+  await expect(cell(page, 'A1')).toHaveText('saved baseline')
+  await expect(page.locator('input.cell-input')).toHaveCount(0)
+})
+
+test('invalid inline edits block navigation and native save', async ({ page }) => {
+  await openWorkbook(page)
+  await page.locator('.menu-bar button').filter({ hasText: /^Data$/ }).click()
+  await page.getByRole('button', { name: 'Data Validation...' }).click()
+  await page.getByLabel('Rule type').selectOption('List')
+  await page.getByLabel('Allowed values').fill('Allowed')
+  await page.getByRole('button', { name: 'Save Rule' }).click()
+  await page.getByRole('button', { name: 'Close' }).click()
+
+  await cell(page, 'A1').dblclick()
+  await page.locator('input.cell-input').fill('Blocked')
+  await page.locator('input.cell-input').press('Enter')
+  await expect(page.locator('input.cell-input')).toHaveValue('Blocked')
+  await expect(page.locator('.toolbar-status')).toContainText('Validation failed')
+
+  await cell(page, 'B1').click()
+  await expect(page.locator('input.cell-input')).toHaveValue('Blocked')
+  await page.keyboard.press('Control+S')
+  await expect.poll(() => page.evaluate(() =>
+    (window as Window & { __RECOVERY_TEST__?: { nativeSaves: unknown[] } }).__RECOVERY_TEST__?.nativeSaves.length ?? 0
+  )).toBe(0)
+})
+
+test('close barrier blocks late edits while the final recovery snapshot is written', async ({ page }) => {
+  await installTauriMock(page, { recoveryWriteDelayMs: 600 })
+  await page.goto('/')
+  await enterCellText(page, 'A1', 'preserve me')
+
+  await page.evaluate(() => (window as Window & { __TRIGGER_CLOSE__?: () => void }).__TRIGGER_CLOSE__?.())
+  await expect(page.getByRole('status', { name: 'Workbook close in progress' })).toBeVisible()
+  await page.keyboard.press('x')
+  await expect(page.locator('input.cell-input')).toHaveCount(0)
+  await expect.poll(() => page.evaluate(() =>
+    (window as Window & { __RECOVERY_TEST__?: { destroyed: number } }).__RECOVERY_TEST__?.destroyed ?? 0
+  )).toBe(1)
+})
+
+test('Go To reaches the maximum grid address with a bounded DOM', async ({ page }) => {
+  await openWorkbook(page)
+
+  const grid = page.getByRole('grid', { name: 'Spreadsheet grid' })
+  await expect(grid).toHaveAttribute('aria-rowcount', '1000000')
+  await expect(grid).toHaveAttribute('aria-colcount', '16384')
+
+  for (let step = 0; step < 5; step++) {
+    await page.locator('.menu-bar button').filter({ hasText: /^View$/ }).click()
+    await page.getByRole('button', { name: 'Zoom In' }).click()
+  }
+  await expect(page.locator('.status-bar')).toContainText('150%')
+
+  await page.keyboard.press('Control+G')
+  const goTo = page.getByRole('textbox', { name: 'Go to cell or range' })
+  await expect(goTo).toBeFocused()
+  await goTo.fill('XFD1000000')
+  await goTo.press('Enter')
+
+  await expect(grid).toHaveAttribute('aria-activedescendant', 'grid-cell-999999-16383')
+  await expect(grid).toBeFocused()
+  const lastCell = page.locator('#grid-cell-999999-16383')
+  await expect(lastCell).toBeVisible()
+  await expect(lastCell).toHaveAttribute('aria-rowindex', '1000000')
+  await expect(lastCell).toHaveAttribute('aria-colindex', '16384')
+  expect(await page.locator('button.cell').count()).toBeLessThan(2500)
+  await page.keyboard.press('F2')
+  await expect(page.locator('input.cell-input')).toHaveAttribute('aria-label', 'Cell XFD1000000')
+  await page.keyboard.press('Escape')
+})
+
+test('Go To accepts ranges and rejects addresses outside the workbook bounds', async ({ page }) => {
+  await openWorkbook(page)
+  const goTo = page.getByRole('textbox', { name: 'Go to cell or range' })
+
+  for (const invalid of ['XFE1', 'A1000001', 'A0']) {
+    await goTo.fill(invalid)
+    await goTo.press('Enter')
+    await expect(page.locator('.toolbar-status')).toContainText('Go To failed')
+    await expect(goTo).toBeFocused()
+  }
+
+  await goTo.fill('D20:B10')
+  await goTo.press('Enter')
+  await expect(page.locator('.status-bar')).toContainText('B10:D20')
+  await expect(page.getByRole('grid')).toHaveAttribute('aria-activedescendant', 'grid-cell-9-1')
+})
+
+test('grid uses one keyboard focus target across virtualized navigation and zoom', async ({ page }) => {
+  await openWorkbook(page)
+  const grid = page.getByRole('grid')
+  await grid.focus()
+
+  await page.keyboard.press('ArrowRight')
+  await page.keyboard.press('ArrowDown')
+  await expect(grid).toBeFocused()
+  await expect(grid).toHaveAttribute('aria-activedescendant', 'grid-cell-1-1')
+  await expect(page.locator('button.cell[tabindex="0"]')).toHaveCount(0)
+
+  await page.locator('.menu-bar button').filter({ hasText: /^View$/ }).click()
+  await page.getByRole('button', { name: 'Zoom In' }).click()
+  await page.locator('.menu-bar button').filter({ hasText: /^View$/ }).click()
+  await page.getByRole('button', { name: 'Zoom In' }).click()
+  await grid.focus()
+  await page.keyboard.press('PageDown')
+  await expect(grid).toBeFocused()
+  await expect(page.locator('.cell.active')).toBeVisible()
+
+  await page.keyboard.press('Shift+Tab')
+  await expect(page.getByRole('textbox', { name: 'Formula bar' })).toBeFocused()
+
+  await grid.focus()
+  await page.keyboard.press('Tab')
+  await expect(grid).not.toBeFocused()
+})
+
+test('single-cell keyboard navigation stays responsive with 50,000 populated cells', async ({ page }) => {
+  await installTauriMock(page, { populatedCellCount: 50_000 })
+  await page.goto('/')
+  const grid = page.getByRole('grid')
+  await expect(cell(page, 'A1')).toHaveText('0')
+  await grid.focus()
+
+  const started = Date.now()
+  for (let step = 0; step < 50; step++) await page.keyboard.press('ArrowDown')
+  expect(Date.now() - started).toBeLessThan(3_000)
+  await expect(grid).toHaveAttribute('aria-activedescendant', 'grid-cell-50-0')
+  expect(await page.locator('button.cell').count()).toBeLessThan(2500)
+})
+
+test('locale setting persists verified grid accessibility labels', async ({ page }) => {
+  await openWorkbook(page)
+
+  await page.locator('.menu-bar button').filter({ hasText: /^Tools$/ }).click()
+  await page.getByRole('button', { name: 'Locale Settings...' }).click()
+  const dialog = page.getByRole('dialog', { name: 'Locale Settings' })
+  await expect(dialog).toBeVisible()
+  await page.getByLabel('Interface language').selectOption('sv')
+  await expect(page.getByRole('grid', { name: 'Kalkylblad' })).toBeVisible()
+  await expect(cell(page, 'A1')).toHaveAccessibleName('A1, tom, markerad')
+  await page.keyboard.press('Escape')
+  await expect(dialog).toHaveCount(0)
+
+  await page.reload()
+  await expect(page.getByRole('grid', { name: 'Kalkylblad' })).toBeVisible()
+})
+
+test('dense operations fail quickly for selections above the shared safety budget', async ({ page }) => {
+  await openWorkbook(page)
+  const goTo = page.getByRole('textbox', { name: 'Go to cell or range' })
+  await goTo.fill('A1:XFD1000000')
+  await goTo.press('Enter')
+
+  await page.keyboard.press('Control+C')
+  await expect(page.locator('.toolbar-status')).toContainText('Copy selection unavailable')
+  await expect(page.locator('.toolbar-status')).toContainText('200,000 cells')
+
+  await page.keyboard.press('Control+B')
+  await expect(page.locator('.toolbar-status')).toContainText('Format selection unavailable')
+
+  await page.locator('.menu-bar button').filter({ hasText: /^Data$/ }).click()
+  await page.getByRole('button', { name: 'Data Validation...' }).click()
+  await page.getByRole('button', { name: /^Validate A1:XFD1000000$/ }).click()
+  await expect(page.locator('.toolbar-status')).toContainText('Validate range unavailable')
+})
+
+test('freeze panes leaves a scrollable area in the current viewport', async ({ page }) => {
+  await openWorkbook(page)
+  const goTo = page.getByRole('textbox', { name: 'Go to cell or range' })
+
+  await goTo.fill('C3')
+  await goTo.press('Enter')
+  await page.locator('.menu-bar button').filter({ hasText: /^View$/ }).click()
+  await page.getByRole('button', { name: 'Freeze Panes at Selection' }).click()
+  await expect(page.locator('.status-bar')).toContainText('Frozen 2R/2C')
+  expect(await page.locator('button.cell').count()).toBeLessThan(2500)
+
+  await goTo.fill('U21')
+  await goTo.press('Enter')
+  await page.locator('.menu-bar button').filter({ hasText: /^View$/ }).click()
+  await page.getByRole('button', { name: 'Freeze Panes at Selection' }).click()
+  await expect(page.locator('.toolbar-status')).toContainText('Freeze panes failed')
+  await expect(page.locator('.status-bar')).toContainText('Frozen 2R/2C')
 })
 
 test('fx menu inserts functions with the cursor ready for arguments', async ({ page }) => {
@@ -431,7 +813,7 @@ test('named range metadata stays isolated by stable sheet identity', async ({ pa
 
   await page.locator('.menu-bar button').filter({ hasText: /^Data$/ }).click()
   await page.getByRole('button', { name: 'Named Ranges...' }).click()
-  const nameInput = page.getByLabel('Name')
+  const nameInput = page.getByLabel('Name', { exact: true })
   await nameInput.fill('Revenue')
   await page.getByRole('button', { name: 'Add Named Range' }).click()
   await expect(page.getByText('Revenue', { exact: true })).toBeVisible()
@@ -613,8 +995,9 @@ test('replacement cleanup failure retains identity and Save retries cleanup', as
     (window as Window & { __RECOVERY_TEST__?: { discardAttempts: string[] } })
       .__RECOVERY_TEST__?.discardAttempts ?? []
   )
-  expect(attempts).toHaveLength(3)
+  expect(attempts).toHaveLength(4)
   expect(attempts[1]).toBe(attempts[2])
+  expect(attempts[3]).not.toBe(attempts[2])
 })
 
 test('save cleanup failure is visible and retryable under the same recovery identity', async ({ page }) => {
@@ -635,8 +1018,9 @@ test('save cleanup failure is visible and retryable under the same recovery iden
     (window as Window & { __RECOVERY_TEST__?: { discardAttempts: string[] } })
       .__RECOVERY_TEST__?.discardAttempts ?? []
   )
-  expect(attempts).toHaveLength(3)
+  expect(attempts).toHaveLength(4)
   expect(attempts[1]).toBe(attempts[2])
+  expect(attempts[3]).not.toBe(attempts[2])
 })
 
 test('delete active sheet undo redo save and reopen does not resurrect stale metadata', async ({ page }) => {
@@ -646,7 +1030,7 @@ test('delete active sheet undo redo save and reopen does not resurrect stale met
 
   await page.locator('.menu-bar button').filter({ hasText: /^Data$/ }).click()
   await page.getByRole('button', { name: 'Named Ranges...' }).click()
-  await page.getByLabel('Name').fill('TransientRange')
+  await page.getByLabel('Name', { exact: true }).fill('TransientRange')
   await page.getByRole('button', { name: 'Add Named Range' }).click()
   await expect(page.getByText('TransientRange', { exact: true })).toBeVisible()
   await page.getByRole('button', { name: 'Close' }).click()

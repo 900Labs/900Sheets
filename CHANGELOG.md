@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.5.0
+
+### Added
+
+- Added row and column virtualization across the full engine bounds of 1,000,000 rows and 16,384 columns.
+- Added bounded **Go To** navigation for a cell or range from `A1` through `XFD1000000`.
+- Added export preflight for XLSX, CSV, JSON, and PDF, including scale information, large dense-export warnings, and existing safety-limit enforcement.
+- Added a **Recovery and Backups** panel that can list, inspect, restore, and delete retained autosave snapshots after startup.
+- Added configurable recovery timing while preserving serialized flush and write ordering.
+- Added private rotating native backups. After a successful `.900sheets` save, the app attempts to keep up to five backups for that document and reports maintenance failures separately. Inspection, restore, and deletion controls remain separate from recovery.
+- Added school budget, small-business accounts, community project, and household planning starter templates using invented data.
+- Added a local first-run guide and persisted English, Swedish, and Spanish labels for grid navigation and core accessibility text.
+- Added XLSX import and export for the supported validation and conditional-formatting subset, including differential formatting.
+- Added sparse and dense workbook benchmark generation and contributor-sized community planning.
+- Added a Windows NSIS artifact job and credential-gated signing paths for macOS Developer ID and Windows Authenticode.
+- Added workflow checks that verify artifact hashes and signing provenance, refuse to publish an ad hoc macOS build, and require accepted notarization plus stapling before GitHub Release publication.
+
+### Changed
+
+- Native saves use atomic replacement and report backup-maintenance warnings separately from primary save success.
+- The desktop grid uses one keyboard focus target with screen-reader row, column, selection, and active-cell semantics.
+- Structural reference rewriting covers the supported complex A1 forms exercised by the XLSX regression suite.
+- Compatibility documentation separates workflow capability from verified facts about any particular tagged artifact.
+- Package, workspace, desktop bundle, and documentation versions are aligned at 0.5.0.
+
+### Known limitations
+
+- Developer ID signing, notarization, Authenticode signing, hosted artifact publication, and clean-machine installation are release-time results, not properties guaranteed by the source tree.
+- Microsoft Excel desktop is not an automated test dependency. Deterministic OOXML tests and the LibreOffice round trip cover the documented XLSX subset.
+- Native Excel tables, slicers, charts, pivot caches, macros, external links, images, shapes, and embedded objects remain unsupported.
+- The interface translations cover grid navigation and core accessibility labels, not the complete application.
+- Frozen panes are limited to the first 20 rows and first 20 columns even though the virtualized grid reaches row 1,000,000 and column `XFD`.
+- Recovery and rotating native backups are local safeguards, not cloud sync or a complete external backup strategy.
+- Linux packaging is not configured for v0.5.0.
+
 ## v0.4.0
 
 ### Added

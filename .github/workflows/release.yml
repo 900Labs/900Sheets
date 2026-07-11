@@ -5,38 +5,403 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: Publish the verified artifacts to an existing matching tag
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  macos-app:
-    name: Build macOS app bundle
-    runs-on: macos-latest
+  release-metadata:
+    name: Validate release metadata
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.metadata.outputs.tag }}
+      version: ${{ steps.metadata.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.92.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Validate source and tag version
+        id: metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./apps/desktop/src-tauri/tauri.conf.json').version")"
+          tag="v${version}"
+          if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" != "${tag}" ]]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match application version ${version}" >&2
+            exit 1
+          fi
+          if [[ "${GITHUB_REF_TYPE}" == "tag" || "${{ inputs.publish_release }}" == "true" ]]; then
+            git fetch --force origin "refs/tags/${tag}:refs/tags/${tag}"
+            test "$(git cat-file -t "refs/tags/${tag}")" = "tag" || {
+              echo "Release tag ${tag} must be annotated" >&2
+              exit 1
+            }
+            test "$(git rev-list -n 1 "${tag}")" = "${GITHUB_SHA}" || {
+              echo "Publication requires the selected commit to be the ${tag} commit" >&2
+              exit 1
+            }
+            git fetch origin main
+            git merge-base --is-ancestor "${GITHUB_SHA}" "origin/main" || {
+              echo "Release commit ${GITHUB_SHA} is not reachable from origin/main" >&2
+              exit 1
+            }
+            parent_count="$(git rev-list --parents -n 1 "${GITHUB_SHA}" | awk '{ print NF - 1 }')"
+            test "${parent_count}" -ge 2 || {
+              echo "Release commit ${GITHUB_SHA} is not a reviewed merge commit" >&2
+              exit 1
+            }
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+      - name: Public release preflight
+        run: ./scripts/verify-public-release.sh
+
+  source-gates:
+    name: Run complete source quality gate
+    needs: release-metadata
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.92.0
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - name: Install desktop and compatibility dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev librsvg2-dev libreoffice-calc
+          npm ci --prefix apps/desktop
+          npx --prefix apps/desktop playwright install --with-deps chromium
+      - name: Complete local quality gate
+        run: ./scripts/verify-local.sh
+      - name: Dependency audits
+        run: |
+          npm audit --prefix apps/desktop --audit-level=high
+          cargo install cargo-audit --locked
+          cargo audit
+
+  macos-app:
+    name: Build and verify macOS app
+    needs: [release-metadata, source-gates]
+    runs-on: macos-latest
+    env:
+      RELEASE_TAG: ${{ needs.release-metadata.outputs.tag }}
+      RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.92.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Select macOS signing mode
+        id: signing
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          present=0
+          for value in \
+            "${APPLE_CERTIFICATE}" \
+            "${APPLE_CERTIFICATE_PASSWORD}" \
+            "${APPLE_SIGNING_IDENTITY}" \
+            "${APPLE_ID}" \
+            "${APPLE_PASSWORD}" \
+            "${APPLE_TEAM_ID}"; do
+            [[ -n "${value}" ]] && present=$((present + 1))
+          done
+          if [[ "${present}" -eq 0 ]]; then
+            echo "mode=ad-hoc" >> "${GITHUB_OUTPUT}"
+            echo "Apple release credentials are absent. The artifact will be explicitly marked ad hoc signed and not notarized."
+          elif [[ "${present}" -eq 6 ]]; then
+            echo "mode=developer-id" >> "${GITHUB_OUTPUT}"
+          else
+            echo "Apple release credentials are incomplete. Configure all documented secrets or remove all of them for the honest ad hoc fallback." >&2
+            exit 1
+          fi
+      - name: Import Developer ID certificate
+        if: steps.signing.outputs.mode == 'developer-id'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          certificate_path="${RUNNER_TEMP}/developer-id.p12"
+          keychain_path="${RUNNER_TEMP}/900sheets-signing.keychain-db"
+          echo "${APPLE_CERTIFICATE}" | base64 --decode > "${certificate_path}"
+          security create-keychain -p "${RUNNER_TEMP}" "${keychain_path}"
+          security set-keychain-settings -lut 21600 "${keychain_path}"
+          security unlock-keychain -p "${RUNNER_TEMP}" "${keychain_path}"
+          security import "${certificate_path}" -P "${APPLE_CERTIFICATE_PASSWORD}" -A -t cert -f pkcs12 -k "${keychain_path}"
+          security list-keychain -d user -s "${keychain_path}"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "${RUNNER_TEMP}" "${keychain_path}"
+          security find-identity -v -p codesigning "${keychain_path}" | grep -F "${APPLE_SIGNING_IDENTITY}"
       - name: Install frontend dependencies
         run: npm ci --prefix apps/desktop
       - name: Build Tauri app
-        run: npm run tauri:build --prefix apps/desktop
-      - name: Ad hoc sign and verify complete app bundle
+        run: npm run tauri:build --prefix apps/desktop -- --bundles app
+      - name: Sign complete app bundle
+        shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: |
-          codesign --force --deep --sign - target/release/bundle/macos/900Sheets.app
-          codesign --verify --deep --strict --verbose=2 target/release/bundle/macos/900Sheets.app
-      - name: Archive app bundle with permissions
-        run: ditto -c -k --sequesterRsrc --keepParent target/release/bundle/macos/900Sheets.app "target/release/bundle/macos/900Sheets-${GITHUB_REF_NAME}-macos.zip"
-      - name: Verify extracted app signature and executable permission
+          set -euo pipefail
+          app="target/release/bundle/macos/900Sheets.app"
+          if [[ "${{ steps.signing.outputs.mode }}" == "developer-id" ]]; then
+            codesign --force --deep --options runtime --timestamp --sign "${APPLE_SIGNING_IDENTITY}" "${app}"
+          else
+            codesign --force --deep --sign - "${app}"
+          fi
+          codesign --verify --deep --strict --verbose=2 "${app}"
+      - name: Notarize and staple Developer ID build
+        if: steps.signing.outputs.mode == 'developer-id'
+        shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          mkdir -p "$RUNNER_TEMP/900sheets-archive-check"
-          ditto -x -k "target/release/bundle/macos/900Sheets-${GITHUB_REF_NAME}-macos.zip" "$RUNNER_TEMP/900sheets-archive-check"
-          test -x "$RUNNER_TEMP/900sheets-archive-check/900Sheets.app/Contents/MacOS/sheets-desktop"
-          codesign --verify --deep --strict --verbose=2 "$RUNNER_TEMP/900sheets-archive-check/900Sheets.app"
-      - name: Upload ad hoc signed app archive
+          set -euo pipefail
+          app="target/release/bundle/macos/900Sheets.app"
+          submission="${RUNNER_TEMP}/900Sheets-notarization.zip"
+          ditto -c -k --sequesterRsrc --keepParent "${app}" "${submission}"
+          result="$(xcrun notarytool submit "${submission}" \
+            --apple-id "${APPLE_ID}" \
+            --password "${APPLE_PASSWORD}" \
+            --team-id "${APPLE_TEAM_ID}" \
+            --wait \
+            --output-format json)"
+          printf '%s\n' "${result}"
+          printf '%s' "${result}" | node -e '
+            const result = JSON.parse(require("fs").readFileSync(0, "utf8"));
+            if (result.status !== "Accepted") {
+              console.error(`Notarization status was ${result.status || "missing"}`);
+              process.exit(1);
+            }
+          '
+          xcrun stapler staple "${app}"
+          xcrun stapler validate "${app}"
+          spctl --assess --type execute --verbose=2 "${app}"
+      - name: Archive and verify macOS artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="target/release/bundle/macos/900Sheets.app"
+          archive="target/release/bundle/macos/900Sheets-${RELEASE_TAG}-macos.zip"
+          check_dir="${RUNNER_TEMP}/900sheets-archive-check"
+          actual_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "${app}/Contents/Info.plist")"
+          test "${actual_version}" = "${RELEASE_VERSION}"
+          ditto -c -k --sequesterRsrc --keepParent "${app}" "${archive}"
+          mkdir -p "${check_dir}"
+          ditto -x -k "${archive}" "${check_dir}"
+          extracted="${check_dir}/900Sheets.app"
+          test -x "${extracted}/Contents/MacOS/sheets-desktop"
+          codesign --verify --deep --strict --verbose=2 "${extracted}"
+          if [[ "${{ steps.signing.outputs.mode }}" == "developer-id" ]]; then
+            xcrun stapler validate "${extracted}"
+            spctl --assess --type execute --verbose=2 "${extracted}"
+            printf 'signing=developer-id\nnotarization=stapled\n' > "target/release/bundle/macos/900Sheets-${RELEASE_TAG}-macos.provenance.txt"
+          else
+            printf 'signing=ad-hoc\nnotarization=not-notarized\n' > "target/release/bundle/macos/900Sheets-${RELEASE_TAG}-macos.provenance.txt"
+          fi
+          archive_dir="$(dirname "${archive}")"
+          archive_name="$(basename "${archive}")"
+          (
+            cd "${archive_dir}"
+            shasum -a 256 "${archive_name}" > "900Sheets-${RELEASE_TAG}-macos.sha256"
+          )
+      - name: Upload verified macOS archive
         uses: actions/upload-artifact@v4
         with:
-          name: 900Sheets-${{ github.ref_name }}-macos
-          path: target/release/bundle/macos/900Sheets-${{ github.ref_name }}-macos.zip
+          name: 900Sheets-${{ needs.release-metadata.outputs.tag }}-macos
+          if-no-files-found: error
+          path: |
+            target/release/bundle/macos/900Sheets-${{ needs.release-metadata.outputs.tag }}-macos.zip
+            target/release/bundle/macos/900Sheets-${{ needs.release-metadata.outputs.tag }}-macos.sha256
+            target/release/bundle/macos/900Sheets-${{ needs.release-metadata.outputs.tag }}-macos.provenance.txt
+
+  windows-installer:
+    name: Build and verify Windows installer
+    needs: [release-metadata, source-gates]
+    runs-on: windows-latest
+    env:
+      RELEASE_TAG: ${{ needs.release-metadata.outputs.tag }}
+      RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.92.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Select Windows signing mode
+        id: signing
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $present = 0
+          if ($env:WINDOWS_CERTIFICATE) { $present++ }
+          if ($env:WINDOWS_CERTIFICATE_PASSWORD) { $present++ }
+          if ($present -eq 0) {
+            "mode=unsigned" >> $env:GITHUB_OUTPUT
+            Write-Host "Windows signing credentials are absent. The installer will be explicitly marked unsigned."
+          } elseif ($present -eq 2) {
+            "mode=authenticode" >> $env:GITHUB_OUTPUT
+          } else {
+            throw "Windows signing credentials are incomplete. Configure both documented secrets or remove both for the honest unsigned fallback."
+          }
+      - name: Install frontend dependencies
+        run: npm ci --prefix apps/desktop
+      - name: Build NSIS installer
+        run: npm run tauri:build --prefix apps/desktop -- --bundles nsis
+      - name: Normalize and optionally sign installer
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installers = @(Get-ChildItem "target/release/bundle/nsis/*.exe")
+          if ($installers.Count -ne 1) {
+            throw "Expected exactly one NSIS installer, found $($installers.Count)"
+          }
+          $output = "target/release/bundle/nsis/900Sheets-$env:RELEASE_TAG-windows-x64-setup.exe"
+          Move-Item $installers[0].FullName $output
+          if ("${{ steps.signing.outputs.mode }}" -eq "authenticode") {
+            $certificate = Join-Path $env:RUNNER_TEMP "900sheets-signing.pfx"
+            [IO.File]::WriteAllBytes($certificate, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+            $signTool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+              Sort-Object FullName -Descending |
+              Select-Object -First 1
+            if (-not $signTool) { throw "signtool.exe was not found" }
+            & $signTool.FullName sign /f $certificate /p $env:WINDOWS_CERTIFICATE_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $output
+            & $signTool.FullName verify /pa /v $output
+            "signing=authenticode`n" | Set-Content "target/release/bundle/nsis/900Sheets-$env:RELEASE_TAG-windows.provenance.txt" -NoNewline
+          } else {
+            $signature = Get-AuthenticodeSignature $output
+            if ($signature.Status -ne "NotSigned") {
+              throw "Expected an unsigned fallback installer, got signature status $($signature.Status)"
+            }
+            "signing=unsigned`n" | Set-Content "target/release/bundle/nsis/900Sheets-$env:RELEASE_TAG-windows.provenance.txt" -NoNewline
+          }
+      - name: Smoke install and uninstall package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installer = Resolve-Path "target/release/bundle/nsis/900Sheets-$env:RELEASE_TAG-windows-x64-setup.exe"
+          $installDir = Join-Path $env:RUNNER_TEMP "900Sheets-smoke"
+          $process = Start-Process $installer -ArgumentList "/S", "/D=$installDir" -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Installer exited with $($process.ExitCode)" }
+          $applications = @(Get-ChildItem $installDir -Filter "*.exe" | Where-Object { $_.Name -ne "uninstall.exe" })
+          if ($applications.Count -ne 1) { throw "Expected one installed application executable, found $($applications.Count)" }
+          $app = $applications[0].FullName
+          $installedVersion = (Get-Item $app).VersionInfo.ProductVersion
+          if (-not $installedVersion.StartsWith($env:RELEASE_VERSION)) {
+            throw "Installed version $installedVersion does not match $env:RELEASE_VERSION"
+          }
+          $uninstaller = Join-Path $installDir "uninstall.exe"
+          if (-not (Test-Path $uninstaller -PathType Leaf)) { throw "Uninstaller was not found" }
+          $process = Start-Process $uninstaller -ArgumentList "/S" -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Uninstaller exited with $($process.ExitCode)" }
+          foreach ($attempt in 1..30) {
+            if (-not (Test-Path $app)) { break }
+            Start-Sleep -Seconds 1
+          }
+          if (Test-Path $app) { throw "Application remains after uninstall" }
+      - name: Record Windows installer checksum
+        shell: pwsh
+        run: |
+          $path = "target/release/bundle/nsis/900Sheets-$env:RELEASE_TAG-windows-x64-setup.exe"
+          $hash = (Get-FileHash $path -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $(Split-Path $path -Leaf)" | Set-Content "target/release/bundle/nsis/900Sheets-$env:RELEASE_TAG-windows.sha256"
+      - name: Upload verified Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: 900Sheets-${{ needs.release-metadata.outputs.tag }}-windows
+          if-no-files-found: error
+          path: |
+            target/release/bundle/nsis/900Sheets-${{ needs.release-metadata.outputs.tag }}-windows-x64-setup.exe
+            target/release/bundle/nsis/900Sheets-${{ needs.release-metadata.outputs.tag }}-windows.sha256
+            target/release/bundle/nsis/900Sheets-${{ needs.release-metadata.outputs.tag }}-windows.provenance.txt
+
+  publish-release:
+    name: Publish verified GitHub Release
+    needs: [release-metadata, source-gates, macos-app, windows-installer]
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish_release == true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ needs.release-metadata.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Download verified artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: 900Sheets-${{ needs.release-metadata.outputs.tag }}-*
+          path: release-assets
+          merge-multiple: true
+      - name: Verify release asset checksums and provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          test "$(find . -maxdepth 1 -type f | wc -l | tr -d ' ')" -eq 6
+          shasum -a 256 --check "900Sheets-${RELEASE_TAG}-macos.sha256"
+          sha256sum --check "900Sheets-${RELEASE_TAG}-windows.sha256"
+          grep -Eq '^signing=(developer-id|ad-hoc)$' "900Sheets-${RELEASE_TAG}-macos.provenance.txt"
+          grep -Eq '^notarization=(stapled|not-notarized)$' "900Sheets-${RELEASE_TAG}-macos.provenance.txt"
+          grep -Eq '^signing=(authenticode|unsigned)$' "900Sheets-${RELEASE_TAG}-windows.provenance.txt"
+          grep -qx 'signing=developer-id' "900Sheets-${RELEASE_TAG}-macos.provenance.txt" || {
+            echo "Public releases require a Developer ID signed macOS artifact" >&2
+            exit 1
+          }
+          grep -qx 'notarization=stapled' "900Sheets-${RELEASE_TAG}-macos.provenance.txt" || {
+            echo "Public releases require a notarized and stapled macOS artifact" >&2
+            exit 1
+          }
+      - name: Publish immutable release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rev-parse --verify "refs/tags/${RELEASE_TAG}"
+          if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Release ${RELEASE_TAG} already exists. Refusing to overwrite published assets." >&2
+            exit 1
+          fi
+          windows_signing="$(cut -d= -f2 "release-assets/900Sheets-${RELEASE_TAG}-windows.provenance.txt")"
+          notes="Distribution verification: macOS is Developer ID signed, notarized, and stapled. Windows signing status: ${windows_signing}. Checksums and machine-readable provenance are attached."
+          gh release create "${RELEASE_TAG}" release-assets/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
+            --title "900Sheets ${RELEASE_TAG}" \
+            --notes "${notes}" \
+            --generate-notes

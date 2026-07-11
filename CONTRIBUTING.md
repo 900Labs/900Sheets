@@ -9,7 +9,7 @@ Contributions are welcome from spreadsheet users, developers, technical writers,
 - Keep fixes focused on one behavior.
 - Never add a workbook containing personal, customer, financial, or confidential data.
 
-Good first contributions include documentation corrections, small accessibility improvements, formula tests, import and export fixtures with invented data, and focused performance fixes.
+Good first contributions include documentation corrections, small accessibility improvements, formula tests, import and export fixtures with invented data, starter-template improvements, reviewed translations, and focused performance fixes. The contributor-sized v0.5.0 issue plan is in [docs/COMMUNITY_PLAN.md](docs/COMMUNITY_PLAN.md).
 
 ## Development setup
 
@@ -28,6 +28,9 @@ npm run tauri:dev --prefix apps/desktop
 - Behavior changes need tests at the closest reliable layer.
 - File-format regressions need a minimal fixture or generated test archive.
 - Compatibility claims must include the exact test or fixture ID in `docs/COMPATIBILITY_MATRIX.md`.
+- Starter templates and compatibility fixtures must contain invented, publishable data.
+- Translation changes must identify the exact interface surface covered and must not claim complete localization from a partial label set.
+- Release workflow changes must distinguish configured capability from a successful hosted build, signing, notarization, installation, or publication result.
 - User-visible changes need matching documentation.
 - Do not claim compatibility that the tests do not prove.
 - Keep new prose direct and do not use em dashes.
@@ -48,7 +51,19 @@ For public-release or macOS packaging changes, also run on macOS:
 npm run tauri:build --prefix apps/desktop
 ```
 
-On Windows or Linux, validate source without claiming a package:
+For release-workflow changes, validate workflow invariants without publishing:
+
+```bash
+./scripts/verify-release-workflow.sh
+```
+
+For large-workbook work, run the deterministic sparse and dense workloads and record the command, host platform, and result:
+
+```bash
+./scripts/benchmark-workbooks.sh
+```
+
+On Windows or Linux, validate source without claiming that a hosted installer, package, signature, or clean-machine check succeeded:
 
 ```bash
 npm run build --prefix apps/desktop
@@ -65,7 +80,7 @@ cargo build --release -p sheets-desktop
 5. Complete the pull request template with exact verification evidence.
 6. Address review feedback without mixing unrelated cleanup into the branch.
 
-Maintainers may ask for an Excel or LibreOffice fixture when a change affects XLSX behavior. Fixtures must use invented data and must be safe to publish.
+Maintainers may ask for an Excel or LibreOffice fixture when a change affects XLSX behavior. Fixtures must use invented data and must be safe to publish. Microsoft Excel desktop compatibility must be reported as a separate observed result because Excel is not an automated repository dependency.
 
 ## Reporting problems
 

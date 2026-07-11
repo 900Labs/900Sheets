@@ -7,8 +7,12 @@ authors.workspace = true
 
 [dependencies]
 sheets-core = { path = "../sheets-core" }
+sheets-validation = { path = "../sheets-validation" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 zip = "2"
 roxmltree = "0.20"
+
+[dev-dependencies]
+sheets-fixtures = { path = "../sheets-fixtures" }

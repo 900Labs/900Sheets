@@ -2,16 +2,42 @@
   import { invoke } from '@tauri-apps/api/core'
   import { getCurrentWindow } from '@tauri-apps/api/window'
   import { open, save } from '@tauri-apps/plugin-dialog'
-  import { onMount } from 'svelte'
-  import type { SheetInfo, CellData, CellRange, ClipboardData, CellFormat, CellFormatMap } from './lib/types'
-  import { colLabel, cellKey, normalizeRange, rangeContains, rangeSize, rangeLabel, parseCellKey } from './lib/utils/grid'
+  import { onMount, tick } from 'svelte'
+  import type {
+    SheetInfo, CellData, CellRange, ClipboardData, CellFormat, CellFormatMap,
+    NativeBackupEntry, NativeBackupInspection, NativeBackupWriteResult, NativeSaveResult,
+    RecoveryEntry, RecoveryInspection,
+  } from './lib/types'
+  import {
+    MAX_GRID_COLS,
+    MAX_GRID_ROWS,
+    colLabel,
+    cellKey,
+    countIndexesBefore,
+    normalizeRange,
+    parseA1Range,
+    parseCellKey,
+    rangeContains,
+    rangeLabel,
+    rangeSize,
+    sortedHiddenRows,
+    visibleRowAt,
+  } from './lib/utils/grid'
+  import { APP_LOCALES, isAppLocale, translate, type AppLocale } from './lib/utils/locale'
   import { MutationQueue } from './lib/utils/mutationQueue.js'
   import { RecoveryAutosave } from './lib/utils/recoveryAutosave.js'
+  import {
+    STARTER_TEMPLATES,
+    FIRST_RUN_STEPS,
+    completeFirstRun,
+    shouldShowFirstRun,
+    templateCellChanges,
+  } from './lib/utils/starterTemplates.js'
 
   type EditFocusOptions = { selectText: boolean; cursorPosition?: number }
 
   function focusInput(node: HTMLInputElement, options: EditFocusOptions = { selectText: true }) {
-    node.focus()
+    node.focus({ preventScroll: true })
     if (options.selectText) {
       node.select()
     } else {
@@ -33,6 +59,7 @@
   let editValue: string = $state('')
   let editFocusOptions: EditFocusOptions = $state({ selectText: true })
   let formulaBarValue: string = $state('')
+  let formulaBarDraftDirty: boolean = $state(false)
   let isSelecting: boolean = $state(false)
   let clipboard: ClipboardData | null = null
   let renamingSheetId: number | null = $state(null)
@@ -43,10 +70,25 @@
   let errorMessage: string = $state('')
   let currentFilePath: string | null = $state(null)
   let isDirty: boolean = $state(false)
+  let mutationGeneration = 0
+  let sessionGeneration = 0
+  let sheetSelectionGeneration = 0
+  let sheetSelectionTail: Promise<void> = Promise.resolve()
+  let saveInProgress: boolean = $state(false)
+  let replacementInProgress: boolean = $state(false)
+  let closeInProgress: boolean = $state(false)
+  let autosaveDelay: number = $state(750)
+  let recoveryEntries: RecoveryEntry[] = $state([])
+  let backupEntries: NativeBackupEntry[] = $state([])
+  let storageInspection: RecoveryInspection | NativeBackupInspection | null = $state(null)
+  let storageInspectionKind: 'recovery' | 'backup' | null = $state(null)
+  let showFirstRun: boolean = $state(false)
   const mutationQueue = new MutationQueue()
   let transactionTail: Promise<void> = Promise.resolve()
   let recoveryId = $state(newRecoveryId())
   let recoveryCleanupPending: { id: string; rotateAfterCleanup: boolean } | null = $state(null)
+  let recoveryAutosaveFailed = false
+  let recoveryAutosaveFailureMessage: string = $state('')
   const recoveryAutosave = new RecoveryAutosave({
     delay: 750,
     flush: () => flushPendingMutations(),
@@ -54,7 +96,17 @@
       recoveryId,
       metadata: nativeMetadata(),
     }),
-    onError: (error) => console.error('Unable to update recovery snapshot', error),
+    onError: (error) => {
+      recoveryAutosaveFailed = true
+      recoveryAutosaveFailureMessage = `Crash recovery is not current: ${describeError(error)}`
+      setError(error, 'Unable to update crash recovery')
+    },
+    onSuccess: () => {
+      if (!recoveryAutosaveFailed) return
+      recoveryAutosaveFailed = false
+      recoveryAutosaveFailureMessage = ''
+      if (errorMessage.startsWith('Unable to update crash recovery:')) setStatus('Crash recovery resumed')
+    },
   })
 
   function newRecoveryId(): string {
@@ -65,7 +117,7 @@
   type ToolbarMenuKey = 'data' | 'analyze' | 'output'
   type PanelKey =
     | 'functions' | 'find' | 'chart' | 'pivot' | 'validation' | 'conditional' | 'print' | 'protection'
-    | 'comment' | 'goalSeek' | 'filter' | 'namedRanges' | 'structure' | 'templates' | 'shortcuts' | 'about'
+    | 'comment' | 'goalSeek' | 'filter' | 'namedRanges' | 'structure' | 'templates' | 'shortcuts' | 'storage' | 'locale' | 'about'
   type MenuAction =
     | 'newWorkbook' | 'templates' | 'openNative' | 'openXlsx' | 'importCsv' | 'importJson' | 'saveNative' | 'saveXlsx' | 'exportCsv' | 'exportJson' | 'exportPdf'
     | 'undo' | 'redo' | 'cut' | 'copy' | 'paste' | 'delete' | 'findReplace'
@@ -73,7 +125,7 @@
     | 'functions' | 'addSheet' | 'comment' | 'chart' | 'pivot' | 'structure' | 'insertRow' | 'deleteRow' | 'insertColumn' | 'deleteColumn'
     | 'bold' | 'italic' | 'underline' | 'strike' | 'alignLeft' | 'alignCenter' | 'alignRight' | 'wrapText' | 'fillYellow' | 'fillGreen' | 'fillRed' | 'textBlue' | 'textRed' | 'conditional'
     | 'sortAsc' | 'sortDesc' | 'filter' | 'clearFilter' | 'removeDuplicates' | 'namedRanges' | 'validation'
-    | 'protection' | 'lockRange' | 'unlockRange' | 'goalSeek' | 'shortcuts' | 'about' | 'notReady'
+    | 'protection' | 'lockRange' | 'unlockRange' | 'goalSeek' | 'shortcuts' | 'storage' | 'locale' | 'about' | 'notReady'
 
   interface MenuItem {
     label: string
@@ -134,9 +186,15 @@
     metadata: Record<string, unknown>
   }
 
-  interface RecoveryEntry {
-    id: string
-    modified_millis: number
+  interface ExportPreflight {
+    format: string
+    estimated_dense_cells: number
+    populated_cells: number
+    max_row: number | null
+    max_col: number | null
+    limit: number | null
+    blocked: boolean
+    message: string
   }
 
   interface CellComment {
@@ -289,6 +347,7 @@
   let conditionalFill: string = $state('#fef3c7')
   let conditionalMatches: Array<[number, number]> = $state([])
   let conditionalRules: StoredConditionalRule[] = $state([])
+  let duplicateValueCounts: Record<string, Map<string, number>> = $derived(buildDuplicateValueCounts())
   let sheetFeatureStates: Record<string, SheetFeatureState> = $state({})
   let printPageSize: string = $state('Letter')
   let printOrientation: string = $state('Portrait')
@@ -308,6 +367,13 @@
   let dragScrollTimer: ReturnType<typeof setInterval> | null = null
   let dragScrollDir: 'down' | 'up' | 'left' | 'right' | null = null
   let gridContainerEl: HTMLElement | null = $state(null)
+  let goToInputEl: HTMLInputElement | null = $state(null)
+  let panelEl: HTMLElement | null = $state(null)
+  let lastFocusedElement: HTMLElement | null = null
+  let goToValue: string = $state('A1')
+  let gridViewportWidth: number = $state(1200)
+  let gridViewportHeight: number = $state(960)
+  let locale: AppLocale = $state('en')
 
   const FORMULA_FUNCTIONS: Record<string, string[]> = {
     Math: ['SUM', 'AVERAGE', 'MIN', 'MAX', 'COUNT', 'COUNTA', 'PRODUCT', 'ABS', 'ROUND', 'ROUNDUP', 'ROUNDDOWN', 'FLOOR', 'CEILING', 'MOD', 'POWER', 'SQRT', 'SQRTPI', 'INT', 'EXP', 'LN', 'LOG10', 'LOG', 'LOG2', 'PI', 'RAND', 'RANDBETWEEN', 'SIGN', 'TRUNC', 'QUOTIENT', 'GCD', 'LCM', 'COMBIN', 'COMBINA', 'PERMUT', 'PERMUTA', 'FACT', 'FACTDOUBLE', 'MROUND', 'MULTINOMIAL', 'SERIESSUM'],
@@ -335,48 +401,6 @@
     PMT: { syntax: 'PMT(rate, periods, present_value)', description: 'Calculates a loan payment.', example: '=PMT(8%/12,24,5000)' },
     TODAY: { syntax: 'TODAY()', description: 'Returns the current date.', example: '=TODAY()' },
     ROUND: { syntax: 'ROUND(value, places)', description: 'Rounds a number to a fixed number of decimal places.', example: '=ROUND(B2,2)' },
-  }
-
-  const TEMPLATES: Record<string, { title: string; rows: string[][] }> = {
-    budget: {
-      title: 'Household Budget',
-      rows: [
-        ['Category', 'Planned', 'Actual', 'Difference'],
-        ['Food', '250', '230', '=B2-C2'],
-        ['Transport', '80', '96', '=B3-C3'],
-        ['Utilities', '120', '118', '=B4-C4'],
-        ['Savings', '100', '75', '=B5-C5'],
-        ['Total', '=SUM(B2:B5)', '=SUM(C2:C5)', '=SUM(D2:D5)'],
-      ],
-    },
-    inventory: {
-      title: 'Inventory Tracker',
-      rows: [
-        ['Item', 'Category', 'In stock', 'Reorder level', 'Status'],
-        ['Rice 10kg', 'Food', '42', '20', '=IF(C2<D2,"Reorder","OK")'],
-        ['Soap', 'Household', '18', '24', '=IF(C3<D3,"Reorder","OK")'],
-        ['Exercise books', 'School', '67', '30', '=IF(C4<D4,"Reorder","OK")'],
-      ],
-    },
-    attendance: {
-      title: 'Attendance Register',
-      rows: [
-        ['Name', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Present Days'],
-        ['Student 1', '1', '1', '0', '1', '1', '=SUM(B2:F2)'],
-        ['Student 2', '1', '0', '1', '1', '0', '=SUM(B3:F3)'],
-        ['Student 3', '1', '1', '1', '1', '1', '=SUM(B4:F4)'],
-      ],
-    },
-    invoice: {
-      title: 'Simple Invoice',
-      rows: [
-        ['Description', 'Quantity', 'Unit Price', 'Line Total'],
-        ['Service', '1', '50', '=B2*C2'],
-        ['Materials', '3', '12', '=B3*C3'],
-        ['Delivery', '1', '8', '=B4*C4'],
-        ['', '', 'Total', '=SUM(D2:D4)'],
-      ],
-    },
   }
 
   const MENU_DEFINITIONS: MenuDefinition[] = [
@@ -523,7 +547,8 @@
         [
           { label: 'Goal Seek...', action: 'goalSeek' },
           { label: 'Scenarios', action: 'notReady', disabled: true },
-          { label: 'Locale Settings', action: 'notReady', disabled: true },
+          { label: 'Recovery and Backups...', action: 'storage' },
+          { label: 'Locale Settings...', action: 'locale' },
         ],
       ],
     },
@@ -539,27 +564,58 @@
     },
   ]
 
-  const COLS = 52
-  const ROWS = 1000
+  const COLS = MAX_GRID_COLS
+  const ROWS = MAX_GRID_ROWS
   const COL_WIDTH = 80
+  const ROW_HEADER_WIDTH = COL_WIDTH * 0.6
   const ROW_HEIGHT = 24
+  const SCROLL_ROW_PITCH = 8
   const HEADER_HEIGHT = 28
+  const ROW_OVERSCAN = 5
+  const COL_OVERSCAN = 3
+  const MAX_FROZEN_ROWS = 20
+  const MAX_FROZEN_COLUMNS = 20
+  const MAX_DENSE_SELECTION_CELLS = 200_000
 
-  const VISIBLE_ROWS = 40
   let scrollTop: number = $state(0)
   let scrollLeft: number = $state(0)
 
-  let displayedRows: number[] = $derived(buildDisplayedRows())
-  let frozenDisplayRows: number[] = $derived(displayedRows.filter((row) => row < frozenRowCount))
-  let scrollableDisplayRows: number[] = $derived(displayedRows.filter((row) => row >= frozenRowCount))
-  let visibleRowStart: number = $derived(Math.floor(scrollTop / ROW_HEIGHT))
-  let visibleRowEnd: number = $derived(Math.min(visibleRowStart + VISIBLE_ROWS + 5, scrollableDisplayRows.length))
-  let visibleRows: number[] = $derived([
-    ...frozenDisplayRows,
-    ...scrollableDisplayRows.slice(visibleRowStart, visibleRowEnd),
-  ])
-  let visibleColStart: number = $derived(Math.max(0, Math.floor(scrollLeft / COL_WIDTH)))
-  let visibleColEnd: number = $derived(Math.min(visibleColStart + COLS, COLS))
+  let hiddenRowIndexes: number[] = $derived(sortedHiddenRows(hiddenRows, ROWS))
+  let displayedRowCount: number = $derived(ROWS - hiddenRowIndexes.length)
+  let frozenDisplayRows: number[] = $derived(buildFrozenDisplayRows())
+  let firstScrollableVisibleIndex: number = $derived(
+    frozenRowCount - countIndexesBefore(hiddenRowIndexes, frozenRowCount)
+  )
+  let scrollableDisplayRowCount: number = $derived(displayedRowCount - firstScrollableVisibleIndex)
+  let scaledRowHeight: number = $derived(ROW_HEIGHT * zoomPercent / 100)
+  let scaledScrollRowPitch: number = $derived(SCROLL_ROW_PITCH * zoomPercent / 100)
+  let scaledColWidth: number = $derived(COL_WIDTH * zoomPercent / 100)
+  let visibleRowStart: number = $derived(Math.max(0, Math.floor(scrollTop / scaledScrollRowPitch) - ROW_OVERSCAN))
+  let visibleRowCapacity: number = $derived(
+    Math.ceil(gridViewportHeight / scaledRowHeight) + ROW_OVERSCAN * 2
+  )
+  let visibleRowEnd: number = $derived(Math.min(visibleRowStart + visibleRowCapacity, scrollableDisplayRowCount))
+  let visibleRows: number[] = $derived(buildVisibleRows())
+  let renderedFrozenCols: number[] = $derived(
+    Array.from({ length: Math.min(frozenColCount, MAX_FROZEN_COLUMNS) }, (_, col) => col)
+  )
+  let visibleColStart: number = $derived(buildVisibleColStart())
+  let visibleColCapacity: number = $derived(
+    Math.ceil(gridViewportWidth / Math.max(1, scaledColWidth)) + COL_OVERSCAN * 2
+  )
+  let visibleColEnd: number = $derived(Math.min(COLS, visibleColStart + visibleColCapacity))
+  let visibleCols: number[] = $derived(
+    Array.from({ length: Math.max(0, visibleColEnd - visibleColStart) }, (_, offset) => visibleColStart + offset)
+  )
+  let leftColSpacerWidth: number = $derived(Math.max(0, visibleColStart - frozenColCount) * COL_WIDTH)
+  let rightColSpacerWidth: number = $derived(Math.max(0, COLS - visibleColEnd) * COL_WIDTH)
+  let gridTemplateColumns: string = $derived([
+    `${ROW_HEADER_WIDTH}px`,
+    ...renderedFrozenCols.map(() => `${COL_WIDTH}px`),
+    `${leftColSpacerWidth}px`,
+    ...visibleCols.map(() => `${COL_WIDTH}px`),
+    `${rightColSpacerWidth}px`,
+  ].join(' '))
 
   let currentRange: CellRange = $derived(
     normalizeRange({
@@ -601,18 +657,29 @@
     let sum = 0
     let min = Number.POSITIVE_INFINITY
     let max = Number.NEGATIVE_INFINITY
-    for (let row = r.startRow; row <= r.endRow; row++) {
-      for (let col = r.startCol; col <= r.endCol; col++) {
-        const raw = cellContents[cellKey(row, col)]
-        if (raw == null || raw === '') continue
-        count += 1
-        const value = Number(raw)
-        if (Number.isFinite(value)) {
-          numericCount += 1
-          sum += value
-          min = Math.min(min, value)
-          max = Math.max(max, value)
-        }
+    if (r.startRow === r.endRow && r.startCol === r.endCol) {
+      const raw = cellContents[cellKey(r.startRow, r.startCol)]
+      const value = raw == null || raw === '' ? Number.NaN : Number(raw)
+      return {
+        count: raw == null || raw === '' ? 0 : 1,
+        numericCount: Number.isFinite(value) ? 1 : 0,
+        sum: Number.isFinite(value) ? value : 0,
+        average: Number.isFinite(value) ? value : 0,
+        min: Number.isFinite(value) ? value : 0,
+        max: Number.isFinite(value) ? value : 0,
+      }
+    }
+    for (const [key, raw] of Object.entries(cellContents)) {
+      if (raw === '') continue
+      const { row, col } = parseCellKey(key)
+      if (!rangeContains(r, row, col)) continue
+      count += 1
+      const value = Number(raw)
+      if (Number.isFinite(value)) {
+        numericCount += 1
+        sum += value
+        min = Math.min(min, value)
+        max = Math.max(max, value)
       }
     }
     return {
@@ -684,12 +751,27 @@
     return path
   }
 
-  function buildDisplayedRows(): number[] {
+  function buildFrozenDisplayRows(): number[] {
     const rows: number[] = []
-    for (let row = 0; row < ROWS; row++) {
+    for (let row = 0; row < Math.min(frozenRowCount, ROWS); row++) {
       if (!hiddenRows[row]) rows.push(row)
     }
     return rows
+  }
+
+  function buildVisibleRows(): number[] {
+    const rows: number[] = [...frozenDisplayRows]
+    for (let offset = visibleRowStart; offset < visibleRowEnd; offset++) {
+      const row = visibleRowAt(firstScrollableVisibleIndex + offset, hiddenRowIndexes, ROWS)
+      if (row !== null && row >= frozenRowCount) rows.push(row)
+    }
+    return rows
+  }
+
+  function buildVisibleColStart(): number {
+    const logicalScrollLeft = scrollLeft / (zoomPercent / 100)
+    const firstScrolledCol = Math.floor(Math.max(0, logicalScrollLeft - ROW_HEADER_WIDTH) / COL_WIDTH)
+    return Math.min(COLS - 1, Math.max(frozenColCount, firstScrolledCol - COL_OVERSCAN))
   }
 
   function rangeToTuple(range: CellRange): [number, number, number, number] {
@@ -723,6 +805,36 @@
     return styles.filter(Boolean).join('; ')
   }
 
+  function rangeArea(range: CellRange): number {
+    const r = normalizeRange(range)
+    return (r.endRow - r.startRow + 1) * (r.endCol - r.startCol + 1)
+  }
+
+  function allowDenseRange(range: CellRange, operation: string, limit = MAX_DENSE_SELECTION_CELLS): boolean {
+    const area = rangeArea(range)
+    if (area <= limit) return true
+    setError(
+      `${operation} is limited to ${limit.toLocaleString()} cells at a time. The current selection contains ${area.toLocaleString()} cells.`,
+      `${operation} unavailable`,
+    )
+    return false
+  }
+
+  function populatedRange(): CellRange | null {
+    let startRow = ROWS
+    let startCol = COLS
+    let endRow = -1
+    let endCol = -1
+    for (const key of Object.keys(cellContents)) {
+      const { row, col } = parseCellKey(key)
+      startRow = Math.min(startRow, row)
+      startCol = Math.min(startCol, col)
+      endRow = Math.max(endRow, row)
+      endCol = Math.max(endCol, col)
+    }
+    return endRow < 0 ? null : { startRow, startCol, endRow, endCol }
+  }
+
   function describeError(error: unknown): string {
     return error instanceof Error ? error.message : String(error)
   }
@@ -733,6 +845,7 @@
   }
 
   function markDirty() {
+    mutationGeneration += 1
     isDirty = true
     recoveryAutosave.schedule()
   }
@@ -746,13 +859,12 @@
     rotateAfterCleanup: boolean,
     context: string,
   ): Promise<boolean> {
+    if (rotateAfterCleanup && recoveryId === id) recoveryId = newRecoveryId()
     try {
       await invoke('discard_recovery_snapshot', { recoveryId: id })
       if (recoveryCleanupPending?.id === id) recoveryCleanupPending = null
-      if (rotateAfterCleanup) recoveryId = newRecoveryId()
       return true
     } catch (error) {
-      recoveryId = id
       recoveryCleanupPending = { id, rotateAfterCleanup }
       setError(error, `${context}. Choose Save Workbook to retry recovery cleanup`)
       return false
@@ -838,6 +950,64 @@
     return !isDirty || window.confirm('This workbook has unsaved changes. Discard them?')
   }
 
+  function commitFormulaBarDraft(): boolean {
+    if (editingCell || !formulaBarDraftDirty) return true
+    const key = cellKey(selectedRow, selectedCol)
+    const oldValue = cellContents[key] ?? ''
+    if (formulaBarValue === oldValue) {
+      formulaBarDraftDirty = false
+      return true
+    }
+    const validationError = validationMessageForValue(selectedRow, selectedCol, formulaBarValue)
+    if (validationError) {
+      setError(validationError, 'Validation failed')
+      return false
+    }
+    cellContents[key] = formulaBarValue
+    if (!formulaBarValue.startsWith('=')) cellDisplays[key] = formulaBarValue
+    queueSetCell(selectedRow, selectedCol, formulaBarValue, 'Unable to update formula bar')
+    formulaBarDraftDirty = false
+    return true
+  }
+
+  function commitActiveDrafts(): boolean {
+    if (editingCell && !commitEdit()) return false
+    return commitFormulaBarDraft()
+  }
+
+  async function prepareWorkbookReplacement(confirmDiscard: boolean = true): Promise<boolean> {
+    if (replacementInProgress || closeInProgress) {
+      setStatus('Another workbook replacement is already in progress')
+      return false
+    }
+    if (!commitActiveDrafts()) return false
+    replacementInProgress = true
+    activePanel = null
+    closePopovers()
+    try {
+      await sheetSelectionTail
+      await recoveryAutosave.cancelAndWait()
+      await flushPendingMutations()
+      if (confirmDiscard && !canDiscardUnsavedChanges()) {
+        resumeRecoveryIfDirty()
+        replacementInProgress = false
+        return false
+      }
+      sessionGeneration += 1
+      sheetSelectionGeneration += 1
+      return true
+    } catch (error) {
+      replacementInProgress = false
+      resumeRecoveryIfDirty()
+      setError(error, 'Unable to prepare the workbook replacement')
+      return false
+    }
+  }
+
+  function endWorkbookReplacement() {
+    replacementInProgress = false
+  }
+
   function enqueueMutation(operation: () => Promise<unknown>, context: string) {
     mutationQueue.enqueue(operation, async (error) => {
         setError(error, context)
@@ -861,7 +1031,7 @@
     sheets = result
     const nextSheet = result.find((sheet) => sheet.id === preferredSheetId) ?? result[0]
     if (nextSheet) {
-      await selectSheet(nextSheet.id)
+      await selectSheet(nextSheet.id, true)
     } else {
       activeSheetId = 0
       cellContents = {}
@@ -884,7 +1054,7 @@
     changes: Array<{ row: number; col: number; value: string }>,
     context: string,
     successMessage?: string,
-  ) {
+  ): Promise<boolean> {
     const byKey = new Map<string, { row: number; col: number; value: string }>()
     for (const change of changes) {
       if (change.row < 0 || change.row >= ROWS || change.col < 0 || change.col >= COLS) continue
@@ -910,7 +1080,7 @@
 
     if (backendChanges.length === 0) {
       if (successMessage) setStatus(successMessage)
-      return
+      return true
     }
 
     cellContents = nextContents
@@ -923,9 +1093,11 @@
       )
       await refreshSheetData()
       if (successMessage) setStatus(successMessage)
+      return true
     } catch (e) {
       setError(e, context)
       await refreshSheetData()
+      return false
     }
   }
 
@@ -963,8 +1135,12 @@
   }
 
   function cellAccessibleName(row: number, col: number): string {
-    const state = selectedRow === row && selectedCol === col ? 'selected' : 'not selected'
-    return `${cellKey(row, col)}, ${getCellDisplay(row, col) || 'blank'}, ${state}`
+    const state = selectedRow === row && selectedCol === col ? translate(locale, 'selected') : translate(locale, 'notSelected')
+    return `${cellKey(row, col)}, ${getCellDisplay(row, col) || translate(locale, 'blank')}, ${state}`
+  }
+
+  function cellDomId(row: number, col: number): string {
+    return `grid-cell-${row}-${col}`
   }
 
   function getCellFormat(row: number, col: number): CellFormat {
@@ -1035,6 +1211,7 @@
 
   async function applyFormatToSelection(format: Partial<CellFormat>) {
     const r = normalizeRange(currentRange)
+    if (!allowDenseRange(r, 'Format selection')) return
     const changes: Array<{ row: number; col: number; format: CellFormat }> = []
     for (let row = r.startRow; row <= r.endRow; row++) {
       for (let col = r.startCol; col <= r.endCol; col++) {
@@ -1181,8 +1358,13 @@
   }
 
   function openPanel(panel: PanelKey) {
+    lastFocusedElement = document.activeElement instanceof HTMLElement ? document.activeElement : gridContainerEl
     activePanel = panel
     closePopovers()
+    void tick().then(() => {
+      const firstControl = panelEl?.querySelector<HTMLElement>('input, select, textarea, button:not([disabled])')
+      ;(firstControl ?? panelEl)?.focus()
+    })
     if (panel === 'comment') {
       loadCommentPanel()
     }
@@ -1211,11 +1393,62 @@
     if (panel === 'print') {
       printPageCount = null
     }
+    if (panel === 'storage') {
+      void refreshStorageManager()
+    }
   }
 
   function closePanel() {
     closeCommentPanelForContextChange()
     activePanel = null
+    void tick().then(() => (lastFocusedElement ?? gridContainerEl)?.focus())
+  }
+
+  function handlePanelKeydown(event: KeyboardEvent) {
+    event.stopPropagation()
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      closePanel()
+      return
+    }
+    if (event.key !== 'Tab' || !panelEl) return
+    const controls = Array.from(panelEl.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+    )).filter((element) => element.offsetParent !== null)
+    if (controls.length === 0) {
+      event.preventDefault()
+      panelEl.focus()
+      return
+    }
+    const first = controls[0]
+    const last = controls[controls.length - 1]
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault()
+      last.focus()
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault()
+      first.focus()
+    }
+  }
+
+  function handleFirstRunKeydown(event: KeyboardEvent) {
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      finishFirstRun()
+      return
+    }
+    handlePanelKeydown(event)
+  }
+
+  function updateLocale(value: string) {
+    if (!isAppLocale(value)) return
+    locale = value
+    try {
+      localStorage.setItem('900sheets.locale', locale)
+    } catch (error) {
+      console.warn('Unable to persist locale preference', error)
+    }
+    setStatus(translate(locale, 'settingsSaved'))
   }
 
   function resetCommentPanelState() {
@@ -1267,8 +1500,8 @@
     validationRules = clonePlain(state?.validationRules ?? [])
     conditionalRules = clonePlain(state?.conditionalRules ?? [])
     namedRanges = clonePlain(state?.namedRanges ?? [])
-    frozenRowCount = state?.frozenRowCount ?? 0
-    frozenColCount = state?.frozenColCount ?? 0
+    frozenRowCount = Math.min(state?.frozenRowCount ?? 0, MAX_FROZEN_ROWS)
+    frozenColCount = Math.min(state?.frozenColCount ?? 0, MAX_FROZEN_COLUMNS)
     hiddenRows = { ...(state?.hiddenRows ?? {}) }
     activeFilterLabel = state?.activeFilterLabel ?? ''
     savedChartTitle = state?.chartTitle ?? 'Chart'
@@ -1323,8 +1556,18 @@
     return rangeContains(currentRange, row, col)
   }
 
-  function selectCell(row: number, col: number, extend: boolean = false) {
-    if (editingCell) commitEdit()
+  function selectCell(row: number, col: number, extend: boolean = false): boolean {
+    if (!commitActiveDrafts()) return false
+    if (hiddenRows[row]) {
+      const direction = row >= selectedRow ? 1 : -1
+      let visibleRow = row
+      while (visibleRow >= 0 && visibleRow < ROWS && hiddenRows[visibleRow]) visibleRow += direction
+      if (visibleRow < 0 || visibleRow >= ROWS) {
+        setStatus(`Row ${row + 1} is hidden by the active filter`)
+        return false
+      }
+      row = visibleRow
+    }
     if (row !== selectedRow || col !== selectedCol) closeCommentPanelForContextChange()
     selectedRow = row
     selectedCol = col
@@ -1335,7 +1578,50 @@
       selectionEnd = { row, col }
     }
     formulaBarValue = getCellValue(row, col)
+    formulaBarDraftDirty = false
+    goToValue = extend ? rangeLabel(normalizeRange({
+      startRow: selectionStart.row,
+      startCol: selectionStart.col,
+      endRow: row,
+      endCol: col,
+    })) : cellKey(row, col)
     editingCell = null
+    revealCell(row, col)
+    return true
+  }
+
+  function revealCell(row: number, col: number) {
+    if (!gridContainerEl) return
+    const scale = zoomPercent / 100
+    const viewportWidth = gridContainerEl.clientWidth
+    if (row >= frozenRowCount && !hiddenRows[row]) {
+      const globalVisibleIndex = row - countIndexesBefore(hiddenRowIndexes, row)
+      const scrollableIndex = Math.max(0, globalVisibleIndex - firstScrollableVisibleIndex)
+      const windowStart = Math.max(0, Math.floor(gridContainerEl.scrollTop / (SCROLL_ROW_PITCH * scale)) - ROW_OVERSCAN)
+      const windowEnd = Math.min(scrollableDisplayRowCount, windowStart + visibleRowCapacity)
+      if (scrollableIndex < windowStart || scrollableIndex >= windowEnd) {
+        const desiredStart = Math.max(
+          0,
+          Math.min(scrollableDisplayRowCount - visibleRowCapacity, scrollableIndex - Math.floor(visibleRowCapacity / 2)),
+        )
+        gridContainerEl.scrollTop = Math.max(0, (desiredStart + ROW_OVERSCAN) * SCROLL_ROW_PITCH * scale)
+      }
+    }
+    if (col >= frozenColCount) {
+      const colLeft = (ROW_HEADER_WIDTH + col * COL_WIDTH) * scale
+      const colRight = colLeft + COL_WIDTH * scale
+      const visibleLeft = gridContainerEl.scrollLeft + (ROW_HEADER_WIDTH + frozenColCount * COL_WIDTH) * scale
+      const visibleRight = gridContainerEl.scrollLeft + viewportWidth
+      if (colLeft < visibleLeft) {
+        gridContainerEl.scrollLeft = Math.max(0, (ROW_HEADER_WIDTH + (col - 1) * COL_WIDTH) * scale)
+      } else if (colRight > visibleRight) {
+        gridContainerEl.scrollLeft = Math.max(0, colRight - viewportWidth + COL_WIDTH * scale)
+      }
+    }
+  }
+
+  function focusGrid() {
+    void tick().then(() => gridContainerEl?.focus({ preventScroll: true }))
   }
 
   function startEdit(row: number, col: number, initialValue?: string, cursorPosition?: number) {
@@ -1346,7 +1632,7 @@
       : { selectText: false, cursorPosition }
   }
 
-  function commitEdit() {
+  function commitEdit(): boolean {
     if (editingCell) {
       const key = editingCell
       const { row, col } = parseCellKey(key)
@@ -1355,7 +1641,7 @@
         const validationError = validationMessageForValue(row, col, editValue)
         if (validationError) {
           setError(validationError, 'Validation failed')
-          return
+          return false
         }
         cellContents[key] = editValue
         if (!editValue.startsWith('=')) {
@@ -1364,8 +1650,10 @@
         queueSetCell(row, col, editValue, 'Unable to edit cell')
       }
       formulaBarValue = editValue
+      formulaBarDraftDirty = false
       editingCell = null
     }
+    return true
   }
 
   function cancelEdit() {
@@ -1393,7 +1681,7 @@
   }
 
   async function doUndo() {
-    if (editingCell) commitEdit()
+    if (!commitActiveDrafts()) return
     try {
       await flushPendingMutations()
       saveActiveSheetFeatureState()
@@ -1412,7 +1700,7 @@
   }
 
   async function doRedo() {
-    if (editingCell) commitEdit()
+    if (!commitActiveDrafts()) return
     try {
       await flushPendingMutations()
       saveActiveSheetFeatureState()
@@ -1432,6 +1720,7 @@
 
   function copySelection(isCut: boolean = false) {
     const r = normalizeRange(currentRange)
+    if (!allowDenseRange(r, isCut ? 'Cut selection' : 'Copy selection')) return
     const size = rangeSize(r)
     const cells: string[][] = []
     for (let row = 0; row < size.rows; row++) {
@@ -1447,23 +1736,21 @@
     navigator.clipboard.writeText(tsv).catch(() => {})
 
     if (isCut) {
-      const changes: Array<{ row: number; col: number; value: string }> = []
-      for (let row = 0; row < size.rows; row++) {
-        for (let col = 0; col < size.cols; col++) {
-          const r2 = r.startRow + row
-          const c2 = r.startCol + col
-          const oldVal = cellContents[cellKey(r2, c2)] ?? ''
-          if (oldVal) {
-            changes.push({ row: r2, col: c2, value: '' })
-          }
-        }
-      }
+      const changes = Object.keys(cellContents).flatMap((key) => {
+        const { row, col } = parseCellKey(key)
+        return rangeContains(r, row, col) ? [{ row, col, value: '' }] : []
+      })
       void applyCellValueChanges(changes, 'Unable to cut cells', `Cut ${changes.length} cell${changes.length === 1 ? '' : 's'}`)
     }
   }
 
   function pasteFromClipboard() {
     if (!clipboard) return
+    const clipboardArea = clipboard.cells.reduce((total, row) => total + row.length, 0)
+    if (clipboardArea > MAX_DENSE_SELECTION_CELLS) {
+      setError(`Paste is limited to ${MAX_DENSE_SELECTION_CELLS.toLocaleString()} cells at a time.`, 'Paste unavailable')
+      return
+    }
     const r = normalizeRange(currentRange)
     const changes: Array<{ row: number; col: number; value: string }> = []
     for (let row = 0; row < clipboard.cells.length; row++) {
@@ -1496,6 +1783,11 @@
         rows.pop()
       }
       const cells = rows.map((r) => r.split('\t'))
+      const clipboardArea = cells.reduce((total, row) => total + row.length, 0)
+      if (clipboardArea > MAX_DENSE_SELECTION_CELLS) {
+        setError(`Paste is limited to ${MAX_DENSE_SELECTION_CELLS.toLocaleString()} cells at a time.`, 'Paste unavailable')
+        return
+      }
       const r = normalizeRange(currentRange)
       const changes: Array<{ row: number; col: number; value: string }> = []
       for (let row = 0; row < cells.length; row++) {
@@ -1525,15 +1817,13 @@
   function deleteSelection() {
     if (editingCell) return
     const r = normalizeRange(currentRange)
-    const changes: Array<{ row: number; col: number; value: string }> = []
-    for (let row = r.startRow; row <= r.endRow; row++) {
-      for (let col = r.startCol; col <= r.endCol; col++) {
-        const key = cellKey(row, col)
-        const oldValue = cellContents[key] ?? cellDisplays[key] ?? ''
-        if (oldValue) {
-          changes.push({ row, col, value: '' })
-        }
-      }
+    const changes = Object.keys(cellContents).flatMap((key) => {
+      const { row, col } = parseCellKey(key)
+      return rangeContains(r, row, col) ? [{ row, col, value: '' }] : []
+    })
+    if (changes.length > MAX_DENSE_SELECTION_CELLS) {
+      setError(`Delete is limited to ${MAX_DENSE_SELECTION_CELLS.toLocaleString()} populated cells at a time.`, 'Delete unavailable')
+      return
     }
     void applyCellValueChanges(changes, 'Unable to delete cells', `Cleared ${changes.length} cell${changes.length === 1 ? '' : 's'}`)
   }
@@ -1547,6 +1837,10 @@
   }
 
   function handleGridKeydown(e: KeyboardEvent) {
+    if (replacementInProgress || closeInProgress) {
+      e.preventDefault()
+      return
+    }
     if (editingCell) return
     if (isClearSelectionKey(e)) {
       e.preventDefault()
@@ -1556,28 +1850,48 @@
   }
 
   function handleKeydown(e: KeyboardEvent) {
+    if (replacementInProgress || closeInProgress) {
+      e.preventDefault()
+      return
+    }
     if (editingCell) {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
         e.preventDefault()
-        commitEdit()
+        if (!commitEdit()) return
         void handleSaveNative()
       } else if (e.key === 'Enter') {
         e.preventDefault()
-        commitEdit()
+        if (!commitEdit()) return
         if (selectedRow < ROWS - 1) selectCell(selectedRow + 1, selectedCol)
+        focusGrid()
       } else if (e.key === 'Escape') {
         e.preventDefault()
         cancelEdit()
       } else if (e.key === 'Tab') {
         e.preventDefault()
-        commitEdit()
-        if (selectedCol < COLS - 1) selectCell(selectedRow, selectedCol + 1)
+        if (!commitEdit()) return
+        exitGridFocus(e.shiftKey)
       }
       return
     }
 
+    const target = e.target as HTMLElement | null
+    const targetIsGrid = target === gridContainerEl || target?.classList.contains('cell')
+    if (target && !targetIsGrid && target.matches('input, textarea, select, button, [contenteditable="true"]')) return
+
     const ctrl = e.ctrlKey || e.metaKey
     const key = e.key.toLowerCase()
+
+    if ((ctrl && key === 'g') || e.key === 'F5') {
+      e.preventDefault()
+      showFormulaBar = true
+      goToValue = rangeLabel(currentRange)
+      void tick().then(() => {
+        goToInputEl?.focus()
+        goToInputEl?.select()
+      })
+      return
+    }
 
     if (ctrl && key === 'n') {
       e.preventDefault()
@@ -1647,8 +1961,9 @@
     }
     if (ctrl && key === 'a') {
       e.preventDefault()
-      selectionStart = { row: 0, col: 0 }
-      selectionEnd = { row: ROWS - 1, col: COLS - 1 }
+      const used = populatedRange()
+      if (used) selectRange(used)
+      else selectCell(selectedRow, selectedCol)
       return
     }
 
@@ -1676,48 +1991,66 @@
       e.preventDefault()
       const newCol = Math.max(selectedCol - 1, 0)
       selectCell(selectedRow, newCol, shift)
+    } else if (e.key === 'Home') {
+      e.preventDefault()
+      selectCell(ctrl ? 0 : selectedRow, 0, shift)
+    } else if (e.key === 'End' && ctrl) {
+      e.preventDefault()
+      const used = populatedRange()
+      selectCell(used?.endRow ?? 0, used?.endCol ?? 0, shift)
+    } else if (e.key === 'PageDown' || e.key === 'PageUp') {
+      e.preventDefault()
+      const pageRows = Math.max(1, Math.floor((gridContainerEl?.clientHeight ?? 600) / scaledRowHeight) - 2)
+      const direction = e.key === 'PageDown' ? 1 : -1
+      selectCell(Math.max(0, Math.min(ROWS - 1, selectedRow + direction * pageRows)), selectedCol, shift)
     } else if (e.key === 'Enter' || e.key === 'F2') {
       e.preventDefault()
       startEdit(selectedRow, selectedCol)
-    } else if (e.key === 'Tab') {
-      e.preventDefault()
-      if (selectedCol < COLS - 1) selectCell(selectedRow, selectedCol + 1)
     } else if (e.key.length === 1 && !ctrl && !e.metaKey) {
       e.preventDefault()
       startEdit(selectedRow, selectedCol, e.key)
     }
   }
 
+  function exitGridFocus(backwards: boolean) {
+    void tick().then(() => {
+      if (!gridContainerEl) return
+      const focusable = Array.from(document.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+      )).filter((element) => element.offsetParent !== null)
+      const gridIndex = focusable.indexOf(gridContainerEl)
+      const target = focusable[gridIndex + (backwards ? -1 : 1)]
+      target?.focus()
+    })
+  }
+
   function handleFormulaBarKeydown(e: KeyboardEvent) {
+    if (replacementInProgress || closeInProgress) {
+      e.preventDefault()
+      return
+    }
     e.stopPropagation()
     if (e.key === 'Enter') {
       e.preventDefault()
-      const key = cellKey(selectedRow, selectedCol)
-      const oldValue = cellContents[key] ?? ''
-      if (formulaBarValue !== oldValue) {
-        const validationError = validationMessageForValue(selectedRow, selectedCol, formulaBarValue)
-        if (validationError) {
-          setError(validationError, 'Validation failed')
-          return
-        }
-        cellContents[key] = formulaBarValue
-        if (!formulaBarValue.startsWith('=')) {
-          cellDisplays[key] = formulaBarValue
-        }
-        queueSetCell(selectedRow, selectedCol, formulaBarValue, 'Unable to update formula bar')
-      }
+      commitFormulaBarDraft()
     }
   }
 
   function handleMouseDown(row: number, col: number, e: MouseEvent) {
+    e.preventDefault()
+    if (replacementInProgress || closeInProgress) return
     if (e.shiftKey) {
+      if (!commitActiveDrafts()) return
       selectionEnd = { row, col }
       selectedRow = row
       selectedCol = col
+      formulaBarValue = getCellValue(row, col)
+      formulaBarDraftDirty = false
     } else {
-      selectCell(row, col)
+      if (!selectCell(row, col)) return
       isSelecting = true
     }
+    focusGrid()
   }
 
   function handleMouseEnter(row: number, col: number) {
@@ -1784,24 +2117,47 @@
     const target = e.target as HTMLElement
     scrollTop = target.scrollTop
     scrollLeft = target.scrollLeft
+    gridViewportWidth = target.clientWidth
+    gridViewportHeight = target.clientHeight
   }
 
-  async function selectSheet(id: number) {
-    if (editingCell) commitEdit()
+  function selectSheet(id: number, allowDuringReplacement: boolean = false): Promise<void> {
+    if ((replacementInProgress && !allowDuringReplacement) || saveInProgress || closeInProgress) return Promise.resolve()
+    const generation = ++sheetSelectionGeneration
+    const selection = sheetSelectionTail.then(() => selectSheetInner(id, generation))
+    sheetSelectionTail = selection.catch(() => undefined)
+    return selection
+  }
+
+  async function selectSheetInner(id: number, generation: number) {
+    if (generation !== sheetSelectionGeneration) return
+    if (!commitActiveDrafts()) return
     closeCommentPanelForContextChange()
     await flushPendingMutations()
+    if (generation !== sheetSelectionGeneration) return
     closeCommentPanelForContextChange()
     saveActiveSheetFeatureState()
+    const previousSheetId = activeSheetId
+    const previousStableId = activeSheetStableId
     const selectedSheet = sheets.find((sheet) => sheet.id === id)
     activeSheetId = id
     activeSheetStableId = selectedSheet ? String(selectedSheet.stable_id) : ''
-    await invoke('set_active_sheet', { sheetId: id })
+    restoreSheetFeatureState(activeSheetStableId)
+    try {
+      await invoke('set_active_sheet', { sheetId: id })
+    } catch (error) {
+      activeSheetId = previousSheetId
+      activeSheetStableId = previousStableId
+      restoreSheetFeatureState(previousStableId)
+      throw error
+    }
+    if (generation !== sheetSelectionGeneration) return
     cellContents = {}
     cellDisplays = {}
     cellFormats = {}
-    restoreSheetFeatureState(activeSheetStableId)
     try {
       const data = await invoke<CellData[]>('get_sheet_data', { sheetId: id })
+      if (generation !== sheetSelectionGeneration) return
       const contents: Record<string, string> = {}
       const displays: Record<string, string> = {}
       const formats: CellFormatMap = {}
@@ -1888,11 +2244,9 @@
   }
 
   async function handleNewWorkbook(confirmDiscard: boolean = true) {
-    if (confirmDiscard && !canDiscardUnsavedChanges()) return
+    if (!await prepareWorkbookReplacement(confirmDiscard)) return
     const previousRecoveryId = recoveryId
     try {
-      await recoveryAutosave.cancelAndWait()
-      await flushPendingMutations()
       const result = await invoke<SheetInfo[]>('new_workbook')
       currentFilePath = null
       resetWorkbookSessionState({ clearComments: true })
@@ -1903,15 +2257,15 @@
     } catch (e) {
       resumeRecoveryIfDirty()
       setError(e, 'Failed to create workbook')
+    } finally {
+      endWorkbookReplacement()
     }
   }
 
   async function handleOpenNative() {
-    if (!canDiscardUnsavedChanges()) return
+    if (!await prepareWorkbookReplacement()) return
     const previousRecoveryId = recoveryId
     try {
-      await recoveryAutosave.cancelAndWait()
-      await flushPendingMutations()
       const path = selectedPath(await open({
         multiple: false,
         filters: [{ name: '900Sheets Workbook', extensions: ['900sheets'] }],
@@ -1931,15 +2285,15 @@
     } catch (e) {
       resumeRecoveryIfDirty()
       setError(e, 'Failed to open workbook')
+    } finally {
+      endWorkbookReplacement()
     }
   }
 
   async function handleOpenXlsx() {
-    if (!canDiscardUnsavedChanges()) return
+    if (!await prepareWorkbookReplacement()) return
     const previousRecoveryId = recoveryId
     try {
-      await recoveryAutosave.cancelAndWait()
-      await flushPendingMutations()
       const path = selectedPath(await open({
         multiple: false,
         filters: [{ name: 'Excel Workbook', extensions: ['xlsx'] }],
@@ -1948,16 +2302,19 @@
         resumeRecoveryIfDirty()
         return
       }
-      const result = await invoke<SheetInfo[]>('import_xlsx_file', { filePath: path })
+      const result = await invoke<NativeOpenResult>('import_xlsx_file', { filePath: path })
       currentFilePath = null
       resetWorkbookSessionState({ clearComments: true })
-      await loadSheetList(result)
+      restoreNativeMetadata(result.metadata)
+      await loadSheetList(result.sheets)
       const cleaned = await finishSuccessfulReplacement(previousRecoveryId)
       markDirty()
       if (cleaned) setStatus(`Opened ${filename(path)} as a replacement workbook. Save as 900Sheets to keep editing.`)
     } catch (e) {
       resumeRecoveryIfDirty()
       setError(e, 'Failed to open XLSX')
+    } finally {
+      endWorkbookReplacement()
     }
   }
 
@@ -1989,11 +2346,9 @@
   }
 
   async function handleImportJson() {
-    if (!canDiscardUnsavedChanges()) return
+    if (!await prepareWorkbookReplacement()) return
     const previousRecoveryId = recoveryId
     try {
-      await recoveryAutosave.cancelAndWait()
-      await flushPendingMutations()
       const path = selectedPath(await open({
         multiple: false,
         filters: [{ name: 'JSON', extensions: ['json'] }],
@@ -2012,12 +2367,20 @@
     } catch (e) {
       resumeRecoveryIfDirty()
       setError(e, 'Failed to open JSON')
+    } finally {
+      endWorkbookReplacement()
     }
   }
 
   async function handleSaveNative() {
+    if (saveInProgress) {
+      setStatus('A workbook save is already in progress')
+      return
+    }
+    saveInProgress = true
     try {
-      if (editingCell) commitEdit()
+      if (!commitActiveDrafts()) return
+      await sheetSelectionTail
       await recoveryAutosave.cancelAndWait()
       await flushPendingMutations()
       let path = currentFilePath
@@ -2031,19 +2394,61 @@
         resumeRecoveryIfDirty()
         return
       }
-      await invoke('export_native_file', { filePath: path, metadata: nativeMetadata() })
+      const savedGeneration = mutationGeneration
+      const savedSessionGeneration = sessionGeneration
+      const result = await invoke<NativeSaveResult>('export_native_file', {
+        filePath: path,
+        metadata: nativeMetadata(),
+      })
+      if (sessionGeneration !== savedSessionGeneration) {
+        setStatus(`The previous workbook finished saving to ${filename(path)}. The replacement workbook was not changed.`)
+        return
+      }
       currentFilePath = path
+      if (mutationGeneration !== savedGeneration) {
+        isDirty = true
+        recoveryAutosave.schedule()
+        const warning = result.backup_warning ? ` ${result.backup_warning}` : ''
+        setError(
+          `The saved file is valid, but edits made while saving are still unsaved.${warning}`,
+          `Saved ${filename(path)} with newer edits pending`,
+        )
+        return
+      }
       isDirty = false
       const pendingCleanup = recoveryCleanupPending
-      const cleaned = await cleanupRecovery(
-        recoveryId,
-        pendingCleanup?.rotateAfterCleanup ?? false,
-        'Workbook saved, but recovery cleanup failed',
-      )
-      if (cleaned) setStatus(`Saved ${filename(path)}`)
+      let cleaned = true
+      if (pendingCleanup) {
+        cleaned = await cleanupRecovery(
+          pendingCleanup.id,
+          pendingCleanup.rotateAfterCleanup,
+          'Workbook saved, but earlier recovery cleanup still failed',
+        )
+      }
+      if (cleaned) {
+        const savedRecoveryId = recoveryId
+        recoveryId = newRecoveryId()
+        cleaned = await cleanupRecovery(
+          savedRecoveryId,
+          false,
+          'Workbook saved, but recovery cleanup failed',
+        )
+      }
+      if (result.backup_warning) {
+        if (cleaned) {
+          setError(result.backup_warning, `Saved ${filename(path)}, but durability or backup maintenance needs attention`)
+        } else {
+          errorMessage = `${errorMessage} Additional save warning: ${result.backup_warning}`
+          statusMessage = ''
+        }
+      } else if (cleaned) {
+        setStatus(`Saved ${filename(path)} with a rotating local backup`)
+      }
     } catch (e) {
       resumeRecoveryIfDirty()
       setError(e, 'Failed to save workbook')
+    } finally {
+      saveInProgress = false
     }
   }
 
@@ -2060,10 +2465,32 @@
       : {}
   }
 
+  async function approveExport(
+    format: 'csv' | 'json' | 'pdf' | 'xlsx',
+    sheetId: number | null = null,
+    printArea: [number, number, number, number] | null = null,
+  ): Promise<boolean> {
+    const preflight = await invoke<ExportPreflight>('get_export_preflight', {
+      format,
+      sheetId,
+      printArea,
+    })
+    if (preflight.blocked) {
+      setError(preflight.message, `${preflight.format} export blocked`)
+      return false
+    }
+    if (preflight.estimated_dense_cells >= 1_000_000) {
+      return window.confirm(`${preflight.message}\n\nContinue with this export?`)
+    }
+    return true
+  }
+
   async function handleSaveXlsx() {
     try {
-      if (editingCell) commitEdit()
+      if (!commitActiveDrafts()) return
+      await sheetSelectionTail
       await flushPendingMutations()
+      if (!await approveExport('xlsx')) return
       const path = await save({
         defaultPath: '900Sheets.xlsx',
         filters: [{ name: 'Excel Workbook', extensions: ['xlsx'] }],
@@ -2072,7 +2499,7 @@
         resumeRecoveryIfDirty()
         return
       }
-      await invoke('export_xlsx_file', { filePath: path })
+      await invoke('export_xlsx_file', { filePath: path, metadata: nativeMetadata() })
       setStatus(`Exported ${filename(path)}`)
     } catch (e) {
       setError(e, 'Failed to save XLSX')
@@ -2081,8 +2508,10 @@
 
   async function handleExportCsv() {
     try {
-      if (editingCell) commitEdit()
+      if (!commitActiveDrafts()) return
+      await sheetSelectionTail
       await flushPendingMutations()
+      if (!await approveExport('csv', activeSheetId)) return
       const path = await save({
         defaultPath: `${sheets.find((sheet) => sheet.id === activeSheetId)?.name ?? 'Sheet'}.csv`,
         filters: [{ name: 'CSV', extensions: ['csv'] }],
@@ -2104,8 +2533,10 @@
 
   async function handleExportJson() {
     try {
-      if (editingCell) commitEdit()
+      if (!commitActiveDrafts()) return
+      await sheetSelectionTail
       await flushPendingMutations()
+      if (!await approveExport('json')) return
       const path = await save({
         defaultPath: '900Sheets.json',
         filters: [{ name: 'JSON', extensions: ['json'] }],
@@ -2123,8 +2554,12 @@
 
   async function handleExportPdf() {
     try {
-      if (editingCell) commitEdit()
+      if (!commitActiveDrafts()) return
+      await sheetSelectionTail
       await flushPendingMutations()
+      const config = defaultPrintConfig()
+      const printArea = config.print_area as [number, number, number, number] | null
+      if (!await approveExport('pdf', activeSheetId, printArea)) return
       const path = await save({
         defaultPath: `${activeSheetName()}.pdf`,
         filters: [{ name: 'PDF', extensions: ['pdf'] }],
@@ -2135,13 +2570,180 @@
       }
       await invoke('save_pdf_to_file', {
         sheetId: activeSheetId,
-        config: defaultPrintConfig(),
+        config,
         filePath: path,
       })
       setStatus(`Exported ${filename(path)}`)
     } catch (e) {
       setError(e, 'Failed to export PDF')
     }
+  }
+
+  function formatStorageSize(bytes: number): string {
+    if (bytes < 1024) return `${bytes} B`
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`
+  }
+
+  async function refreshStorageManager() {
+    try {
+      const [recoveries, backups] = await Promise.all([
+        invoke<RecoveryEntry[]>('list_recovery_snapshots'),
+        invoke<NativeBackupEntry[]>('list_native_backups', { filePath: null }),
+      ])
+      recoveryEntries = recoveries
+      backupEntries = backups
+    } catch (error) {
+      setError(error, 'Could not load recovery and backup records')
+    }
+  }
+
+  async function createBackupNow() {
+    if (!currentFilePath) {
+      setError('Save this workbook first so the backup has a source document.', 'Back Up Now unavailable')
+      return
+    }
+    try {
+      const result = await invoke<NativeBackupWriteResult>('create_native_backup', {
+        filePath: currentFilePath,
+      })
+      await refreshStorageManager()
+      if (result.rotation_warning) {
+        setError(result.rotation_warning, 'Backup created, but rotation needs attention')
+      } else {
+        setStatus(`Backed up the last saved copy of ${filename(currentFilePath)}`)
+      }
+    } catch (error) {
+      setError(error, 'Back Up Now failed')
+    }
+  }
+
+  async function inspectRecovery(entry: RecoveryEntry) {
+    try {
+      storageInspection = await invoke<RecoveryInspection>('inspect_recovery_snapshot', {
+        recoveryId: entry.id,
+      })
+      storageInspectionKind = 'recovery'
+    } catch (error) {
+      setError(error, 'Recovery inspection failed')
+    }
+  }
+
+  async function inspectBackup(entry: NativeBackupEntry) {
+    try {
+      storageInspection = await invoke<NativeBackupInspection>('inspect_native_backup', {
+        backupId: entry.id,
+      })
+      storageInspectionKind = 'backup'
+    } catch (error) {
+      setError(error, 'Backup inspection failed')
+    }
+  }
+
+  async function deleteManagedRecovery(entry: RecoveryEntry) {
+    if (!window.confirm('Delete this crash recovery snapshot? This cannot be undone.')) return
+    try {
+      await invoke('delete_recovery_snapshot', { recoveryId: entry.id })
+      if (storageInspectionKind === 'recovery' && storageInspection?.entry.id === entry.id) {
+        storageInspection = null
+        storageInspectionKind = null
+      }
+      await refreshStorageManager()
+      setStatus('Recovery snapshot deleted')
+    } catch (error) {
+      setError(error, 'Recovery deletion failed')
+    }
+  }
+
+  async function deleteManagedBackup(entry: NativeBackupEntry) {
+    if (!window.confirm('Delete this saved-workbook backup? This cannot be undone.')) return
+    try {
+      await invoke('delete_native_backup', { backupId: entry.id })
+      if (storageInspectionKind === 'backup' && storageInspection?.entry.id === entry.id) {
+        storageInspection = null
+        storageInspectionKind = null
+      }
+      await refreshStorageManager()
+      setStatus('Native backup deleted')
+    } catch (error) {
+      setError(error, 'Backup deletion failed')
+    }
+  }
+
+  async function restoreManagedRecovery(entry: RecoveryEntry) {
+    if (!await prepareWorkbookReplacement()) return
+    try {
+      const result = await invoke<NativeOpenResult>('restore_recovery_snapshot', {
+        recoveryId: entry.id,
+      })
+      currentFilePath = null
+      resetWorkbookSessionState({ clearComments: true })
+      restoreNativeMetadata(result.metadata)
+      await loadSheetList(result.sheets)
+      recoveryId = entry.id
+      canUndo = false
+      canRedo = false
+      markDirty()
+      closePanel()
+      setStatus('Restored crash recovery. Save the workbook to keep it.')
+    } catch (error) {
+      resumeRecoveryIfDirty()
+      setError(error, 'Recovery restore failed')
+    } finally {
+      endWorkbookReplacement()
+    }
+  }
+
+  async function restoreManagedBackup(entry: NativeBackupEntry) {
+    if (!await prepareWorkbookReplacement()) return
+    const previousRecoveryId = recoveryId
+    try {
+      const result = await invoke<NativeOpenResult>('restore_native_backup', {
+        backupId: entry.id,
+      })
+      currentFilePath = null
+      resetWorkbookSessionState({ clearComments: true })
+      restoreNativeMetadata(result.metadata)
+      await loadSheetList(result.sheets)
+      const cleaned = await finishSuccessfulReplacement(previousRecoveryId)
+      canUndo = false
+      canRedo = false
+      markDirty()
+      closePanel()
+      if (cleaned) setStatus(`Restored backup of ${entry.document_name}. Save as a workbook to keep it.`)
+    } catch (error) {
+      resumeRecoveryIfDirty()
+      setError(error, 'Backup restore failed')
+    } finally {
+      endWorkbookReplacement()
+    }
+  }
+
+  function updateAutosaveDelay(value: string) {
+    const delay = Number(value)
+    if (!Number.isFinite(delay) || delay < 250) return
+    autosaveDelay = delay
+    recoveryAutosave.setDelay(delay)
+    try {
+      localStorage.setItem('900sheets.autosave-delay', String(delay))
+    } catch (error) {
+      console.warn('Unable to persist autosave preference', error)
+    }
+    setStatus(`Crash recovery delay set to ${(delay / 1000).toFixed(delay < 1000 ? 2 : 0)} seconds`)
+  }
+
+  function finishFirstRun() {
+    try {
+      completeFirstRun(localStorage)
+    } catch (error) {
+      console.warn('Unable to persist first-run completion', error)
+    }
+    showFirstRun = false
+    focusGrid()
+  }
+
+  async function chooseFirstRunTemplate(templateId: string) {
+    if (await applyTemplate(templateId)) finishFirstRun()
   }
 
   async function runFind() {
@@ -2186,6 +2788,7 @@
 
   async function runChart() {
     const r = normalizeRange(currentRange)
+    if (!allowDenseRange(r, 'Create chart')) return
     const xCol = Number(chartXColumn)
     const yCol = Number(chartYColumn)
     if (xCol === yCol || r.startRow === r.endRow) {
@@ -2275,6 +2878,7 @@
 
   async function runPivotSheet() {
     const r = normalizeRange(currentRange)
+    if (!allowDenseRange(r, 'Create pivot table')) return
     if (r.startRow === r.endRow || r.startCol === r.endCol) {
       setError('Select a table with headers, row labels, and at least one value column', 'Pivot unavailable')
       return
@@ -2338,6 +2942,7 @@
 
   async function applyFilter() {
     const r = normalizeRange(currentRange)
+    if (!allowDenseRange({ ...r, startCol: r.startCol, endCol: r.startCol }, 'Filter rows')) return
     const col = Number(filterColumn || r.startCol)
     if (!Number.isInteger(col) || col < r.startCol || col > r.endCol) {
       setError('Choose a filter column inside the selected range', 'Filter failed')
@@ -2369,6 +2974,7 @@
 
   async function removeDuplicateRows() {
     const r = normalizeRange(currentRange)
+    if (!allowDenseRange(r, 'Remove duplicates')) return
     if (r.endRow <= r.startRow) {
       setError('Select at least two rows before removing duplicates', 'Remove duplicates failed')
       return
@@ -2463,14 +3069,49 @@
 
   function selectRange(range: CellRange) {
     const r = normalizeRange(range)
+    if (hiddenRows[r.startRow]) {
+      setStatus(`Row ${r.startRow + 1} is hidden by the active filter`)
+      return
+    }
     selectedRow = r.startRow
     selectedCol = r.startCol
     selectionStart = { row: r.startRow, col: r.startCol }
     selectionEnd = { row: r.endRow, col: r.endCol }
     formulaBarValue = getCellValue(r.startRow, r.startCol)
-    if (gridContainerEl) {
-      gridContainerEl.scrollTop = Math.max(0, r.startRow * ROW_HEIGHT - ROW_HEIGHT * 2)
-      gridContainerEl.scrollLeft = Math.max(0, r.startCol * COL_WIDTH - COL_WIDTH)
+    formulaBarDraftDirty = false
+    goToValue = rangeLabel(r)
+    revealCell(r.startRow, r.startCol)
+    focusGrid()
+  }
+
+  function goToAddress() {
+    const range = parseA1Range(goToValue)
+    if (!range) {
+      setError(`${translate(locale, 'goToHint')}.`, 'Go To failed')
+      goToInputEl?.focus()
+      goToInputEl?.select()
+      return
+    }
+    if (hiddenRows[range.startRow]) {
+      setError(`Row ${range.startRow + 1} is hidden by the active filter. Clear the filter or choose a visible row.`, 'Go To failed')
+      goToInputEl?.focus()
+      goToInputEl?.select()
+      return
+    }
+    errorMessage = ''
+    selectRange(range)
+    setStatus(`${translate(locale, 'activeCell')}: ${rangeLabel(range)}`)
+  }
+
+  function handleGoToKeydown(event: KeyboardEvent) {
+    event.stopPropagation()
+    if (event.key === 'Enter') {
+      event.preventDefault()
+      goToAddress()
+    } else if (event.key === 'Escape') {
+      event.preventDefault()
+      goToValue = rangeLabel(currentRange)
+      focusGrid()
     }
   }
 
@@ -2548,6 +3189,21 @@
   }
 
   async function freezePanesAtSelection() {
+    const scale = zoomPercent / 100
+    const viewportHeight = gridContainerEl?.clientHeight ?? gridViewportHeight
+    const viewportWidth = gridContainerEl?.clientWidth ?? gridViewportWidth
+    const viewportRowLimit = Math.max(0, Math.floor((viewportHeight - HEADER_HEIGHT * scale) / (ROW_HEIGHT * scale)) - 2)
+    const viewportColLimit = Math.max(0, Math.floor((viewportWidth - ROW_HEADER_WIDTH * scale) / (COL_WIDTH * scale)) - 2)
+    const rowLimit = Math.min(MAX_FROZEN_ROWS, viewportRowLimit)
+    const colLimit = Math.min(MAX_FROZEN_COLUMNS, viewportColLimit)
+    if (selectedRow > rowLimit) {
+      setError(`Freeze panes can keep at most ${rowLimit} rows frozen in the current viewport. Choose an earlier row or enlarge the window.`, 'Freeze panes failed')
+      return
+    }
+    if (selectedCol > colLimit) {
+      setError(`Freeze panes can keep at most ${colLimit} columns frozen in the current viewport. Choose an earlier column or enlarge the window.`, 'Freeze panes failed')
+      return
+    }
     const changed = await applyMetadataChange(() => {
       frozenRowCount = selectedRow
       frozenColCount = selectedCol
@@ -2564,25 +3220,22 @@
     if (changed) setStatus('Panes unfrozen')
   }
 
-  async function applyTemplate(key: string) {
-    const template = TEMPLATES[key]
-    if (!template) return
+  async function applyTemplate(key: string): Promise<boolean> {
+    const template = STARTER_TEMPLATES.find((candidate) => candidate.id === key)
+    if (!template) return false
     const start = normalizeRange(currentRange)
-    const changes: Array<{ row: number; col: number; value: string }> = []
-    for (let row = 0; row < template.rows.length; row++) {
-      for (let col = 0; col < template.rows[row].length; col++) {
-        changes.push({
-          row: start.startRow + row,
-          col: start.startCol + col,
-          value: template.rows[row][col],
-        })
+    try {
+      const changes = templateCellChanges(key, start.startRow, start.startCol)
+      if (!await applyCellValueChanges(changes, 'Template insert failed', `Inserted ${template.title} template`)) return false
+      selectionStart = { row: start.startRow, col: start.startCol }
+      selectionEnd = {
+        row: start.startRow + template.rows.length - 1,
+        col: start.startCol + Math.max(...template.rows.map((row) => row.length)) - 1,
       }
-    }
-    await applyCellValueChanges(changes, 'Template insert failed', `Inserted ${template.title} template`)
-    selectionStart = { row: start.startRow, col: start.startCol }
-    selectionEnd = {
-      row: start.startRow + template.rows.length - 1,
-      col: start.startCol + template.rows[0].length - 1,
+      return true
+    } catch (error) {
+      setError(error, 'Template insert failed')
+      return false
     }
   }
 
@@ -2614,6 +3267,7 @@
     if (value.startsWith('=')) return null
     if (!value.trim()) return validation.allow_blank ? null : 'Value is required'
     if (validation.validation_type === 'List') {
+      if ((validation.source ?? '').startsWith('=')) return null
       const allowed = (validation.source ?? '').split(',').map((entry) => entry.trim()).filter(Boolean)
       return allowed.some((entry) => entry.toLowerCase() === value.trim().toLowerCase())
         ? null
@@ -2657,6 +3311,7 @@
 
   async function runValidation() {
     const r = normalizeRange(currentRange)
+    if (!allowDenseRange(r, 'Validate range')) return
     try {
       validationResults = await invoke<ValidationErrorData[]>('validate_range_cmd', {
         sheetId: activeSheetId,
@@ -2674,6 +3329,7 @@
   async function saveValidationRule() {
     const label = validationRuleName.trim() || `Validation ${validationRules.length + 1}`
     const r = normalizeRange(currentRange)
+    if (!allowDenseRange(r, 'Save validation rule')) return
     const rule: StoredValidationRule = {
       id: `validation-${Date.now()}`,
       label,
@@ -2758,25 +3414,36 @@
         return text !== ''
       case 'Duplicate': {
         if (!text) return false
-        let matches = 0
-        for (let r = range.startRow; r <= range.endRow; r++) {
-          for (let c = range.startCol; c <= range.endCol; c++) {
-            if ((getCellValue(r, c) || '').trim().toLowerCase() === text.toLowerCase()) {
-              matches += 1
-              if (matches > 1) return true
-            }
-          }
-        }
-        return false
+        return (duplicateValueCounts[rule.id]?.get(text.toLowerCase()) ?? 0) > 1
       }
       default:
         return false
     }
   }
 
+  function buildDuplicateValueCounts(): Record<string, Map<string, number>> {
+    const result: Record<string, Map<string, number>> = {}
+    for (const stored of conditionalRules) {
+      if (stored.rule.condition_type !== 'Duplicate') continue
+      const range = tupleToRange(stored.rule.range)
+      const counts = new Map<string, number>()
+      for (const [key, raw] of Object.entries(cellContents)) {
+        const value = raw.trim().toLowerCase()
+        if (!value) continue
+        const { row, col } = parseCellKey(key)
+        if (!cellInRange(range, row, col)) continue
+        counts.set(value, (counts.get(value) ?? 0) + 1)
+      }
+      result[stored.rule.id] = counts
+    }
+    return result
+  }
+
   async function applyConditionalFormat() {
     try {
       const rule = buildConditionalRule()
+      const range = tupleToRange(rule.range)
+      if (!allowDenseRange(range, 'Conditional formatting')) return
       const matches = await invoke<Array<[number, number]>>('find_conditional_format_matches', {
         sheetId: activeSheetId,
         rule,
@@ -2840,6 +3507,7 @@
 
   async function setRangeLock(locked: boolean) {
     const r = normalizeRange(currentRange)
+    if (!allowDenseRange(r, locked ? 'Lock range' : 'Unlock range')) return
     try {
       await runWorkbookTransaction(() => invoke('lock_cell_range', {
         sheetId: activeSheetId,
@@ -2956,6 +3624,10 @@
   }
 
   async function executeMenuAction(action: MenuAction) {
+    if (replacementInProgress || closeInProgress) {
+      setStatus('Wait for the workbook replacement to finish')
+      return
+    }
     closePopovers()
     switch (action) {
       case 'newWorkbook': return handleNewWorkbook()
@@ -3020,6 +3692,8 @@
       case 'unlockRange': return setRangeLock(false)
       case 'goalSeek': return openPanel('goalSeek')
       case 'shortcuts': return openPanel('shortcuts')
+      case 'storage': return openPanel('storage')
+      case 'locale': return openPanel('locale')
       case 'about': return openPanel('about')
       case 'notReady': setStatus('This workflow is planned but not wired yet'); return
     }
@@ -3040,6 +3714,7 @@
             `Restore recovery ${index + 1} of ${recoveries.length} from ${new Date(entry.modified_millis).toLocaleString()}?\n\nCancel discards this recovery and shows the next one.`
           )
           if (restore) {
+            if (!await prepareWorkbookReplacement(false)) continue
             try {
               recoveryId = entry.id
               const result = await invoke<NativeOpenResult>('restore_recovery_snapshot', {
@@ -3056,6 +3731,8 @@
             } catch (error) {
               window.alert(`Recovery could not be restored: ${describeError(error)}`)
               continue
+            } finally {
+              endWorkbookReplacement()
             }
           }
           await invoke('discard_recovery_snapshot', { recoveryId: entry.id })
@@ -3069,14 +3746,22 @@
   }
 
   let removeCloseListener: (() => void) | null = null
-  let closeInProgress = false
-
   async function handleAppClose(event: { preventDefault: () => void }) {
-    if (closeInProgress) return
     event.preventDefault()
+    if (closeInProgress) return
+    if (replacementInProgress || saveInProgress) {
+      setStatus(replacementInProgress
+        ? 'Wait for the workbook replacement to finish before closing'
+        : 'Wait for the workbook save to finish before closing')
+      return
+    }
     closeInProgress = true
     try {
-      if (editingCell) commitEdit()
+      if (!commitActiveDrafts()) {
+        closeInProgress = false
+        return
+      }
+      await sheetSelectionTail
       await recoveryAutosave.cancelAndWait()
       await flushPendingMutations()
       if (isDirty) await recoveryAutosave.runNow()
@@ -3091,19 +3776,48 @@
   }
 
   onMount(() => {
+    try {
+      const storedLocale = localStorage.getItem('900sheets.locale')
+      if (isAppLocale(storedLocale)) locale = storedLocale
+      const storedDelay = Number(localStorage.getItem('900sheets.autosave-delay'))
+      if (Number.isFinite(storedDelay) && storedDelay >= 250 && storedDelay <= 60_000) {
+        autosaveDelay = storedDelay
+        recoveryAutosave.setDelay(storedDelay)
+      }
+    } catch (error) {
+      console.warn('Unable to read locale preference', error)
+    }
     const warnBeforeClose = (event: BeforeUnloadEvent) => {
-      if (!isDirty) return
+      if (!isDirty && !formulaBarDraftDirty && !editingCell) return
       event.preventDefault()
       event.returnValue = ''
     }
     window.addEventListener('beforeunload', warnBeforeClose)
+    const resizeObserver = new ResizeObserver(() => {
+      if (gridContainerEl) {
+        gridViewportWidth = gridContainerEl.clientWidth
+        gridViewportHeight = gridContainerEl.clientHeight
+      }
+    })
+    if (gridContainerEl) resizeObserver.observe(gridContainerEl)
     void getCurrentWindow()
       .onCloseRequested(handleAppClose)
       .then((remove) => { removeCloseListener = remove })
       .catch((error) => console.error('Unable to register close recovery handler', error))
-    void initializeWorkbook()
+    void initializeWorkbook().finally(() => {
+      try {
+        showFirstRun = shouldShowFirstRun(localStorage)
+      } catch (error) {
+        console.warn('Unable to read first-run preference', error)
+        showFirstRun = true
+      }
+      if (showFirstRun) {
+        void tick().then(() => panelEl?.querySelector<HTMLElement>('button')?.focus())
+      }
+    })
     return () => {
       window.removeEventListener('beforeunload', warnBeforeClose)
+      resizeObserver.disconnect()
       removeCloseListener?.()
       void recoveryAutosave.cancelAndWait()
     }
@@ -3113,7 +3827,14 @@
 <svelte:window onkeydown={handleKeydown} onmouseup={handleMouseUp} onclick={closePopovers} />
 
 <div class="app" class:compact={compactControls} class:no-gridlines={!showGridlines}>
-  <div class="toolbar">
+  {#if replacementInProgress || closeInProgress}
+    <div class="modal-backdrop" role="status" aria-live="assertive" aria-label={closeInProgress ? 'Workbook close in progress' : 'Workbook replacement in progress'}>
+      <div class="panel" aria-busy="true">
+        <div class="panel-body"><p>{closeInProgress ? 'Preserving the latest edits before closing. Editing is paused.' : 'Replacing the workbook. Editing is paused until validation finishes.'}</p></div>
+      </div>
+    </div>
+  {/if}
+  <div class="toolbar" inert={replacementInProgress || closeInProgress} aria-hidden={replacementInProgress || closeInProgress}>
     <span class="app-title">900Sheets{isDirty ? ' •' : ''}</span>
     <nav class="menu-bar" aria-label="Application menus">
       {#each MENU_DEFINITIONS as menu}
@@ -3159,7 +3880,11 @@
     </div>
   </div>
 
-  <div class="format-toolbar">
+  {#if recoveryAutosaveFailureMessage}
+    <div class="recovery-warning" role="alert">{recoveryAutosaveFailureMessage}</div>
+  {/if}
+
+  <div class="format-toolbar" inert={replacementInProgress || closeInProgress} aria-hidden={replacementInProgress || closeInProgress}>
     <div class="ribbon-group">
       <button type="button" class="fmt-btn fx-btn" onclick={(e) => { e.stopPropagation(); toggleFormulaMenu(e) }} title="Insert function">fx ▾</button>
       <button type="button" class="fmt-btn" onclick={() => openPanel('functions')} title="Function browser">Functions</button>
@@ -3296,34 +4021,68 @@
   {/if}
 
   {#if showFormulaBar}
-    <div class="formula-bar">
-      <span class="cell-ref">{rangeLabel(currentRange)}</span>
+    <div class="formula-bar" inert={replacementInProgress || closeInProgress} aria-hidden={replacementInProgress || closeInProgress}>
+      <input
+        class="cell-ref go-to-input"
+        type="text"
+        bind:this={goToInputEl}
+        bind:value={goToValue}
+        aria-label={translate(locale, 'goTo')}
+        title={`${translate(locale, 'goTo')} (Ctrl+G or F5)`}
+        onfocus={(event) => event.currentTarget.select()}
+        onkeydown={handleGoToKeydown}
+      />
       <span class="fx">fx</span>
       <input
         type="text"
         bind:value={formulaBarValue}
+        oninput={() => { formulaBarDraftDirty = true }}
         onkeydown={handleFormulaBarKeydown}
         placeholder="Enter value or formula"
+        aria-label="Formula bar"
       />
     </div>
   {/if}
 
-  <div class="grid-container" style="--grid-zoom: {zoomPercent / 100};" role="grid" aria-rowcount={ROWS} aria-colcount={COLS} tabindex="-1" bind:this={gridContainerEl} onscroll={handleScroll} onmousemove={handleGridMouseMove} onkeydown={handleGridKeydown}>
+  <p id="grid-keyboard-help" class="sr-only">Use arrow keys to move, Shift plus arrow keys to extend the selection, Enter or F2 to edit, and Ctrl+G or F5 to go to an address.</p>
+  <div
+    class="grid-container"
+    inert={replacementInProgress || closeInProgress}
+    aria-hidden={replacementInProgress || closeInProgress}
+    style="--grid-zoom: {zoomPercent / 100};"
+    role="grid"
+    aria-label={translate(locale, 'grid')}
+    aria-describedby="grid-keyboard-help"
+    aria-rowcount={ROWS}
+    aria-colcount={COLS}
+    aria-activedescendant={cellDomId(selectedRow, selectedCol)}
+    tabindex="0"
+    bind:this={gridContainerEl}
+    onscroll={handleScroll}
+    onmousemove={handleGridMouseMove}
+    onkeydown={handleGridKeydown}
+  >
     <div
       class="grid"
-      style="grid-template-columns: {COL_WIDTH * 0.6}px repeat({COLS}, {COL_WIDTH}px); height: {HEADER_HEIGHT + displayedRows.length * ROW_HEIGHT}px;"
+      style="grid-template-columns: {gridTemplateColumns};"
     >
-      <div class="corner-cell"></div>
-      {#each Array(COLS) as _, c}
-        <div class="col-header" style={getColHeaderStyle(c)}>{colLabel(c)}</div>
+      <div class="corner-cell" aria-hidden="true"></div>
+      {#each renderedFrozenCols as c}
+        <div class="col-header" role="columnheader" aria-colindex={c + 1} style={getColHeaderStyle(c)}>{colLabel(c)}</div>
       {/each}
+      <div class="col-window-spacer header-spacer" style="width: {leftColSpacerWidth}px;" aria-hidden="true"></div>
+      {#each visibleCols as c}
+        <div class="col-header" role="columnheader" aria-colindex={c + 1}>{colLabel(c)}</div>
+      {/each}
+      <div class="col-window-spacer header-spacer" style="width: {rightColSpacerWidth}px;" aria-hidden="true"></div>
 
-      <div class="grid-spacer" style="height: {visibleRowStart * ROW_HEIGHT}px;"></div>
+      <div class="grid-spacer" style="height: {visibleRowStart * SCROLL_ROW_PITCH}px;"></div>
 
       {#each visibleRows as r}
-        <div class="row-header" style={getRowHeaderStyle(r)}>{r + 1}</div>
-        {#each Array(COLS) as _, c}
+        <div class="row-header" role="rowheader" aria-rowindex={r + 1} style={getRowHeaderStyle(r)}>{r + 1}</div>
+        {#each renderedFrozenCols as c}
           <button
+            id={cellDomId(r, c)}
             type="button"
             class="cell"
             class:selected={isInSelection(r, c)}
@@ -3333,8 +4092,11 @@
             onmouseenter={() => handleMouseEnter(r, c)}
             ondblclick={() => startEdit(r, c)}
             role="gridcell"
+            aria-rowindex={r + 1}
+            aria-colindex={c + 1}
             aria-label={cellAccessibleName(r, c)}
             aria-selected={selectedRow === r && selectedCol === c}
+            tabindex="-1"
             title={`${cellKey(r, c)}: ${getCellDisplay(r, c) || 'blank'}`}
             style="height: {ROW_HEIGHT}px; {getCellStyle(r, c)}"
           >
@@ -3351,16 +4113,51 @@
             {/if}
           </button>
         {/each}
+        <div class="col-window-spacer" style="width: {leftColSpacerWidth}px; height: {ROW_HEIGHT}px;" aria-hidden="true"></div>
+        {#each visibleCols as c}
+          <button
+            id={cellDomId(r, c)}
+            type="button"
+            class="cell"
+            class:selected={isInSelection(r, c)}
+            class:active={selectedRow === r && selectedCol === c}
+            onmousedown={(e) => handleMouseDown(r, c, e)}
+            onmouseenter={() => handleMouseEnter(r, c)}
+            ondblclick={() => startEdit(r, c)}
+            role="gridcell"
+            aria-rowindex={r + 1}
+            aria-colindex={c + 1}
+            aria-label={cellAccessibleName(r, c)}
+            aria-selected={selectedRow === r && selectedCol === c}
+            tabindex="-1"
+            title={`${cellKey(r, c)}: ${getCellDisplay(r, c) || translate(locale, 'blank')}`}
+            style="height: {ROW_HEIGHT}px; {getCellStyle(r, c)}"
+          >
+            {#if editingCell === cellKey(r, c)}
+              <input
+                type="text"
+                bind:value={editValue}
+                onblur={commitEdit}
+                use:focusInput={editFocusOptions}
+                class="cell-input"
+                aria-label={`${translate(locale, 'cell')} ${cellKey(r, c)}`}
+              />
+            {:else}
+              <span class="cell-value">{getCellDisplay(r, c)}</span>
+            {/if}
+          </button>
+        {/each}
+        <div class="col-window-spacer" style="width: {rightColSpacerWidth}px; height: {ROW_HEIGHT}px;" aria-hidden="true"></div>
       {/each}
 
-      <div class="grid-spacer" style="height: {Math.max(0, (scrollableDisplayRows.length - visibleRowEnd) * ROW_HEIGHT)}px;"></div>
+      <div class="grid-spacer" style="height: {Math.max(0, (scrollableDisplayRowCount - visibleRowEnd) * SCROLL_ROW_PITCH)}px;"></div>
     </div>
     {#if isMultiSelection}
       <div class="selection-label">{selectionLabel}</div>
     {/if}
   </div>
 
-  <div class="sheet-tabs">
+  <div class="sheet-tabs" inert={replacementInProgress || closeInProgress} aria-hidden={replacementInProgress || closeInProgress}>
     {#each sheets as sheet}
       <div class="sheet-tab-wrapper">
         {#if renamingSheetId === sheet.id}
@@ -3395,7 +4192,7 @@
     <button type="button" class="sheet-tab-add" onclick={handleAddSheet} title="Add sheet">+</button>
   </div>
 
-  <div class="status-bar">
+  <div class="status-bar" inert={replacementInProgress || closeInProgress} aria-hidden={replacementInProgress || closeInProgress}>
     <span>{activeSheetName()}</span>
     <span>{rangeLabel(currentRange)}</span>
     {#if activeFilterLabel}
@@ -3415,9 +4212,49 @@
     <span>{zoomPercent}%</span>
   </div>
 
+  {#if showFirstRun && !activePanel}
+    <div class="modal-backdrop" role="presentation">
+      <div class="panel" role="dialog" aria-modal="true" aria-labelledby="first-run-title" tabindex="-1" bind:this={panelEl} onkeydown={handleFirstRunKeydown}>
+        <header class="panel-header">
+          <div>
+            <p class="panel-kicker">Welcome</p>
+            <h2 id="first-run-title">Make a useful workbook</h2>
+          </div>
+        </header>
+        <div class="panel-body form-grid">
+          {#each FIRST_RUN_STEPS as step}
+            <div class="panel-note"><strong>{step.title}</strong><br />{step.detail}</div>
+          {/each}
+          <div class="template-grid">
+            {#each STARTER_TEMPLATES as template}
+              <button type="button" class="template-card" onclick={() => chooseFirstRunTemplate(template.id)}>
+                <span>{template.title}</span>
+                <small>{template.summary}</small>
+              </button>
+            {/each}
+          </div>
+          <div class="panel-actions">
+            <button type="button" class="secondary-btn" onclick={finishFirstRun}>Continue with a blank workbook</button>
+            <button type="button" class="secondary-btn" onclick={() => { finishFirstRun(); openPanel('shortcuts') }}>Keyboard shortcuts</button>
+          </div>
+          <p class="panel-note">This preference stays on this computer. No account, analytics identifier, or workbook content is sent anywhere.</p>
+        </div>
+      </div>
+    </div>
+  {/if}
+
   {#if activePanel}
     <div class="modal-backdrop" role="presentation" onclick={closePanel}>
-      <section class="panel" role="dialog" aria-modal="true" tabindex="-1" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
+      <div
+        class="panel"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="active-panel-title"
+        tabindex="-1"
+        bind:this={panelEl}
+        onclick={(e) => e.stopPropagation()}
+        onkeydown={handlePanelKeydown}
+      >
         <header class="panel-header">
           <div>
             <p class="panel-kicker">
@@ -3435,9 +4272,11 @@
               {:else if activePanel === 'protection'}Tools
               {:else if activePanel === 'comment'}Review
               {:else if activePanel === 'goalSeek'}Tools
+              {:else if activePanel === 'storage'}Tools
+              {:else if activePanel === 'locale'}Tools
               {:else}Help{/if}
             </p>
-            <h2>
+            <h2 id="active-panel-title">
               {#if activePanel === 'functions'}Function Browser
               {:else if activePanel === 'find'}Find and Replace
               {:else if activePanel === 'chart'}Chart Builder
@@ -3453,6 +4292,8 @@
               {:else if activePanel === 'comment'}Cell Comment
               {:else if activePanel === 'goalSeek'}Goal Seek
               {:else if activePanel === 'shortcuts'}Keyboard Shortcuts
+              {:else if activePanel === 'storage'}Recovery and Backups
+              {:else if activePanel === 'locale'}Locale Settings
               {:else}About 900Sheets{/if}
             </h2>
           </div>
@@ -3728,9 +4569,10 @@
           <div class="panel-body form-grid">
             <p class="panel-note">Templates insert practical starter tables at the current selection.</p>
             <div class="template-grid">
-              {#each Object.entries(TEMPLATES) as [key, template]}
-                <button type="button" class="template-card" onclick={() => applyTemplate(key)}>
+              {#each STARTER_TEMPLATES as template}
+                <button type="button" class="template-card" onclick={() => applyTemplate(template.id)}>
                   <span>{template.title}</span>
+                  <small>{template.summary}</small>
                   <small>{template.rows.length} rows × {template.rows[0].length} columns</small>
                 </button>
               {/each}
@@ -3860,12 +4702,90 @@
             <span>Ctrl+C / X / V</span><span>Copy, cut, paste</span>
             <span>Ctrl+B / I / U</span><span>Bold, italic, underline</span>
             <span>Ctrl+F</span><span>Find and replace</span>
+            <span>Ctrl+G / F5</span><span>Go to cell or range</span>
+            <span>Home / Ctrl+Home</span><span>Start of row or sheet</span>
+            <span>Page Up / Page Down</span><span>Move by one viewport</span>
             <span>Delete</span><span>Clear selection</span>
             <span>F2</span><span>Edit active cell</span>
           </div>
+        {:else if activePanel === 'storage'}
+          <div class="panel-body form-grid">
+            <label>Crash recovery delay
+              <select class="panel-input" value={String(autosaveDelay)} onchange={(event) => updateAutosaveDelay(event.currentTarget.value)}>
+                <option value="750">0.75 seconds</option>
+                <option value="2000">2 seconds</option>
+                <option value="5000">5 seconds</option>
+                <option value="15000">15 seconds</option>
+              </select>
+            </label>
+            <p class="panel-note">Crash recoveries protect unsaved edits. Native backups are separate saved-workbook copies, rotated to five per document after successful saves.</p>
+            <div class="panel-actions">
+              <button type="button" class="secondary-btn" onclick={refreshStorageManager}>Refresh</button>
+              <button type="button" class="primary-btn" onclick={createBackupNow} disabled={!currentFilePath}>Back Up Now</button>
+            </div>
+            <p class="panel-note">Back Up Now copies the last saved native workbook. Save current edits first if they should be included.</p>
+            <h3>Crash recoveries</h3>
+            {#if recoveryEntries.length === 0}
+              <p class="panel-note">No crash recovery snapshots are retained.</p>
+            {:else}
+              <div class="result-list">
+                {#each recoveryEntries as entry}
+                  <div class="rule-row">
+                    <button type="button" class="result-row" onclick={() => inspectRecovery(entry)}>
+                      <span>{new Date(entry.modified_millis).toLocaleString()}</span>
+                      <span>{formatStorageSize(entry.size_bytes)}</span>
+                    </button>
+                    <button type="button" class="secondary-btn" onclick={() => restoreManagedRecovery(entry)}>Restore</button>
+                    <button type="button" class="icon-btn small" onclick={() => deleteManagedRecovery(entry)} aria-label="Delete recovery">×</button>
+                  </div>
+                {/each}
+              </div>
+            {/if}
+            <h3>Saved-workbook backups</h3>
+            {#if backupEntries.length === 0}
+              <p class="panel-note">No native backups are retained yet. Save a .900sheets workbook to create one.</p>
+            {:else}
+              <div class="result-list">
+                {#each backupEntries as entry}
+                  <div class="rule-row">
+                    <button type="button" class="result-row" onclick={() => inspectBackup(entry)}>
+                      <span>{entry.document_name}</span>
+                      <span>{new Date(entry.created_millis).toLocaleString()} · {formatStorageSize(entry.size_bytes)}</span>
+                    </button>
+                    <button type="button" class="secondary-btn" onclick={() => restoreManagedBackup(entry)}>Restore copy</button>
+                    <button type="button" class="icon-btn small" onclick={() => deleteManagedBackup(entry)} aria-label="Delete backup">×</button>
+                  </div>
+                {/each}
+              </div>
+            {/if}
+            {#if storageInspection}
+              <div class="panel-note" role="status">
+                <strong>{storageInspectionKind === 'recovery' ? 'Recovery' : 'Backup'} inspection:</strong>
+                {storageInspection.sheets.length} sheet{storageInspection.sheets.length === 1 ? '' : 's'}:
+                {storageInspection.sheets.map((sheet) => sheet.name).join(', ')}.
+                Inspection does not change the open workbook.
+              </div>
+            {/if}
+          </div>
+        {:else if activePanel === 'locale'}
+          <div class="panel-body form-grid">
+            <label>{translate(locale, 'language')}
+              <select
+                class="panel-input"
+                aria-label={translate(locale, 'language')}
+                value={locale}
+                onchange={(event) => updateLocale(event.currentTarget.value)}
+              >
+                {#each APP_LOCALES as option}
+                  <option value={option.code}>{option.label}</option>
+                {/each}
+              </select>
+            </label>
+            <p class="panel-note">English, Swedish, and Spanish are verified for grid navigation and core accessibility labels. Workbook content is never translated.</p>
+          </div>
         {:else if activePanel === 'about'}
           <div class="panel-body">
-            <p class="panel-note">Version 0.4.0</p>
+            <p class="panel-note">Version 0.5.0</p>
             <p class="panel-note">900Sheets is a local-first spreadsheet editor from 900 Labs. It works without an account or subscription and keeps workbook processing on your computer.</p>
             <p class="panel-note">900 Labs builds enterprise-grade open-source tools for people and communities priced out of modern software, especially in developing economies. 900Sheets is part of that work.</p>
             <p class="panel-note">Create or edit a workbook in the grid, use cross-sheet formulas when needed, then choose File &gt; Save Workbook to keep an editable .900sheets file. Open XLSX or JSON as a replacement workbook, import CSV into the active sheet, and use export commands for exchange files. Unsaved edits receive local recovery snapshots.</p>
@@ -3877,7 +4797,7 @@
             </div>
           </div>
         {/if}
-      </section>
+      </div>
     </div>
   {/if}
 </div>

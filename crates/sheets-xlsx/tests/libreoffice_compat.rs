@@ -1,5 +1,5 @@
-use sheets_core::format::CellFormat;
-use sheets_core::workbook::Workbook;
+use sheets_fixtures::community_budget_compatibility_fixture;
+use sheets_xlsx::{XlsxDocument, XlsxSheetFeatures};
 use std::process::Command;
 
 #[test]
@@ -20,14 +20,20 @@ fn libreoffice_can_open_and_resave_exported_workbook() {
     std::fs::create_dir_all(&profile_dir).unwrap();
     let source = root.join("compat.xlsx");
 
-    let mut workbook = Workbook::new();
-    let sheet = workbook.sheet_mut(0).unwrap();
-    sheet.set_cell_value(0, 0, "Value".into());
-    sheet.set_cell_value(0, 1, "Double".into());
-    sheet.set_cell_value(1, 0, "21".into());
-    sheet.set_cell_value(1, 1, "=A2*2".into());
-    sheet.set_format(0, 0, CellFormat::new().bold(true).bg_color("#DDEEFF"));
-    std::fs::write(&source, sheets_xlsx::export_workbook(&workbook).unwrap()).unwrap();
+    let fixture = community_budget_compatibility_fixture();
+    let document = XlsxDocument {
+        workbook: fixture.workbook,
+        sheet_features: fixture
+            .validations
+            .into_iter()
+            .zip(fixture.conditional_formats)
+            .map(|(validations, conditional_formats)| XlsxSheetFeatures {
+                validations,
+                conditional_formats,
+            })
+            .collect(),
+    };
+    std::fs::write(&source, sheets_xlsx::export_document(&document).unwrap()).unwrap();
 
     let profile_url = format!("file://{}", profile_dir.display());
     let result = Command::new("soffice")
@@ -44,19 +50,27 @@ fn libreoffice_can_open_and_resave_exported_workbook() {
     );
 
     let converted = std::fs::read(output_dir.join("compat.xlsx")).unwrap();
-    let reopened = sheets_xlsx::import_workbook(&converted).unwrap();
+    let reopened = sheets_xlsx::import_document(&converted).unwrap();
     assert_eq!(
-        reopened.sheet(0).unwrap().cell_value(1, 0),
-        Some("21".into())
+        reopened.workbook.sheet(0).unwrap().cell_value(1, 0),
+        Some("Venue".into())
     );
     assert_eq!(
-        reopened.sheet(0).unwrap().cell_value(1, 1),
-        Some("=A2*2".into())
+        reopened.workbook.sheet(0).unwrap().cell_value(4, 3),
+        Some("=SUM(D2:D4)".into())
     );
     assert_eq!(
-        reopened.sheet(0).unwrap().get_format(0, 0).unwrap().bold,
+        reopened
+            .workbook
+            .sheet(0)
+            .unwrap()
+            .get_format(0, 0)
+            .unwrap()
+            .bold,
         Some(true)
     );
+    assert_eq!(reopened.sheet_features[0].validations.len(), 1);
+    assert_eq!(reopened.sheet_features[0].conditional_formats.len(), 1);
 
     let _ = std::fs::remove_dir_all(root);
 }

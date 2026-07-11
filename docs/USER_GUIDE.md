@@ -1,6 +1,6 @@
 # User guide
 
-This guide describes 900Sheets v0.4.0.
+This guide describes 900Sheets v0.5.0.
 
 ## Start a workbook
 
@@ -17,6 +17,7 @@ Useful shortcuts:
 | Redo | Ctrl+Y or Command+Y |
 | Copy, cut, paste | Ctrl+C, Ctrl+X, Ctrl+V |
 | Find and replace | Ctrl+F or Command+F |
+| Go to a cell or range | Ctrl+G, Command+G, or F5 |
 | Edit active cell | F2 |
 | Clear selected cells | Delete or Backspace |
 
@@ -36,13 +37,32 @@ Use a simple sheet name directly before `!`. Put a name containing spaces or pun
 
 If a referenced sheet does not exist, the formula returns a reference error. Cross-sheet circular references are rejected. A formula can expand at most 100,000 references, so very large ranges return a budget error instead of consuming unbounded memory.
 
+## Start from a template
+
+The first-run guide offers a blank workbook or one of four starter templates:
+
+- School Budget
+- Small Business Accounts
+- Community Project
+- Household Planning
+
+Every sample uses invented data. A template is inserted at the selected cell, and its relative formulas are rebased to the insertion point. Replace the sample values before relying on its totals. The first-run completion preference stays on the local computer and does not create an account or send data elsewhere. You can open the template chooser again after completing the guide.
+
 ## Formatting and sheets
 
 Select one cell or drag across a range. Use the toolbar to change font emphasis, size, colors, alignment, wrapping, borders, and number formats. A range format is committed as one transaction.
 
 Use the tabs at the bottom to add, rename, select, or delete sheets. The Insert menu adds or removes rows and columns. Structural changes move stored cells and formats and rewrite supported A1 references. They also remove coordinate-bound state that cannot be moved safely.
 
-Sheet and structural changes participate in undo and redo in v0.4.0. If an operation is too large for the bounded history, the app rejects it without leaving a partial change.
+Sheet and structural changes participate in undo and redo. If an operation is too large for the bounded history, the app rejects it without leaving a partial change.
+
+## Navigate the full grid
+
+The editor covers rows 1 through 1,000,000 and columns A through XFD. It renders only the rows and columns near the viewport, so reaching a distant coordinate does not create a cell element for every position in between.
+
+Use the address field or press Ctrl+G, Command+G, or F5. Enter one cell, such as `B25000`, or one range, such as `A1:F20`, and press Enter. Addresses outside `A1:XFD1000000` are rejected. Arrow keys, Home, Page Up, and Page Down continue from the selected location. Tab and Shift+Tab leave the grid so keyboard users can reach the surrounding controls. Frozen panes are limited to the first 20 rows and first 20 columns.
+
+Operations that must visit every coordinate, such as formatting, copy, cut, paste, charts, pivots, filters, duplicate removal, validation, conditional formatting, and range locking, accept at most 200,000 selected cells. Sparse deletion accepts at most 200,000 populated cells. Break larger work into smaller ranges.
 
 ## Save, open, import, and export
 
@@ -68,17 +88,26 @@ XLSX supports multiple sheets, formulas, and direct cell styles, but not every E
 
 XLSX, CSV, JSON, and PDF exports create exchange files. Export does not change the current native workbook path or clear undo history. Save a native workbook before exporting if you intend to continue editing.
 
+Before the file picker opens, 900Sheets runs an export preflight:
+
+- CSV, JSON, and PDF report how many dense cells the export would process.
+- Work at or above 1,000,000 dense cells produces a confirmation warning.
+- A dense area above the 5,000,000-cell safety limit is blocked before export begins.
+- XLSX reports stored cell and format coordinates because it writes sparse workbook data rather than expanding a dense grid.
+
+If a sparse workbook contains one cell at a very high coordinate, CSV or JSON may still be large because those formats represent the rectangle up to that coordinate. Clear or move the distant cell if preflight blocks the export.
+
 ## Undo and redo
 
 Undo and redo cover cell edits, clear and paste, formatting, sheet changes, structural edits, CSV import, sort, replace, pivot output, comments, protection, locks, and sheet-scoped feature metadata.
 
 History keeps at most 100 transactions and 64 MiB. One transaction may use at most 32 MiB and touch at most 200,000 coordinates. When aggregate limits are reached, the oldest entries are removed. Opening or creating a workbook starts fresh history.
 
-## Autosave and recovery
+## Recovery and rotating backups
 
 Recovery protects unsaved work without silently overwriting a workbook you opened.
 
-After a successful edit, the app waits 750 milliseconds for more activity, flushes pending edits, and writes a recovery snapshot in the operating system's app data directory. A dirty workbook also gets a final recovery write when you close the desktop app. If that final write fails, the app asks whether to close without preserving the latest edits.
+After a successful edit, the app waits for the configured interval, flushes pending edits, and writes a recovery snapshot in the operating system's app data directory. The default interval is 750 milliseconds. Under **Tools > Recovery and Backups**, choose 0.75 seconds, 2 seconds, 5 seconds, or 15 seconds. The setting is local to the computer. A dirty workbook also gets a final recovery write when you close the desktop app. If that final write fails, the app asks whether to close without preserving the latest edits.
 
 On startup, the app lists available recoveries newest first. For each prompt:
 
@@ -86,9 +115,13 @@ On startup, the app lists available recoveries newest first. For each prompt:
 2. Choose **Cancel** to discard only that recovery and see the next one.
 3. After restoring, choose **Save Workbook** to keep it as a normal `.900sheets` file.
 
-Restoring one recovery leaves every unselected recovery untouched. A corrupt recovery is quarantined and will not keep reappearing. If cleanup fails after Save or a workbook replacement, the app shows an error and asks you to use Save Workbook to retry under the same recovery identity.
+The **Recovery and Backups** panel remains available after startup. It shows each snapshot's time and size. Select its record to inspect sheet names without replacing the workbook. **Restore** asks before discarding unsaved changes, loads the snapshot as an unsaved replacement, and leaves retained recoveries in place until an explicit save or delete. **Delete** asks for confirmation and affects only the selected snapshot.
 
-Recovery snapshots are not a versioned backup system. Save important workbooks normally and keep external backups.
+Restoring one recovery leaves every unrelated recovery untouched. A corrupt recovery is quarantined and will not keep reappearing. If cleanup fails after Save or a workbook replacement, the app shows an error and asks you to use Save Workbook to retry under the same recovery identity.
+
+Rotating backups protect previously saved native versions. After a `.900sheets` save succeeds, the app attempts to create a private backup and keeps the newest five versions for that saved document. The **Saved-workbook backups** section shows the workbook name, time, and size. Select its record to inspect sheet names, choose **Restore copy** to open it as an unsaved replacement, or delete it explicitly. Restoring does not delete the backup. If backup creation or rotation fails after the primary save, the app reports a warning without claiming that the already-written workbook failed to save.
+
+Recovery follows dirty session state. Rotating backups are attempted after successful native saves, with any failure reported separately from the completed save. They are separate local safeguards, and neither replaces external backups for important files.
 
 ## Data tools and advanced features
 
@@ -99,9 +132,15 @@ Recovery snapshots are not a versioned backup system. Save important workbooks n
 - Named ranges are saved bookmarks. Formula name evaluation is not implemented.
 - Charts are SVG previews. They are not exported as native Excel charts.
 - Pivot output can be created in a generated sheet and is undoable.
-- Validation and conditional formatting use the 900Sheets model and are saved in native metadata.
+- Validation and conditional formatting use the 900Sheets model, are saved in native metadata, and round-trip through XLSX for the documented subset.
 - Comments, protection, and cell locks are scoped to stable sheet identities.
 - Sheet protection is an editing deterrent, not encryption.
+
+## Language and accessibility
+
+Choose **Tools > Locale Settings** to select English, Swedish, or Spanish. The preference stays on the local computer. It changes verified grid-navigation and core accessibility labels, not workbook content or the complete application interface.
+
+The virtualized grid uses one keyboard focus target and exposes its row count, column count, active cell, selection state, and cell labels to assistive technology. Dialogs keep keyboard focus inside while open, close with Escape, and return focus when dismissed. Screen readers and platform keyboard behavior still vary, so include the operating system and assistive technology when reporting a problem.
 
 ## If a file does not behave as expected
 

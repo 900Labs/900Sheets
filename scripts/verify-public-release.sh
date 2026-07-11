@@ -7,7 +7,7 @@ echo ""
 echo "Checking for local paths, hostnames, secrets, and generated artifacts..."
 echo ""
 
-RELEASE_VERSION="0.4.0"
+RELEASE_VERSION="0.5.0"
 
 SOURCE_PATHS=(
   Cargo.toml
@@ -111,15 +111,5 @@ fi
 
 echo "PASS: No local paths, secrets, or sensitive artifacts found"
 
-signature_verifications="$(grep -c 'codesign --verify --deep --strict' .github/workflows/release.yml || true)"
-if ! grep -q -- '--keepParent' .github/workflows/release.yml || \
-  ! grep -q 'test -x' .github/workflows/release.yml || \
-  ! grep -q 'macos.zip' .github/workflows/release.yml || \
-  ! grep -q 'codesign --force --deep --sign -' .github/workflows/release.yml || \
-  [[ "${signature_verifications}" -lt 2 ]]; then
-  echo "FAIL: Release workflow must sign the complete app, verify it before and after archive, and preserve executable permission"
-  exit 1
-fi
-
-echo "PASS: Release workflow signs and verifies the complete app before and after archive"
+./scripts/verify-release-workflow.sh
 echo "=== Public release checks passed ==="
