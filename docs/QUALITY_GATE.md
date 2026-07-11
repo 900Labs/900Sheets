@@ -1,37 +1,44 @@
-# Quality Gate
+# Quality gate
 
-The quality gate must pass before merging to `main`. Run:
+Run the complete gate before merging to `main`:
 
 ```bash
 ./scripts/verify-local.sh
 ```
 
-## Checks
+It runs:
 
-1. **Rust formatting**: `cargo fmt --all -- --check` — properly formatted
-2. **Rust lints**: `cargo clippy --workspace --all-targets -- -D warnings` — zero warnings
-3. **Rust tests**: `cargo test --workspace` — all tests must pass
-4. **Frontend install**: `npm install --prefix apps/desktop` — dependencies installed
-5. **Frontend check**: `npm run check --prefix apps/desktop` — type check passes
-6. **Frontend build**: `npm run build --prefix apps/desktop` — build succeeds
-7. **Spreadsheet interaction smoke tests**: `npm run test:e2e --prefix apps/desktop` — six core editing, formula bar/fx, copy/paste, and compact-menu flows pass in Playwright
+1. `cargo fmt --all -- --check`
+2. `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+3. `cargo test --workspace`
+4. `npm ci --prefix apps/desktop`
+5. `npm run check --prefix apps/desktop`
+6. `npm run build --prefix apps/desktop`
+7. `npm run test:unit --prefix apps/desktop`
+8. `npm run test:e2e --prefix apps/desktop`
 
-## Failure Policy
+The v0.3.0 baseline is 418 Rust tests, 4 mutation-queue unit tests, and 8 Playwright tests. A higher count is expected when new tests are added. The gate must remain free of Rust warnings and Svelte or TypeScript diagnostics.
 
-If any check fails, the PR cannot be merged. Fix all issues before requesting review.
+The XLSX compatibility test opens and re-saves a generated workbook with LibreOffice. CI installs LibreOffice and fails if `soffice` is unavailable. Local runs report a skip when LibreOffice is not installed.
 
-## Public Release Preflight
+## Public-release preflight
 
-Before tagging a public release, also run:
+Before tagging, also run:
 
 ```bash
 ./scripts/verify-public-release.sh
-npm audit --prefix apps/desktop
+npm audit --prefix apps/desktop --audit-level=high
 cargo audit
 npm run tauri:build --prefix apps/desktop
 ```
 
-The public release preflight verifies that source files do not contain local
-machine paths or obvious committed secrets, that npm dependencies have no known
-vulnerabilities, that Rust dependencies have no failing RustSec advisories, and
-that the desktop app bundle can be produced from a clean checkout.
+Confirm that:
+
+- Versions match across Cargo, npm, Tauri, the changelog, and release notes.
+- The privacy gate finds no local paths or obvious committed secrets.
+- The native workbook can be saved and reopened.
+- Representative XLSX import and export fixtures behave as documented.
+- The built app reports the intended release version.
+- Known distribution limits, including signing and platform coverage, are stated in the release notes.
+
+Any failed check or unresolved release-blocking review finding stops the release.

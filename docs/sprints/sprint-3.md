@@ -1,13 +1,13 @@
-# Sprint 3: Formula Engine — Parser & Basic Functions
+# Sprint 3: Formula Engine - Parser & Basic Functions
 
 ## Goal
 Build a custom formula engine in Rust with tokenizer, parser, evaluator, dependency graph, and 60+ built-in functions.
 
 ## Scope Delivered
 
-- [x] Tokenizer (lexer) — numbers, strings, booleans, cell refs, range refs, functions, operators
-- [x] AST — Expr enum with CellRef, RangeRef, BinOp, UnaryOp, Function, Error nodes
-- [x] Parser — Pratt parser with operator precedence, parenthesization, function calls
+- [x] Tokenizer (lexer) - numbers, strings, booleans, cell refs, range refs, functions, operators
+- [x] AST - Expr enum with CellRef, RangeRef, BinOp, UnaryOp, Function, Error nodes
+- [x] Parser - Pratt parser with operator precedence, parenthesization, function calls
 - [x] Evaluator with type coercion (Number, String, Boolean, Error, Empty)
 - [x] CellProvider trait for cell value lookup
 - [x] Dependency graph with cycle detection and topological sort

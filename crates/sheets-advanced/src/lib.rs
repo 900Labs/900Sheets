@@ -106,7 +106,7 @@ pub enum ProtectionAction {
 }
 
 /// Non-cryptographic hash for sheet protection passwords.
-/// Uses a simple polynomial rolling hash — sufficient for deterrence in a
+/// Uses a simple polynomial rolling hash, sufficient for deterrence in a
 /// local-first desktop app but NOT suitable for storing sensitive secrets.
 fn hash_password(password: &str) -> String {
     let mut hash: u32 = 0;
@@ -160,6 +160,12 @@ impl CellLockManager {
 
     pub fn clear(&mut self) {
         self.locked_cells.clear();
+    }
+
+    pub fn iter_overrides(&self) -> impl Iterator<Item = ((u32, u32), bool)> + '_ {
+        self.locked_cells
+            .iter()
+            .map(|(&(row, col), &locked)| ((row, col), locked))
     }
 }
 

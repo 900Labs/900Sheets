@@ -1,6 +1,8 @@
 use crate::error::CsvError;
 use sheets_core::sheet::Sheet;
 
+const MAX_DENSE_EXPORT_CELLS: usize = 5_000_000;
+
 pub fn export_sheet_csv(sheet: &Sheet, delimiter: char) -> Result<String, CsvError> {
     let mut rows: std::collections::BTreeMap<u32, std::collections::BTreeMap<u32, String>> =
         std::collections::BTreeMap::new();
@@ -23,6 +25,10 @@ pub fn export_sheet_csv(sheet: &Sheet, delimiter: char) -> Result<String, CsvErr
     }
 
     let max_row = *rows.last_key_value().unwrap().0;
+    let dense_cells = (max_row as usize + 1).saturating_mul(max_col as usize + 1);
+    if dense_cells > MAX_DENSE_EXPORT_CELLS {
+        return Err(CsvError::TooManyCells(dense_cells, MAX_DENSE_EXPORT_CELLS));
+    }
 
     for row in 0..=max_row {
         let row_data = rows.get(&row);
@@ -126,5 +132,15 @@ mod tests {
         let sheet = crate::import_csv(original, ',').unwrap();
         let exported = export_sheet_csv(&sheet, ',').unwrap();
         assert_eq!(exported, "name,age,city\nAlice,30,NYC\nBob,25,LA\n");
+    }
+
+    #[test]
+    fn test_sparse_high_coordinate_export_is_rejected() {
+        let mut sheet = Sheet::new("Sheet1");
+        sheet.set_cell_value(999_999, 16_383, "edge".into());
+        assert!(matches!(
+            export_sheet_csv(&sheet, ','),
+            Err(CsvError::TooManyCells(_, MAX_DENSE_EXPORT_CELLS))
+        ));
     }
 }

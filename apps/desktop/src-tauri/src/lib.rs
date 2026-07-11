@@ -1,6 +1,6 @@
 use sheets_advanced::{
-    CellComment, CellLockManager, CommentManager, GoalSeekConfig, GoalSeekResult, ProtectionAction,
-    Scenario, SheetProtection,
+    CellComment, CellLockManager, GoalSeekConfig, GoalSeekResult, ProtectionAction, Scenario,
+    SheetProtection,
 };
 use sheets_chart::{ChartConfig, ChartResult};
 use sheets_core::format::CellFormat;
@@ -13,7 +13,7 @@ use sheets_i18n::{Locale, NavigationDirection, TranslationKey, TranslationProvid
 use sheets_pivot::{PivotConfig, PivotResult};
 use sheets_print::{PrintConfig, PrintPreview};
 use sheets_validation::{ConditionalFormat, DataValidation, ValidationRule};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 use tauri::State;
@@ -23,6 +23,17 @@ struct AppState {
     dep_graphs: Mutex<Vec<DependencyGraph>>,
     protections: Mutex<Vec<SheetProtection>>,
     cell_locks: Mutex<Vec<CellLockManager>>,
+}
+
+#[derive(Default)]
+struct SheetComments {
+    comments: HashMap<(u32, u32, u32), CellComment>,
+}
+
+impl SheetComments {
+    fn clear(&mut self) {
+        self.comments.clear();
+    }
 }
 
 struct TauriProvider<'a> {
@@ -81,7 +92,14 @@ impl<'a> CellProvider for TauriProvider<'a> {
 #[derive(serde::Serialize, Clone)]
 struct SheetInfo {
     id: u32,
+    stable_id: u64,
     name: String,
+}
+
+#[derive(serde::Serialize)]
+struct NativeOpenResult {
+    sheets: Vec<SheetInfo>,
+    metadata: serde_json::Value,
 }
 
 #[derive(serde::Serialize)]
@@ -102,6 +120,7 @@ fn sheet_infos(workbook: &Workbook) -> Vec<SheetInfo> {
         .enumerate()
         .map(|(i, s)| SheetInfo {
             id: i as u32,
+            stable_id: s.stable_id(),
             name: s.name().to_string(),
         })
         .collect()
@@ -123,15 +142,55 @@ fn clear_derived_workbook_state(state: &AppState) -> Result<(), String> {
     Ok(())
 }
 
-fn clear_comments(comments: &Mutex<CommentManager>) -> Result<(), String> {
+fn clear_comments(comments: &Mutex<SheetComments>) -> Result<(), String> {
     let mut comments = comments.lock().map_err(|e| e.to_string())?;
     comments.clear();
     Ok(())
 }
 
+fn delete_sheet_comments(comments: &mut SheetComments, deleted_sheet_id: u32) {
+    comments.comments = comments
+        .comments
+        .drain()
+        .filter_map(|((sheet_id, row, col), comment)| {
+            if sheet_id == deleted_sheet_id {
+                None
+            } else {
+                let next_sheet_id = if sheet_id > deleted_sheet_id {
+                    sheet_id - 1
+                } else {
+                    sheet_id
+                };
+                Some(((next_sheet_id, row, col), comment))
+            }
+        })
+        .collect();
+}
+
+fn clear_sheet_coordinate_state(
+    state: &AppState,
+    comments: &Mutex<SheetComments>,
+    sheet_id: u32,
+) -> Result<(), String> {
+    if let Some(manager) = state
+        .cell_locks
+        .lock()
+        .map_err(|error| error.to_string())?
+        .get_mut(sheet_id as usize)
+    {
+        manager.clear();
+    }
+    comments
+        .lock()
+        .map_err(|error| error.to_string())?
+        .comments
+        .retain(|(candidate, _, _), _| *candidate != sheet_id);
+    Ok(())
+}
+
 fn clear_full_workbook_state(
     state: &AppState,
-    comments: &Mutex<CommentManager>,
+    comments: &Mutex<SheetComments>,
 ) -> Result<(), String> {
     clear_derived_workbook_state(state)?;
     clear_comments(comments)?;
@@ -165,6 +224,25 @@ fn ensure_allowed_extension(path: &Path, allowed_extensions: &[&str]) -> Result<
         "File extension must be one of: {}",
         allowed_extensions.join(", ")
     ))
+}
+
+fn write_atomic(path: &Path, data: &[u8]) -> Result<(), String> {
+    let temporary = path.with_extension(format!(
+        "{}.tmp",
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("file")
+    ));
+    {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&temporary).map_err(|error| error.to_string())?;
+        file.write_all(data).map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())?;
+    }
+    std::fs::rename(&temporary, path).map_err(|error| {
+        let _ = std::fs::remove_file(&temporary);
+        error.to_string()
+    })
 }
 
 fn ensure_can_edit_cell(state: &AppState, sheet_id: u32, row: u32, col: u32) -> Result<(), String> {
@@ -207,14 +285,6 @@ fn ensure_can_perform_protected_action(
         if !protection.can_perform(action) {
             return Err(format!("Sheet {} is protected for {:?}", sheet_id, action));
         }
-    }
-    Ok(())
-}
-
-fn clear_dependency_graph_for_sheet(state: &AppState, sheet_id: u32) -> Result<(), String> {
-    let mut graphs = state.dep_graphs.lock().map_err(|e| e.to_string())?;
-    if (sheet_id as usize) < graphs.len() {
-        graphs[sheet_id as usize] = DependencyGraph::new();
     }
     Ok(())
 }
@@ -280,11 +350,200 @@ fn clear_cell_in_workbook(
     let sheet = wb
         .sheet_mut(sheet_id as usize)
         .ok_or_else(|| format!("Sheet {} not found", sheet_id))?;
-    sheet.clear_cell(row, col);
+    sheet.clear_value(row, col);
     let mut graphs = state.dep_graphs.lock().map_err(|e| e.to_string())?;
     if let Some(graph) = graphs.get_mut(sheet_id as usize) {
         graph.clear_cell(row, col);
     }
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct CellChange {
+    row: u32,
+    col: u32,
+    value: String,
+}
+
+#[derive(serde::Deserialize)]
+struct FormatChange {
+    row: u32,
+    col: u32,
+    format: CellFormat,
+}
+
+fn dependency_graph_for_sheet(
+    sheet: &sheets_core::sheet::Sheet,
+) -> Result<DependencyGraph, String> {
+    let mut graph = DependencyGraph::new();
+    for ((row, col), cell) in sheet.iter_cells() {
+        if cell.is_formula() {
+            Parser::parse_formula(&cell.raw).map_err(|error| error.to_string())?;
+            graph.set_formula(row, col, &cell.raw)?;
+        }
+    }
+    Ok(graph)
+}
+
+fn dependency_graphs_for_workbook(workbook: &Workbook) -> Result<Vec<DependencyGraph>, String> {
+    workbook
+        .sheets()
+        .iter()
+        .map(dependency_graph_for_sheet)
+        .collect()
+}
+
+fn replace_loaded_workbook(
+    state: &AppState,
+    comments: &Mutex<SheetComments>,
+    imported: Workbook,
+) -> Result<Vec<SheetInfo>, String> {
+    let graphs = dependency_graphs_for_workbook(&imported)?;
+    let infos = sheet_infos(&imported);
+    *state.workbook.lock().map_err(|error| error.to_string())? = imported;
+    *state.dep_graphs.lock().map_err(|error| error.to_string())? = graphs;
+    state
+        .protections
+        .lock()
+        .map_err(|error| error.to_string())?
+        .clear();
+    state
+        .cell_locks
+        .lock()
+        .map_err(|error| error.to_string())?
+        .clear();
+    comments.lock().map_err(|error| error.to_string())?.clear();
+    Ok(infos)
+}
+
+#[tauri::command]
+fn batch_set_cells(
+    sheet_id: u32,
+    changes: Vec<CellChange>,
+    state: State<AppState>,
+) -> Result<(), String> {
+    for change in &changes {
+        ensure_can_edit_cell(state.inner(), sheet_id, change.row, change.col)?;
+    }
+    let mut workbook = state.workbook.lock().map_err(|error| error.to_string())?;
+    let mut next = workbook
+        .sheet(sheet_id as usize)
+        .cloned()
+        .ok_or_else(|| format!("Sheet {sheet_id} not found"))?;
+    for change in changes {
+        if change.value.is_empty() {
+            next.clear_value(change.row, change.col);
+        } else {
+            next.set_cell_value(change.row, change.col, change.value);
+        }
+    }
+    let graph = dependency_graph_for_sheet(&next)?;
+    *workbook
+        .sheet_mut(sheet_id as usize)
+        .ok_or_else(|| format!("Sheet {sheet_id} not found"))? = next;
+    let sheet_count = workbook.sheet_count();
+    drop(workbook);
+    let mut graphs = state.dep_graphs.lock().map_err(|error| error.to_string())?;
+    ensure_dependency_graphs(&mut graphs, sheet_count);
+    graphs[sheet_id as usize] = graph;
+    Ok(())
+}
+
+#[tauri::command]
+fn batch_set_formats(
+    sheet_id: u32,
+    changes: Vec<FormatChange>,
+    state: State<AppState>,
+) -> Result<(), String> {
+    ensure_can_perform_protected_action(state.inner(), sheet_id, ProtectionAction::FormatCells)?;
+    let mut workbook = state.workbook.lock().map_err(|error| error.to_string())?;
+    let mut next = workbook
+        .sheet(sheet_id as usize)
+        .cloned()
+        .ok_or_else(|| format!("Sheet {sheet_id} not found"))?;
+    for change in changes {
+        next.set_format(change.row, change.col, change.format);
+    }
+    *workbook
+        .sheet_mut(sheet_id as usize)
+        .ok_or_else(|| format!("Sheet {sheet_id} not found"))? = next;
+    Ok(())
+}
+
+#[tauri::command]
+fn replace_sheet_snapshot(
+    sheet_id: u32,
+    cells: Vec<CellChange>,
+    formats: Vec<FormatChange>,
+    state: State<AppState>,
+) -> Result<(), String> {
+    ensure_sheet_not_protected(state.inner(), sheet_id)?;
+    let mut next = {
+        let workbook = state.workbook.lock().map_err(|error| error.to_string())?;
+        let current = workbook
+            .sheet(sheet_id as usize)
+            .ok_or_else(|| format!("Sheet {sheet_id} not found"))?;
+        sheets_core::sheet::Sheet::with_stable_id(current.stable_id(), current.name())
+    };
+    for cell in cells {
+        next.set_cell_value(cell.row, cell.col, cell.value);
+    }
+    for format in formats {
+        next.set_format(format.row, format.col, format.format);
+    }
+    let graph = dependency_graph_for_sheet(&next)?;
+    let mut workbook = state.workbook.lock().map_err(|error| error.to_string())?;
+    *workbook
+        .sheet_mut(sheet_id as usize)
+        .ok_or_else(|| format!("Sheet {sheet_id} not found"))? = next;
+    let sheet_count = workbook.sheet_count();
+    drop(workbook);
+    let mut graphs = state.dep_graphs.lock().map_err(|error| error.to_string())?;
+    ensure_dependency_graphs(&mut graphs, sheet_count);
+    graphs[sheet_id as usize] = graph;
+    Ok(())
+}
+
+#[tauri::command]
+fn edit_sheet_structure(
+    sheet_id: u32,
+    operation: String,
+    index: u32,
+    state: State<AppState>,
+    comments: State<'_, Mutex<SheetComments>>,
+) -> Result<(), String> {
+    use sheets_core::sheet::StructureEdit;
+    let edit = match operation.as_str() {
+        "insert_row" => StructureEdit::InsertRow(index),
+        "delete_row" => StructureEdit::DeleteRow(index),
+        "insert_column" => StructureEdit::InsertColumn(index),
+        "delete_column" => StructureEdit::DeleteColumn(index),
+        _ => return Err(format!("Unknown structure operation: {operation}")),
+    };
+    let action = match edit {
+        StructureEdit::InsertRow(_) => ProtectionAction::InsertRows,
+        StructureEdit::DeleteRow(_) => ProtectionAction::DeleteRows,
+        StructureEdit::InsertColumn(_) => ProtectionAction::InsertCols,
+        StructureEdit::DeleteColumn(_) => ProtectionAction::DeleteCols,
+    };
+    ensure_can_perform_protected_action(state.inner(), sheet_id, action)?;
+    let mut workbook = state.workbook.lock().map_err(|error| error.to_string())?;
+    let mut next = workbook
+        .sheet(sheet_id as usize)
+        .cloned()
+        .ok_or_else(|| format!("Sheet {sheet_id} not found"))?;
+    next.apply_structure_edit(edit);
+    let graph = dependency_graph_for_sheet(&next)?;
+    *workbook
+        .sheet_mut(sheet_id as usize)
+        .ok_or_else(|| format!("Sheet {sheet_id} not found"))? = next;
+    let sheet_count = workbook.sheet_count();
+    drop(workbook);
+    let mut graphs = state.dep_graphs.lock().map_err(|error| error.to_string())?;
+    ensure_dependency_graphs(&mut graphs, sheet_count);
+    graphs[sheet_id as usize] = graph;
+    drop(graphs);
+    clear_sheet_coordinate_state(state.inner(), comments.inner(), sheet_id)?;
     Ok(())
 }
 
@@ -298,7 +557,7 @@ struct SearchResultData {
 #[tauri::command]
 fn new_workbook(
     state: State<AppState>,
-    comments: State<'_, Mutex<CommentManager>>,
+    comments: State<'_, Mutex<SheetComments>>,
 ) -> Result<Vec<SheetInfo>, String> {
     let mut wb = state.workbook.lock().map_err(|e| e.to_string())?;
     *wb = Workbook::new();
@@ -314,6 +573,16 @@ fn get_sheets(state: State<AppState>) -> Result<Vec<SheetInfo>, String> {
 }
 
 #[tauri::command]
+fn set_active_sheet(sheet_id: u32, state: State<AppState>) -> Result<(), String> {
+    let mut workbook = state.workbook.lock().map_err(|error| error.to_string())?;
+    if sheet_id as usize >= workbook.sheet_count() {
+        return Err(format!("Sheet {sheet_id} not found"));
+    }
+    workbook.set_active_sheet(sheet_id as usize);
+    Ok(())
+}
+
+#[tauri::command]
 fn add_sheet(name: String, state: State<AppState>) -> Result<Vec<SheetInfo>, String> {
     let mut wb = state.workbook.lock().map_err(|e| e.to_string())?;
     wb.add_sheet(&name);
@@ -321,7 +590,11 @@ fn add_sheet(name: String, state: State<AppState>) -> Result<Vec<SheetInfo>, Str
 }
 
 #[tauri::command]
-fn delete_sheet(sheet_id: u32, state: State<AppState>) -> Result<Vec<SheetInfo>, String> {
+fn delete_sheet(
+    sheet_id: u32,
+    state: State<AppState>,
+    comments: State<'_, Mutex<SheetComments>>,
+) -> Result<Vec<SheetInfo>, String> {
     ensure_sheet_not_protected(state.inner(), sheet_id)?;
     let mut wb = state.workbook.lock().map_err(|e| e.to_string())?;
     if sheet_id as usize >= wb.sheet_count() {
@@ -343,6 +616,9 @@ fn delete_sheet(sheet_id: u32, state: State<AppState>) -> Result<Vec<SheetInfo>,
     if (sheet_id as usize) < locks.len() {
         locks.remove(sheet_id as usize);
     }
+    drop(locks);
+    let mut comment_guard = comments.lock().map_err(|error| error.to_string())?;
+    delete_sheet_comments(&mut comment_guard, sheet_id);
     Ok(sheet_infos(&wb))
 }
 
@@ -496,13 +772,10 @@ fn evaluate_formula(
 fn import_xlsx(
     data: Vec<u8>,
     state: State<AppState>,
-    comments: State<'_, Mutex<CommentManager>>,
+    comments: State<'_, Mutex<SheetComments>>,
 ) -> Result<Vec<SheetInfo>, String> {
     let imported = sheets_xlsx::import_workbook(&data).map_err(|e| e.to_string())?;
-    let mut wb = state.workbook.lock().map_err(|e| e.to_string())?;
-    *wb = imported;
-    clear_full_workbook_state(state.inner(), comments.inner())?;
-    Ok(sheet_infos(&wb))
+    replace_loaded_workbook(state.inner(), comments.inner(), imported)
 }
 
 #[tauri::command]
@@ -515,7 +788,7 @@ fn export_xlsx(state: State<AppState>) -> Result<Vec<u8>, String> {
 fn import_xlsx_file(
     file_path: String,
     state: State<AppState>,
-    comments: State<'_, Mutex<CommentManager>>,
+    comments: State<'_, Mutex<SheetComments>>,
 ) -> Result<Vec<SheetInfo>, String> {
     let path = checked_absolute_path(&file_path)?;
     ensure_allowed_extension(&path, &["xlsx"])?;
@@ -543,18 +816,28 @@ fn import_csv_data(
         ensure_sheet_not_protected(state.inner(), id)?;
     }
     let sheet = sheets_csv::import_csv(&data, delim).map_err(|e| e.to_string())?;
-    let mut wb = state.workbook.lock().map_err(|e| e.to_string())?;
-
     if let Some(id) = sheet_id {
-        if let Some(existing) = wb.sheet_mut(id as usize) {
-            for ((row, col), cell) in sheet.iter_cells() {
-                existing.set_cell(row, col, cell.clone());
-            }
-            clear_dependency_graph_for_sheet(state.inner(), id)?;
-        } else {
-            return Err(format!("Sheet {} not found", id));
+        let mut workbook = state.workbook.lock().map_err(|e| e.to_string())?;
+        let mut next = workbook
+            .sheet(id as usize)
+            .cloned()
+            .ok_or_else(|| format!("Sheet {} not found", id))?;
+        for ((row, col), cell) in sheet.iter_cells() {
+            next.set_cell(row, col, cell.clone());
         }
+        let graph = dependency_graph_for_sheet(&next)?;
+        *workbook
+            .sheet_mut(id as usize)
+            .ok_or_else(|| format!("Sheet {} not found", id))? = next;
+        let count = workbook.sheet_count();
+        let infos = sheet_infos(&workbook);
+        drop(workbook);
+        let mut graphs = state.dep_graphs.lock().map_err(|e| e.to_string())?;
+        ensure_dependency_graphs(&mut graphs, count);
+        graphs[id as usize] = graph;
+        Ok(infos)
     } else {
+        let mut wb = state.workbook.lock().map_err(|e| e.to_string())?;
         let sheet_name = format!("Sheet{}", wb.sheet_count() + 1);
         let idx = wb.add_sheet(&sheet_name);
         for ((row, col), cell) in sheet.iter_cells() {
@@ -562,9 +845,18 @@ fn import_csv_data(
                 s.set_cell(row, col, cell.clone());
             }
         }
+        let graph = dependency_graph_for_sheet(
+            wb.sheet(idx)
+                .ok_or_else(|| format!("Sheet {} not found", idx))?,
+        )?;
+        let count = wb.sheet_count();
+        let infos = sheet_infos(&wb);
+        drop(wb);
+        let mut graphs = state.dep_graphs.lock().map_err(|e| e.to_string())?;
+        ensure_dependency_graphs(&mut graphs, count);
+        graphs[idx] = graph;
+        Ok(infos)
     }
-
-    Ok(sheet_infos(&wb))
 }
 
 #[tauri::command]
@@ -607,13 +899,10 @@ fn export_csv_file(
 fn import_json_data(
     data: String,
     state: State<AppState>,
-    comments: State<'_, Mutex<CommentManager>>,
+    comments: State<'_, Mutex<SheetComments>>,
 ) -> Result<Vec<SheetInfo>, String> {
     let imported = sheets_json::import_workbook_json(&data).map_err(|e| e.to_string())?;
-    let mut wb = state.workbook.lock().map_err(|e| e.to_string())?;
-    *wb = imported;
-    clear_full_workbook_state(state.inner(), comments.inner())?;
-    Ok(sheet_infos(&wb))
+    replace_loaded_workbook(state.inner(), comments.inner(), imported)
 }
 
 #[tauri::command]
@@ -626,7 +915,7 @@ fn export_json(state: State<AppState>) -> Result<String, String> {
 fn import_json_file(
     file_path: String,
     state: State<AppState>,
-    comments: State<'_, Mutex<CommentManager>>,
+    comments: State<'_, Mutex<SheetComments>>,
 ) -> Result<Vec<SheetInfo>, String> {
     let path = checked_absolute_path(&file_path)?;
     ensure_allowed_extension(&path, &["json"])?;
@@ -640,6 +929,124 @@ fn export_json_file(file_path: String, state: State<AppState>) -> Result<(), Str
     ensure_allowed_extension(&path, &["json"])?;
     let data = export_json(state)?;
     std::fs::write(path, data).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn import_native_file(
+    file_path: String,
+    state: State<AppState>,
+    comments: State<'_, Mutex<SheetComments>>,
+) -> Result<NativeOpenResult, String> {
+    let path = checked_absolute_path(&file_path)?;
+    ensure_allowed_extension(&path, &["900sheets"])?;
+    let data = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
+    let (imported, metadata) = sheets_json::import_native_workbook_with_metadata(&data)
+        .map_err(|error| error.to_string())?;
+    let sheets = replace_loaded_workbook(state.inner(), comments.inner(), imported)?;
+    if let Some(saved_comments) = metadata.get("comments").and_then(|value| value.as_array()) {
+        let mut manager = comments.lock().map_err(|error| error.to_string())?;
+        for saved in saved_comments {
+            let Some(sheet_id) = saved.get("sheet_id").and_then(|value| value.as_u64()) else {
+                continue;
+            };
+            let Ok(comment) = serde_json::from_value::<CellComment>(saved.clone()) else {
+                continue;
+            };
+            manager
+                .comments
+                .insert((sheet_id as u32, comment.row, comment.col), comment);
+        }
+    }
+    if let Some(saved) = metadata.get("protections") {
+        if let Ok(values) = serde_json::from_value::<Vec<SheetProtection>>(saved.clone()) {
+            *state
+                .protections
+                .lock()
+                .map_err(|error| error.to_string())? = values;
+        }
+    }
+    if let Some(saved_locks) = metadata
+        .get("cell_locks")
+        .and_then(|value| value.as_array())
+    {
+        let mut managers = Vec::new();
+        for sheet_locks in saved_locks {
+            let mut manager = CellLockManager::new();
+            if let Some(entries) = sheet_locks.as_array() {
+                for entry in entries {
+                    let Some(values) = entry.as_array() else {
+                        continue;
+                    };
+                    if values.len() != 3 {
+                        continue;
+                    }
+                    let (Some(row), Some(col), Some(locked)) =
+                        (values[0].as_u64(), values[1].as_u64(), values[2].as_bool())
+                    else {
+                        continue;
+                    };
+                    manager.set_locked(row as u32, col as u32, locked);
+                }
+            }
+            managers.push(manager);
+        }
+        *state.cell_locks.lock().map_err(|error| error.to_string())? = managers;
+    }
+    Ok(NativeOpenResult { sheets, metadata })
+}
+
+#[tauri::command]
+fn export_native_file(
+    file_path: String,
+    mut metadata: serde_json::Value,
+    state: State<AppState>,
+    comments: State<'_, Mutex<SheetComments>>,
+) -> Result<(), String> {
+    let path = checked_absolute_path(&file_path)?;
+    ensure_allowed_extension(&path, &["900sheets"])?;
+    if !metadata.is_object() {
+        metadata = serde_json::json!({});
+    }
+    let workbook = state.workbook.lock().map_err(|error| error.to_string())?;
+    let comment_guard = comments.lock().map_err(|error| error.to_string())?;
+    let protection_guard = state
+        .protections
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let lock_guard = state.cell_locks.lock().map_err(|error| error.to_string())?;
+    let object = metadata.as_object_mut().expect("metadata object");
+    let saved_comments: Vec<serde_json::Value> = comment_guard
+        .comments
+        .iter()
+        .filter_map(|(&(sheet_id, _, _), comment)| {
+            let mut value = serde_json::to_value(comment).ok()?;
+            value
+                .as_object_mut()?
+                .insert("sheet_id".into(), sheet_id.into());
+            Some(value)
+        })
+        .collect();
+    object.insert("comments".into(), saved_comments.into());
+    object.insert(
+        "protections".into(),
+        serde_json::to_value(&*protection_guard).map_err(|error| error.to_string())?,
+    );
+    let cell_locks: Vec<Vec<(u32, u32, bool)>> = lock_guard
+        .iter()
+        .map(|manager| {
+            manager
+                .iter_overrides()
+                .map(|((row, col), locked)| (row, col, locked))
+                .collect()
+        })
+        .collect();
+    object.insert(
+        "cell_locks".into(),
+        serde_json::to_value(cell_locks).map_err(|error| error.to_string())?,
+    );
+    let data = sheets_json::export_native_workbook_with_metadata(&workbook, metadata)
+        .map_err(|error| error.to_string())?;
+    write_atomic(&path, data.as_bytes())
 }
 
 #[tauri::command]
@@ -673,21 +1080,45 @@ fn get_cell_format(
     Ok(sheet.get_format(row, col).cloned())
 }
 
-#[tauri::command]
-fn sort_data(
-    sheet_id: u32,
+#[derive(serde::Deserialize)]
+struct SortRange {
     sort_col: u32,
     start_row: u32,
     end_row: u32,
+    start_col: u32,
+    end_col: u32,
+}
+
+#[tauri::command]
+fn sort_data(
+    sheet_id: u32,
+    range: SortRange,
     ascending: bool,
     state: State<AppState>,
 ) -> Result<(), String> {
     ensure_can_perform_protected_action(state.inner(), sheet_id, ProtectionAction::Sort)?;
     let mut wb = state.workbook.lock().map_err(|e| e.to_string())?;
-    let sheet = wb
-        .sheet_mut(sheet_id as usize)
+    let mut next = wb
+        .sheet(sheet_id as usize)
+        .cloned()
         .ok_or_else(|| format!("Sheet {} not found", sheet_id))?;
-    sheets_core::data_tools::apply_sort(sheet, sort_col, start_row, end_row, ascending);
+    sheets_core::data_tools::apply_sort_range(
+        &mut next,
+        range.sort_col,
+        range.start_row,
+        range.end_row,
+        range.start_col,
+        range.end_col,
+        ascending,
+    );
+    let graph = dependency_graph_for_sheet(&next)?;
+    *wb.sheet_mut(sheet_id as usize)
+        .ok_or_else(|| format!("Sheet {} not found", sheet_id))? = next;
+    let count = wb.sheet_count();
+    drop(wb);
+    let mut graphs = state.dep_graphs.lock().map_err(|e| e.to_string())?;
+    ensure_dependency_graphs(&mut graphs, count);
+    graphs[sheet_id as usize] = graph;
     Ok(())
 }
 
@@ -723,12 +1154,21 @@ fn replace_in_sheet_cmd(
 ) -> Result<usize, String> {
     ensure_sheet_not_protected(state.inner(), sheet_id)?;
     let mut wb = state.workbook.lock().map_err(|e| e.to_string())?;
-    let sheet = wb
-        .sheet_mut(sheet_id as usize)
+    let mut next = wb
+        .sheet(sheet_id as usize)
+        .cloned()
         .ok_or_else(|| format!("Sheet {} not found", sheet_id))?;
-    Ok(sheets_core::data_tools::replace_in_sheet(
-        sheet, &find, &replace, match_case,
-    ))
+    let replaced =
+        sheets_core::data_tools::replace_in_sheet(&mut next, &find, &replace, match_case);
+    let graph = dependency_graph_for_sheet(&next)?;
+    *wb.sheet_mut(sheet_id as usize)
+        .ok_or_else(|| format!("Sheet {} not found", sheet_id))? = next;
+    let count = wb.sheet_count();
+    drop(wb);
+    let mut graphs = state.dep_graphs.lock().map_err(|e| e.to_string())?;
+    ensure_dependency_graphs(&mut graphs, count);
+    graphs[sheet_id as usize] = graph;
+    Ok(replaced)
 }
 
 #[tauri::command]
@@ -765,7 +1205,17 @@ fn create_pivot_sheet(
     if let Some(pivot_sheet) = wb.sheet_mut(idx) {
         sheets_pivot::write_pivot_to_sheet(pivot_sheet, &result, 0, 0);
     }
-    Ok(sheet_infos(&wb))
+    let graph = dependency_graph_for_sheet(
+        wb.sheet(idx)
+            .ok_or_else(|| format!("Sheet {} not found", idx))?,
+    )?;
+    let infos = sheet_infos(&wb);
+    let count = wb.sheet_count();
+    drop(wb);
+    let mut graphs = state.dep_graphs.lock().map_err(|e| e.to_string())?;
+    ensure_dependency_graphs(&mut graphs, count);
+    graphs[idx] = graph;
+    Ok(infos)
 }
 
 #[tauri::command]
@@ -1186,56 +1636,82 @@ fn goal_seek_cmd(
 #[tauri::command]
 fn apply_scenario(sheet_id: u32, scenario: Scenario, state: State<AppState>) -> Result<(), String> {
     let mut wb = state.workbook.lock().map_err(|e| e.to_string())?;
-    let sheet = wb
-        .sheet_mut(sheet_id as usize)
+    let mut next = wb
+        .sheet(sheet_id as usize)
+        .cloned()
         .ok_or_else(|| format!("Sheet {} not found", sheet_id))?;
     for cell in &scenario.cells {
         ensure_can_edit_cell(state.inner(), sheet_id, cell.row, cell.col)?;
-        sheet.set_cell_value(cell.row, cell.col, cell.value.clone());
+        next.set_cell_value(cell.row, cell.col, cell.value.clone());
     }
-    clear_dependency_graph_for_sheet(state.inner(), sheet_id)?;
+    let graph = dependency_graph_for_sheet(&next)?;
+    *wb.sheet_mut(sheet_id as usize)
+        .ok_or_else(|| format!("Sheet {} not found", sheet_id))? = next;
+    let count = wb.sheet_count();
+    drop(wb);
+    let mut graphs = state.dep_graphs.lock().map_err(|e| e.to_string())?;
+    ensure_dependency_graphs(&mut graphs, count);
+    graphs[sheet_id as usize] = graph;
     Ok(())
 }
 
 #[tauri::command]
 fn get_cell_comment(
+    sheet_id: u32,
     row: u32,
     col: u32,
-    comments: State<'_, std::sync::Mutex<CommentManager>>,
+    comments: State<'_, Mutex<SheetComments>>,
 ) -> Result<Option<CellComment>, String> {
     let mgr = comments.lock().map_err(|e| e.to_string())?;
-    Ok(mgr.get(row, col).cloned())
+    Ok(mgr.comments.get(&(sheet_id, row, col)).cloned())
 }
 
 #[tauri::command]
 fn add_cell_comment(
+    sheet_id: u32,
     row: u32,
     col: u32,
     text: String,
     author: String,
-    comments: State<'_, std::sync::Mutex<CommentManager>>,
+    comments: State<'_, Mutex<SheetComments>>,
 ) -> Result<(), String> {
     let mut mgr = comments.lock().map_err(|e| e.to_string())?;
-    mgr.add(row, col, &text, &author);
+    mgr.comments.insert(
+        (sheet_id, row, col),
+        CellComment {
+            row,
+            col,
+            text,
+            author,
+            visible: false,
+        },
+    );
     Ok(())
 }
 
 #[tauri::command]
 fn remove_cell_comment(
+    sheet_id: u32,
     row: u32,
     col: u32,
-    comments: State<'_, std::sync::Mutex<CommentManager>>,
+    comments: State<'_, Mutex<SheetComments>>,
 ) -> Result<bool, String> {
     let mut mgr = comments.lock().map_err(|e| e.to_string())?;
-    Ok(mgr.remove(row, col))
+    Ok(mgr.comments.remove(&(sheet_id, row, col)).is_some())
 }
 
 #[tauri::command]
 fn list_comments(
-    comments: State<'_, std::sync::Mutex<CommentManager>>,
+    sheet_id: u32,
+    comments: State<'_, Mutex<SheetComments>>,
 ) -> Result<Vec<CellComment>, String> {
     let mgr = comments.lock().map_err(|e| e.to_string())?;
-    Ok(mgr.list().into_iter().cloned().collect())
+    Ok(mgr
+        .comments
+        .iter()
+        .filter(|((candidate, _, _), _)| *candidate == sheet_id)
+        .map(|(_, comment)| comment.clone())
+        .collect())
 }
 
 #[tauri::command]
@@ -1314,16 +1790,21 @@ pub fn run() {
             protections: Mutex::new(Vec::new()),
             cell_locks: Mutex::new(Vec::new()),
         })
-        .manage(Mutex::new(CommentManager::new()))
+        .manage(Mutex::new(SheetComments::default()))
         .invoke_handler(tauri::generate_handler![
             new_workbook,
             get_sheets,
+            set_active_sheet,
             add_sheet,
             delete_sheet,
             rename_sheet,
             get_cell,
             set_cell,
             clear_cell,
+            batch_set_cells,
+            batch_set_formats,
+            replace_sheet_snapshot,
+            edit_sheet_structure,
             get_sheet_data,
             evaluate_formula,
             import_xlsx,
@@ -1338,6 +1819,8 @@ pub fn run() {
             export_json,
             import_json_file,
             export_json_file,
+            import_native_file,
+            export_native_file,
             set_cell_format,
             get_cell_format,
             sort_data,
@@ -1521,11 +2004,134 @@ mod tests {
     #[test]
     fn full_workbook_reset_clears_comments() {
         let state = test_state();
-        let comments = Mutex::new(CommentManager::new());
-        comments.lock().unwrap().add(0, 0, "stale", "tester");
+        let comments = Mutex::new(SheetComments::default());
+        comments.lock().unwrap().comments.insert(
+            (0, 0, 0),
+            CellComment {
+                row: 0,
+                col: 0,
+                text: "stale".into(),
+                author: "tester".into(),
+                visible: false,
+            },
+        );
 
         clear_full_workbook_state(&state, &comments).unwrap();
 
-        assert_eq!(comments.lock().unwrap().count(), 0);
+        assert!(comments.lock().unwrap().comments.is_empty());
+    }
+
+    #[test]
+    fn comments_are_scoped_by_sheet() {
+        let mut comments = SheetComments::default();
+        for sheet_id in 0..=1 {
+            comments.comments.insert(
+                (sheet_id, 0, 0),
+                CellComment {
+                    row: 0,
+                    col: 0,
+                    text: format!("sheet {sheet_id}"),
+                    author: "tester".into(),
+                    visible: false,
+                },
+            );
+        }
+        assert_eq!(comments.comments.get(&(0, 0, 0)).unwrap().text, "sheet 0");
+        assert_eq!(comments.comments.get(&(1, 0, 0)).unwrap().text, "sheet 1");
+    }
+
+    #[test]
+    fn deleting_sheet_removes_and_reindexes_comments() {
+        let mut comments = SheetComments::default();
+        for sheet_id in 0..=2 {
+            comments.comments.insert(
+                (sheet_id, 0, 0),
+                CellComment {
+                    row: 0,
+                    col: 0,
+                    text: format!("sheet {sheet_id}"),
+                    author: "tester".into(),
+                    visible: false,
+                },
+            );
+        }
+        delete_sheet_comments(&mut comments, 1);
+        assert_eq!(comments.comments.len(), 2);
+        assert_eq!(comments.comments.get(&(0, 0, 0)).unwrap().text, "sheet 0");
+        assert_eq!(comments.comments.get(&(1, 0, 0)).unwrap().text, "sheet 2");
+    }
+
+    #[test]
+    fn imported_workbook_dependency_rebuild_rejects_existing_cycle() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.sheet_mut(0).unwrap();
+        sheet.set_cell_value(0, 0, "=B1".into());
+        sheet.set_cell_value(0, 1, "=A1".into());
+        assert!(dependency_graphs_for_workbook(&workbook).is_err());
+    }
+
+    #[test]
+    fn dependency_rebuild_rejects_cycle_created_by_formula_move() {
+        let mut sheet = sheets_core::sheet::Sheet::new("Data");
+        sheet.set_cell_value(0, 0, "=A2".into());
+        sheet.set_cell_value(1, 0, "1".into());
+        sheets_core::data_tools::apply_sort_range(&mut sheet, 0, 0, 1, 0, 0, true);
+        assert_eq!(sheet.cell_value(1, 0), Some("=A2".into()));
+        assert!(dependency_graph_for_sheet(&sheet).is_err());
+    }
+
+    #[test]
+    fn structural_edit_cleanup_removes_coordinate_bound_backend_state() {
+        let state = test_state();
+        let comments = Mutex::new(SheetComments::default());
+        comments.lock().unwrap().comments.insert(
+            (0, 2, 3),
+            CellComment {
+                row: 2,
+                col: 3,
+                text: "note".into(),
+                author: "tester".into(),
+                visible: false,
+            },
+        );
+        let mut manager = CellLockManager::new();
+        manager.set_locked(2, 3, false);
+        state.cell_locks.lock().unwrap().push(manager);
+
+        clear_sheet_coordinate_state(&state, &comments, 0).unwrap();
+
+        assert!(comments.lock().unwrap().comments.is_empty());
+        assert_eq!(
+            state.cell_locks.lock().unwrap()[0].iter_overrides().count(),
+            0
+        );
+    }
+
+    #[test]
+    fn native_file_atomic_write_and_open_preserve_latest_cell_and_metadata() {
+        let mut workbook = Workbook::new();
+        workbook
+            .sheet_mut(0)
+            .unwrap()
+            .set_cell_value(0, 0, "latest".into());
+        let metadata = serde_json::json!({"sheet_states": {"1": {"frozenRowCount": 1}}});
+        let data =
+            sheets_json::export_native_workbook_with_metadata(&workbook, metadata.clone()).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "900sheets-native-command-{}.900sheets",
+            std::process::id()
+        ));
+
+        write_atomic(&path, data.as_bytes()).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        let (reopened, restored_metadata) =
+            sheets_json::import_native_workbook_with_metadata(&saved).unwrap();
+
+        assert_eq!(
+            reopened.sheet(0).unwrap().cell_value(0, 0),
+            Some("latest".into())
+        );
+        assert_eq!(restored_metadata, metadata);
+        let _ = std::fs::remove_file(path);
     }
 }

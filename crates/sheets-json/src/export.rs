@@ -3,12 +3,14 @@ use serde_json::{json, Value};
 use sheets_core::cell::CellType;
 use sheets_core::workbook::Workbook;
 
+const MAX_DENSE_EXPORT_CELLS: usize = 5_000_000;
+
 pub fn export_workbook_json(workbook: &Workbook) -> Result<String, JsonError> {
     let mut sheets_arr = Vec::new();
 
     for i in 0..workbook.sheet_count() {
         if let Some(sheet) = workbook.sheet(i) {
-            let data = export_sheet_data(sheet);
+            let data = export_sheet_data(sheet)?;
             sheets_arr.push(json!({
                 "name": sheet.name(),
                 "data": data,
@@ -20,7 +22,7 @@ pub fn export_workbook_json(workbook: &Workbook) -> Result<String, JsonError> {
     Ok(serde_json::to_string_pretty(&result)?)
 }
 
-fn export_sheet_data(sheet: &sheets_core::sheet::Sheet) -> Value {
+fn export_sheet_data(sheet: &sheets_core::sheet::Sheet) -> Result<Value, JsonError> {
     let mut rows: std::collections::BTreeMap<u32, std::collections::BTreeMap<u32, Value>> =
         std::collections::BTreeMap::new();
 
@@ -42,7 +44,12 @@ fn export_sheet_data(sheet: &sheets_core::sheet::Sheet) -> Value {
     }
 
     if rows.is_empty() {
-        return Value::Array(Vec::new());
+        return Ok(Value::Array(Vec::new()));
+    }
+
+    let dense_cells = (max_row as usize + 1).saturating_mul(max_col as usize + 1);
+    if dense_cells > MAX_DENSE_EXPORT_CELLS {
+        return Err(JsonError::TooManyCells(dense_cells, MAX_DENSE_EXPORT_CELLS));
     }
 
     let mut result = Vec::new();
@@ -64,7 +71,7 @@ fn export_sheet_data(sheet: &sheets_core::sheet::Sheet) -> Value {
         result.push(Value::Array(row_arr));
     }
 
-    Value::Array(result)
+    Ok(Value::Array(result))
 }
 
 fn cell_to_json(cell_type: CellType, raw: &str) -> Value {
@@ -165,5 +172,18 @@ mod tests {
         let parsed: Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(parsed["sheets"][0]["data"][0][0], json!(true));
         assert_eq!(parsed["sheets"][0]["data"][0][1], json!(false));
+    }
+
+    #[test]
+    fn test_sparse_high_coordinate_export_is_rejected() {
+        let mut workbook = Workbook::new();
+        workbook
+            .sheet_mut(0)
+            .unwrap()
+            .set_cell_value(999_999, 16_383, "edge".into());
+        assert!(matches!(
+            export_workbook_json(&workbook),
+            Err(JsonError::TooManyCells(_, MAX_DENSE_EXPORT_CELLS))
+        ));
     }
 }

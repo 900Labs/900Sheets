@@ -1,5 +1,6 @@
 export interface SheetInfo {
   id: number
+  stable_id: number
   name: string
 }
 

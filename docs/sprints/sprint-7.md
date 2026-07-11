@@ -1,4 +1,4 @@
-# Sprint 7: Data Tools — Sort, Filter, Find/Replace
+# Sprint 7: Data Tools - Sort, Filter, Find/Replace
 
 ## Goal
 Implement data manipulation tools: sorting, filtering, and find/replace operations on sheet data.

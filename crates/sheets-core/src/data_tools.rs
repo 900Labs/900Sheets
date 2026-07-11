@@ -1,6 +1,9 @@
 use crate::cell::{CellType, CellValue};
 use crate::sheet::Sheet;
 
+type SortCell = (u32, Option<CellValue>, Option<crate::format::CellFormat>);
+type SortRow = (CellValue, Vec<SortCell>);
+
 pub fn sort_sheet(
     sheet: &Sheet,
     sort_col: u32,
@@ -10,10 +13,17 @@ pub fn sort_sheet(
 ) -> Vec<((u32, u32), CellValue)> {
     let mut rows: Vec<Vec<((u32, u32), CellValue)>> = Vec::new();
 
+    let max_used_col = sheet
+        .iter_cells()
+        .filter(|((row, _), _)| *row >= start_row && *row <= end_row)
+        .map(|((_, col), _)| col)
+        .max()
+        .unwrap_or(sort_col);
+
     for row in start_row..=end_row {
         let mut row_data = Vec::new();
         let mut has_data = false;
-        for col in 0..sheet.max_cols() {
+        for col in 0..=max_used_col {
             if let Some(cell) = sheet.cell(row, col) {
                 if !cell.is_empty() {
                     row_data.push(((row, col), cell.clone()));
@@ -58,16 +68,83 @@ pub fn sort_sheet(
 }
 
 pub fn apply_sort(sheet: &mut Sheet, sort_col: u32, start_row: u32, end_row: u32, ascending: bool) {
-    let sorted = sort_sheet(sheet, sort_col, start_row, end_row, ascending);
+    let max_col = sheet
+        .iter_cells()
+        .filter(|((row, _), _)| *row >= start_row && *row <= end_row)
+        .map(|((_, col), _)| col)
+        .chain(
+            sheet
+                .iter_formats()
+                .filter(|((row, _), _)| *row >= start_row && *row <= end_row)
+                .map(|((_, col), _)| col),
+        )
+        .max()
+        .unwrap_or(sort_col);
+    apply_sort_range(sheet, sort_col, start_row, end_row, 0, max_col, ascending);
+}
+
+pub fn apply_sort_range(
+    sheet: &mut Sheet,
+    sort_col: u32,
+    start_row: u32,
+    end_row: u32,
+    start_col: u32,
+    end_col: u32,
+    ascending: bool,
+) {
+    if start_row > end_row
+        || start_col > end_col
+        || sort_col < start_col
+        || sort_col > end_col
+        || !sheet.in_bounds(end_row, end_col)
+    {
+        return;
+    }
+
+    let mut rows: Vec<SortRow> = Vec::new();
+    for row in start_row..=end_row {
+        let key = sheet
+            .cell(row, sort_col)
+            .cloned()
+            .unwrap_or_else(CellValue::empty);
+        let cells = (start_col..=end_col)
+            .map(|col| {
+                (
+                    col,
+                    sheet.cell(row, col).cloned(),
+                    sheet.get_format(row, col).cloned(),
+                )
+            })
+            .collect();
+        rows.push((key, cells));
+    }
+
+    rows.sort_by(|(a, _), (b, _)| {
+        let comparison = compare_cells(a, b);
+        if ascending {
+            comparison
+        } else {
+            comparison.reverse()
+        }
+    });
 
     for row in start_row..=end_row {
-        for col in 0..sheet.max_cols() {
-            sheet.clear_cell(row, col);
+        for col in start_col..=end_col {
+            sheet.clear_value(row, col);
+            sheet.clear_format(row, col);
         }
     }
 
-    for ((row, col), cell) in sorted {
-        sheet.set_cell(row, col, cell);
+    for (offset, (_, cells)) in rows.into_iter().enumerate() {
+        let row = start_row + offset as u32;
+        for (col, cell, format) in cells {
+            if let Some(cell) = cell {
+                sheet.set_cell(row, col, cell);
+            }
+            if let Some(format) = format {
+                sheet.set_format(row, col, format);
+            }
+        }
     }
 }
 
@@ -394,6 +471,23 @@ mod tests {
         assert_eq!(sheet.cell_value(1, 0), Some("Alice".into()));
         assert_eq!(sheet.cell_value(2, 0), Some("Bob".into()));
         assert_eq!(sheet.cell_value(3, 0), Some("Charlie".into()));
+    }
+
+    #[test]
+    fn test_apply_sort_range_moves_formats_and_leaves_outside_columns_unchanged() {
+        use crate::format::CellFormat;
+
+        let mut sheet = make_sheet();
+        sheet.set_format(1, 0, CellFormat::new().bold(true));
+        sheet.set_format(2, 0, CellFormat::new().italic(true));
+        sheet.set_cell_value(1, 2, "outside".into());
+
+        apply_sort_range(&mut sheet, 0, 1, 3, 0, 1, true);
+
+        assert_eq!(sheet.cell_value(1, 0), Some("Alice".into()));
+        assert_eq!(sheet.get_format(1, 0).unwrap().italic, Some(true));
+        assert_eq!(sheet.get_format(3, 0).unwrap().bold, Some(true));
+        assert_eq!(sheet.cell_value(1, 2), Some("outside".into()));
     }
 
     #[test]

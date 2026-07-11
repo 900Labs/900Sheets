@@ -1,5 +1,5 @@
 use crate::error::XlsxError;
-use sheets_core::cell::{CellType, CellValue};
+use sheets_core::cell::CellType;
 use sheets_core::format::CellFormat;
 use sheets_core::workbook::Workbook;
 use std::io::Write;
@@ -22,7 +22,7 @@ pub fn export_workbook(workbook: &Workbook) -> Result<Vec<u8>, XlsxError> {
     zip.write_all(generate_workbook_xml(workbook).as_bytes())?;
 
     zip.start_file("xl/_rels/workbook.xml.rels", opts)?;
-    zip.write_all(generate_workbook_rels_xml(workbook).as_bytes())?;
+    zip.write_all(generate_workbook_rels_xml(workbook, has_styles).as_bytes())?;
 
     let mut shared_strings = Vec::new();
     let mut shared_string_index: std::collections::HashMap<String, usize> =
@@ -79,7 +79,7 @@ fn generate_workbook_xml(workbook: &Workbook) -> String {
     xml
 }
 
-fn generate_workbook_rels_xml(workbook: &Workbook) -> String {
+fn generate_workbook_rels_xml(workbook: &Workbook, has_styles: bool) -> String {
     let mut xml = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\n",
     );
@@ -88,6 +88,18 @@ fn generate_workbook_rels_xml(workbook: &Workbook) -> String {
             "<Relationship Id=\"rId{}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet{}.xml\"/>\n",
             i + 1,
             i + 1
+        ));
+    }
+    let mut next_id = workbook.sheet_count() + 1;
+    xml.push_str(&format!(
+        "<Relationship Id=\"rId{}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings\" Target=\"sharedStrings.xml\"/>\n",
+        next_id
+    ));
+    next_id += 1;
+    if has_styles {
+        xml.push_str(&format!(
+            "<Relationship Id=\"rId{}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>\n",
+            next_id
         ));
     }
     xml.push_str("</Relationships>");
@@ -123,18 +135,23 @@ fn generate_sheet_xml(
         }
     };
 
-    let mut rows: std::collections::BTreeMap<u32, Vec<(u32, &CellValue)>> =
-        std::collections::BTreeMap::new();
+    let mut positions = std::collections::BTreeSet::new();
 
-    for ((row, col), cell) in sheet.iter_cells() {
-        rows.entry(row).or_default().push((col, cell));
+    for ((row, col), _) in sheet.iter_cells() {
+        positions.insert((row, col));
+    }
+    for ((row, col), _) in sheet.iter_formats() {
+        positions.insert((row, col));
     }
 
-    for (row, cells) in &rows {
+    let mut rows: std::collections::BTreeMap<u32, Vec<u32>> = std::collections::BTreeMap::new();
+    for (row, col) in positions {
+        rows.entry(row).or_default().push(col);
+    }
+
+    for (row, cols) in &rows {
         xml.push_str(&format!("<row r=\"{}\">\n", row + 1));
-        let mut sorted_cells = cells.clone();
-        sorted_cells.sort_by_key(|(col, _)| *col);
-        for (col, cell) in &sorted_cells {
+        for col in cols {
             let ref_str = format!("{}{}", col_to_label(*col), row + 1);
             let style_idx = sheet
                 .get_format(*row, *col)
@@ -142,6 +159,12 @@ fn generate_sheet_xml(
             let s_attr = match style_idx {
                 Some(idx) => format!(" s=\"{}\"", idx),
                 None => String::new(),
+            };
+            let Some(cell) = sheet.cell(*row, *col) else {
+                if !s_attr.is_empty() {
+                    xml.push_str(&format!("<c r=\"{}\"{}/>\n", ref_str, s_attr));
+                }
+                continue;
             };
             match cell.cell_type {
                 CellType::Number => {
@@ -229,7 +252,7 @@ impl StyleTable {
             return None;
         }
         let key = serde_json::to_string(fmt).ok()?;
-        self.format_indices.get(&key).copied()
+        self.format_indices.get(&key).map(|index| index + 1)
     }
 }
 
@@ -240,17 +263,15 @@ fn build_style_table(workbook: &Workbook) -> StyleTable {
 
     for sheet_idx in 0..workbook.sheet_count() {
         if let Some(sheet) = workbook.sheet(sheet_idx) {
-            for ((row, col), _) in sheet.iter_cells() {
-                if let Some(fmt) = sheet.get_format(row, col) {
-                    if fmt.is_empty() {
-                        continue;
-                    }
-                    let key = serde_json::to_string(fmt).unwrap_or_default();
-                    if let std::collections::hash_map::Entry::Vacant(e) = format_indices.entry(key)
-                    {
-                        e.insert(formats.len());
-                        formats.push(fmt.clone());
-                    }
+            for (_, fmt) in sheet.iter_formats() {
+                if fmt.is_empty() {
+                    continue;
+                }
+                let key = serde_json::to_string(fmt).unwrap_or_default();
+                if let std::collections::hash_map::Entry::Vacant(entry) = format_indices.entry(key)
+                {
+                    entry.insert(formats.len());
+                    formats.push(fmt.clone());
                 }
             }
         }
@@ -290,42 +311,151 @@ fn generate_styles_xml(table: &StyleTable) -> String {
         xml.push_str("</numFmts>\n");
     }
 
-    xml.push_str(
-        "<fonts count=\"1\">\n<font><sz val=\"11\"/><name val=\"Calibri\"/></font>\n</fonts>\n",
-    );
-    xml.push_str(
-        "<fills count=\"1\">\n<fill><patternFill patternType=\"none\"/></fill>\n</fills>\n",
-    );
-    xml.push_str("<borders count=\"1\"><border/></borders>\n");
+    xml.push_str(&format!("<fonts count=\"{}\">\n", table.formats.len() + 1));
+    xml.push_str("<font><sz val=\"11\"/><name val=\"Calibri\"/></font>\n");
+    for fmt in &table.formats {
+        xml.push_str("<font>");
+        if fmt.bold == Some(true) {
+            xml.push_str("<b/>");
+        }
+        if fmt.italic == Some(true) {
+            xml.push_str("<i/>");
+        }
+        if fmt.underline == Some(true) {
+            xml.push_str("<u/>");
+        }
+        if fmt.strikethrough == Some(true) {
+            xml.push_str("<strike/>");
+        }
+        xml.push_str(&format!(
+            "<sz val=\"{}\"/><name val=\"{}\"/>",
+            fmt.font_size.unwrap_or(11.0),
+            escape_xml(fmt.font_name.as_deref().unwrap_or("Calibri"))
+        ));
+        if let Some(color) = &fmt.font_color {
+            xml.push_str(&format!("<color rgb=\"{}\"/>", xlsx_color(color)));
+        }
+        xml.push_str("</font>\n");
+    }
+    xml.push_str("</fonts>\n");
+
+    xml.push_str(&format!("<fills count=\"{}\">\n", table.formats.len() + 2));
+    xml.push_str("<fill><patternFill patternType=\"none\"/></fill>\n");
+    xml.push_str("<fill><patternFill patternType=\"gray125\"/></fill>\n");
+    for fmt in &table.formats {
+        if let Some(color) = &fmt.bg_color {
+            xml.push_str(&format!(
+                "<fill><patternFill patternType=\"solid\"><fgColor rgb=\"{}\"/><bgColor indexed=\"64\"/></patternFill></fill>\n",
+                xlsx_color(color)
+            ));
+        } else {
+            xml.push_str("<fill><patternFill patternType=\"none\"/></fill>\n");
+        }
+    }
+    xml.push_str("</fills>\n");
+
+    xml.push_str(&format!(
+        "<borders count=\"{}\"><border/>\n",
+        table.formats.len() + 1
+    ));
+    for fmt in &table.formats {
+        xml.push_str("<border>");
+        write_border(&mut xml, "left", fmt.border_left.as_ref());
+        write_border(&mut xml, "right", fmt.border_right.as_ref());
+        write_border(&mut xml, "top", fmt.border_top.as_ref());
+        write_border(&mut xml, "bottom", fmt.border_bottom.as_ref());
+        xml.push_str("<diagonal/></border>\n");
+    }
+    xml.push_str("</borders>\n");
 
     xml.push_str(&format!(
         "<cellXfs count=\"{}\">\n",
         table.formats.len() + 1
     ));
     xml.push_str("<xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/>\n");
-    for fmt in &table.formats {
+    for (index, fmt) in table.formats.iter().enumerate() {
         let num_fmt_id = fmt
             .number_format
             .as_ref()
             .and_then(|nf| num_fmt_indices.get(nf).copied())
             .unwrap_or(0);
-        let bold_attr = if fmt.bold == Some(true) {
-            " b=\"1\""
-        } else {
-            ""
-        };
-        let italic_attr = if fmt.italic == Some(true) {
-            " i=\"1\""
-        } else {
-            ""
-        };
         xml.push_str(&format!(
-            "<xf numFmtId=\"{}\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"{}{} applyFont=\"1\"/>\n",
-            num_fmt_id, bold_attr, italic_attr
+            "<xf numFmtId=\"{}\" fontId=\"{}\" fillId=\"{}\" borderId=\"{}\" xfId=\"0\" applyFont=\"1\" applyFill=\"1\" applyBorder=\"1\"{}>",
+            num_fmt_id,
+            index + 1,
+            index + 2,
+            index + 1,
+            if num_fmt_id == 0 { "" } else { " applyNumberFormat=\"1\"" }
         ));
+        if fmt.h_align.is_some() || fmt.v_align.is_some() || fmt.wrap_text.is_some() {
+            xml.push_str("<alignment");
+            if let Some(horizontal) = fmt.h_align {
+                let value = match horizontal {
+                    sheets_core::format::HorizontalAlignment::Left => "left",
+                    sheets_core::format::HorizontalAlignment::Center => "center",
+                    sheets_core::format::HorizontalAlignment::Right => "right",
+                    sheets_core::format::HorizontalAlignment::General => "general",
+                };
+                xml.push_str(&format!(" horizontal=\"{value}\""));
+            }
+            if let Some(vertical) = fmt.v_align {
+                let value = match vertical {
+                    sheets_core::format::VerticalAlignment::Top => "top",
+                    sheets_core::format::VerticalAlignment::Middle => "center",
+                    sheets_core::format::VerticalAlignment::Bottom => "bottom",
+                };
+                xml.push_str(&format!(" vertical=\"{value}\""));
+            }
+            if let Some(wrap) = fmt.wrap_text {
+                xml.push_str(if wrap {
+                    " wrapText=\"1\""
+                } else {
+                    " wrapText=\"0\""
+                });
+            }
+            xml.push_str("/>");
+        }
+        xml.push_str("</xf>\n");
     }
     xml.push_str("</cellXfs>\n</styleSheet>");
     xml
+}
+
+fn xlsx_color(color: &str) -> String {
+    let hex = color.trim_start_matches('#');
+    if hex.len() == 8 {
+        hex.to_ascii_uppercase()
+    } else if hex.len() == 6 {
+        format!("FF{}", hex.to_ascii_uppercase())
+    } else {
+        "FF000000".to_string()
+    }
+}
+
+fn write_border(xml: &mut String, side: &str, border: Option<&sheets_core::format::Border>) {
+    use sheets_core::format::BorderStyle;
+    let Some(border) = border else {
+        xml.push_str(&format!("<{side}/>"));
+        return;
+    };
+    let style = match border.style {
+        BorderStyle::None => None,
+        BorderStyle::Thin => Some("thin"),
+        BorderStyle::Medium => Some("medium"),
+        BorderStyle::Thick => Some("thick"),
+        BorderStyle::Dotted => Some("dotted"),
+        BorderStyle::Dashed => Some("dashed"),
+        BorderStyle::Double => Some("double"),
+    };
+    let Some(style) = style else {
+        xml.push_str(&format!("<{side}/>"));
+        return;
+    };
+    xml.push_str(&format!("<{side} style=\"{style}\">"));
+    if let Some(color) = &border.color {
+        xml.push_str(&format!("<color rgb=\"{}\"/>", xlsx_color(color)));
+    }
+    xml.push_str(&format!("</{side}>"));
 }
 
 fn escape_xml(s: &str) -> String {
@@ -416,6 +546,72 @@ mod tests {
         assert_eq!(wb2.sheets()[1].name(), "Second");
         assert_eq!(wb2.sheets()[0].cell_value(0, 0), Some("A1".into()));
         assert_eq!(wb2.sheets()[1].cell_value(0, 0), Some("B1".into()));
+    }
+
+    #[test]
+    fn test_export_import_preserves_complete_styles_and_formatted_blank_cells() {
+        use sheets_core::format::{Border, BorderStyle, HorizontalAlignment, VerticalAlignment};
+
+        let mut wb = Workbook::new();
+        let sheet = wb.sheet_mut(0).unwrap();
+        sheet.set_cell_value(0, 0, "Styled".into());
+        let format = CellFormat {
+            bold: Some(true),
+            italic: Some(true),
+            underline: Some(true),
+            strikethrough: Some(true),
+            font_size: Some(14.0),
+            font_name: Some("Arial".into()),
+            font_color: Some("#112233".into()),
+            bg_color: Some("#AABBCC".into()),
+            h_align: Some(HorizontalAlignment::Center),
+            v_align: Some(VerticalAlignment::Middle),
+            wrap_text: Some(true),
+            number_format: Some("0.000".into()),
+            border_top: Some(Border {
+                style: BorderStyle::Thin,
+                color: Some("#FF0000".into()),
+            }),
+            border_bottom: None,
+            border_left: None,
+            border_right: None,
+        };
+        sheet.set_format(0, 0, format.clone());
+        sheet.set_format(4, 4, format.clone());
+
+        let data = export_workbook(&wb).unwrap();
+        let imported = crate::import_workbook(&data).unwrap();
+        assert_eq!(imported.sheet(0).unwrap().get_format(0, 0), Some(&format));
+        assert_eq!(imported.sheet(0).unwrap().get_format(4, 4), Some(&format));
+        assert!(imported.sheet(0).unwrap().cell(4, 4).is_none());
+    }
+
+    #[test]
+    fn test_export_package_declares_shared_strings_and_styles_relationships() {
+        use std::io::Read;
+
+        let mut workbook = Workbook::new();
+        workbook
+            .sheet_mut(0)
+            .unwrap()
+            .set_cell_value(0, 0, "text".into());
+        workbook
+            .sheet_mut(0)
+            .unwrap()
+            .set_format(0, 0, CellFormat::new().bold(true));
+        let data = export_workbook(&workbook).unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(data)).unwrap();
+        let mut relationships = String::new();
+        archive
+            .by_name("xl/_rels/workbook.xml.rels")
+            .unwrap()
+            .read_to_string(&mut relationships)
+            .unwrap();
+
+        assert!(relationships.contains("relationships/sharedStrings"));
+        assert!(relationships.contains("Target=\"sharedStrings.xml\""));
+        assert!(relationships.contains("relationships/styles"));
+        assert!(relationships.contains("Target=\"styles.xml\""));
     }
 
     #[test]

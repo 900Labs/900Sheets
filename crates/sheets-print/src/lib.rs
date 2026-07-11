@@ -4,6 +4,8 @@ use sheets_core::sheet::Sheet;
 use std::fmt::Write as _;
 use thiserror::Error;
 
+const MAX_PRINT_CELLS: u64 = 5_000_000;
+
 // ============================================================================
 // Print Configuration
 // ============================================================================
@@ -205,6 +207,13 @@ pub fn calculate_pages(sheet: &Sheet, config: &PrintConfig) -> Result<PageLayout
         return Err(PrintError::InvalidPrintArea(format!(
             "start ({},{}) > end ({},{})",
             start_row, start_col, end_row, end_col
+        )));
+    }
+    let cell_count =
+        u64::from(end_row - start_row + 1).saturating_mul(u64::from(end_col - start_col + 1));
+    if cell_count > MAX_PRINT_CELLS {
+        return Err(PrintError::InvalidPrintArea(format!(
+            "print area contains {cell_count} cells; maximum is {MAX_PRINT_CELLS}"
         )));
     }
 

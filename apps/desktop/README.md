@@ -7,7 +7,7 @@ Tauri v2 desktop shell for 900Sheets. The frontend is Svelte 5 and the backend c
 From the repository root:
 
 ```bash
-npm install --prefix apps/desktop
+npm ci --prefix apps/desktop
 npm run tauri:dev --prefix apps/desktop
 ```
 
@@ -42,10 +42,12 @@ cargo test --workspace
 
 The desktop toolbar exposes native-dialog flows backed by Rust commands:
 
-- Open XLSX: `import_xlsx_file`
+- Open native workbook: `import_native_file`
+- Save native workbook: `export_native_file`
+- Import XLSX: `import_xlsx_file`
 - Import CSV or TSV into the active sheet: `import_csv_file`
 - Import JSON workbook: `import_json_file`
-- Save XLSX: `export_xlsx_file`
+- Export XLSX: `export_xlsx_file`
 - Export active sheet as CSV: `export_csv_file`
 - Export workbook as JSON: `export_json_file`
 

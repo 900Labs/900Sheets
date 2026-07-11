@@ -1,145 +1,118 @@
 # 900Sheets
 
-Offline-first spreadsheet for low-resource environments.
+900Sheets is a free, local-first desktop spreadsheet editor. It opens common spreadsheet data, supports formulas and formatting, and works without an account, subscription, telemetry, or constant internet access.
 
-Free. Local. Open.
+## Why it exists
 
-900Sheets is a local-first desktop spreadsheet application designed for communities where expensive subscriptions, constant connectivity, and high-end hardware are not realistic assumptions.
+900 Labs starts from a simple problem: around 900 million people are priced out of modern software. The company builds enterprise-grade open-source tools for developing economies and for anyone who cannot justify another expensive software subscription.
 
-Built by [900 Labs](https://www.900labs.com) — building enterprise-grade open source tools for the 900 million+ people in developing economies who are priced out of the software that modern businesses depend on.
+900Sheets is one part of that mission. A spreadsheet is basic working infrastructure for schools, small businesses, community organizations, researchers, and public services. The tool should remain useful on an ordinary computer and should not stop working when a subscription ends.
 
-## Features
+## Current release
 
-### Core (MVP)
+Version 0.3.0 is an early public release for macOS and source builds. It includes:
 
-- Tauri v2 desktop shell with a Rust backend and Svelte 5 frontend.
-- Custom Rust workbook/sheet/cell data model with A1 address notation.
-- Grid UI (52 cols × 1000 rows) with cell selection, keyboard navigation, and inline editing.
-- Formula bar for entering values and formulas.
-- Sheet tab management (add, rename, delete).
-- Formula engine with 174 built-in functions (math, logical, text, info, statistical, financial, date/time, lookup).
-- Formula dependency graph with circular reference detection and topological sort.
-- XLSX (OOXML) import/export with shared strings and multi-sheet support.
-- CSV and JSON import/export with delimiter detection and multi-line field support.
-- Cell formatting and number formats (general, number, currency, percentage, date, time, scientific).
-- Sort, find/replace, copy/paste, undo/redo.
-- No telemetry by default.
-- Apache-2.0 licensing.
+- A fast Rust workbook engine with a Tauri and Svelte desktop interface
+- Multiple sheets, cell editing, keyboard navigation, copy and paste, and find and replace
+- 174 formula functions with dependency tracking and circular-reference checks
+- Cell fonts, colors, alignment, borders, wrapping, and number formats
+- Native `.900sheets` workbooks for continued editing
+- XLSX, CSV, and JSON import and export
+- PDF export and print configuration
+- Sort, filters, pivot tables, chart previews, validation, conditional formatting, named ranges, frozen panes, comments, and sheet protection
+- No account requirement and no telemetry
 
-### Post-MVP
+Read [Compatibility and known limitations](docs/COMPATIBILITY.md) before using 900Sheets for important work. Cross-sheet formulas are not supported in v0.3.0, and the packaged macOS build is not yet signed or notarized.
 
-- **Pivot tables** with aggregation (sum, count, average, min, max, product), row/column grouping, filtering, and grand totals.
-- **Charts & data visualization** — bar, line, pie, scatter, area, column, and doughnut charts with SVG generation and series extraction from sheet data.
-- **Statistical, financial, engineering, date/time, lookup, and array functions** — expanding the formula engine to 174 total functions.
-- **Advanced conditional formatting** — cell rules, top/bottom, data bars, color scales, icon sets, and formula-based rules. **Data validation** with input constraints, dropdowns, and error alerts.
-- **Internationalization backend** — 22 supported locales, 88 translation keys, locale-aware number/currency/percentage/date/time formatting, RTL support (Arabic, Hebrew). **Accessibility** — ARIA labels, screen reader support, keyboard navigation metadata. Full locale settings UI remains backend-ready rather than fully wired.
-- **Print & PDF export** — page layout (A4, A3, Letter, Legal, Tabloid), portrait/landscape, margins, scaling (fit-to-page, fit-to-width, custom %), headers/footers with `{page}`/`{pages}` templates, gridlines, row/column headings, print areas, repeating rows/columns, HTML print rendering, and minimal PDF 1.4 generation.
-- **Advanced features** — sheet protection with password hashing and granular permissions, cell locking, goal seek (Newton's method with bisection fallback), and cell comments/notes with author tracking are wired into the desktop app. Scenario support is available in the backend engine/IPC; the full scenario manager UI is not yet wired.
-- **Cell comments/notes** with author tracking, visibility toggling, and bulk management.
+## Install and run
 
-## Architecture
+### macOS release artifact
 
-900Sheets uses a Rust-owned data model with a Svelte 5 projection UI:
+Tagged releases build and archive `900Sheets.app` in GitHub Actions. Download the `900Sheets-v0.3.0-macos` artifact from the release workflow, extract `900Sheets-v0.3.0-macos.zip`, and move the app to Applications. The archive workflow verifies that the app executable remains executable after extraction.
 
-1. `sheets-core` owns the workbook/sheet/cell data model.
-2. `sheets-formula` provides the formula parser, evaluator, and dependency graph.
-3. `sheets-xlsx` handles XLSX (OOXML) import/export at the Rust boundary.
-4. `sheets-csv` and `sheets-json` handle CSV and JSON import/export.
-5. `sheets-chart` provides chart rendering and SVG generation.
-6. `sheets-pivot` provides the pivot table engine.
-7. `sheets-validation` handles data validation and conditional formatting.
-8. `sheets-i18n` provides locale management, translations, and accessibility labels.
-9. `sheets-print` handles print layout and PDF generation.
-10. `sheets-advanced` provides sheet protection, goal seek, scenarios, and comments.
-11. The Svelte 5 frontend is an editing projection over the Rust model.
+The v0.3.0 artifact is ad hoc signed and not notarized. macOS may require you to right-click the app and choose Open the first time. Only use artifacts published by the `900Labs/900Sheets` repository.
 
-Repository layout:
-
-```
-900Sheets/
-├── apps/desktop/              # Tauri v2 + Svelte 5 desktop app
-│   └── src-tauri/             # Rust backend (Tauri commands, IPC)
-├── crates/
-│   ├── sheets-core/           # Workbook/sheet/cell model, types, commands, undo/redo
-│   ├── sheets-formula/        # Formula parser, evaluator, dependency graph, functions
-│   ├── sheets-xlsx/           # XLSX read/write (OOXML) — import/export boundary
-│   ├── sheets-csv/            # CSV import/export with delimiter detection
-│   ├── sheets-json/           # JSON import/export
-│   ├── sheets-chart/          # Chart rendering and data visualization
-│   ├── sheets-pivot/          # Pivot table engine
-│   ├── sheets-validation/     # Data validation and conditional formatting
-│   ├── sheets-i18n/           # Internationalization and accessibility
-│   ├── sheets-print/          # Print layout and PDF export
-│   └── sheets-advanced/       # Sheet protection, goal seek, scenarios, comments
-├── docs/                      # Public documentation, ADRs, sprint records
-├── scripts/                   # Validation and release-preflight scripts
-└── .github/                   # CI/CD workflows and templates
-```
-
-## Build From Source
+### Build from source
 
 Prerequisites:
-- Rust 1.92.0 — pinned in `rust-toolchain.toml`; install from [rustup.rs](https://rustup.rs)
-- Node.js 20.19+, 22.12+, or 24+ — install from [nodejs.org](https://nodejs.org)
-- Tauri CLI v2: `cargo install tauri-cli --version "^2"`
-- Tauri v2 system dependencies — see [v2.tauri.app/start/prerequisites](https://v2.tauri.app/start/prerequisites)
+
+- Rust 1.92.0, pinned by `rust-toolchain.toml`
+- Node.js 20.19 or newer, 22.12 or newer, or 24 or newer
+- The [Tauri v2 system prerequisites](https://v2.tauri.app/start/prerequisites/)
 
 ```bash
 git clone https://github.com/900Labs/900Sheets.git
 cd 900Sheets
-npm install --prefix apps/desktop
+npm ci --prefix apps/desktop
 npm run tauri:dev --prefix apps/desktop
 ```
 
-## Validation
+Create a release build with:
 
-Run the local quality gate before opening a pull request:
+```bash
+npm run tauri:build --prefix apps/desktop
+```
+
+## How to use it
+
+1. Select a cell and type a value or a formula such as `=SUM(A1:A10)`.
+2. Use the sheet tabs to add, rename, select, or remove sheets.
+3. Use the toolbar and menus for formatting, data tools, charts, pivots, validation, and print output.
+4. Choose **File > Save Workbook** to create an editable `.900sheets` file.
+5. Use **File > Import XLSX** to bring in an Excel workbook.
+6. Use the export commands when you need XLSX, CSV, JSON, or PDF output.
+
+The `.900sheets` format is the safest choice for continued editing in 900Sheets. XLSX support is intended for exchange with other spreadsheet applications, but it does not preserve every Excel feature.
+
+The full walkthrough is in the [User guide](docs/USER_GUIDE.md).
+
+## Development
+
+The repository is a Rust workspace with a Svelte 5 desktop application:
+
+```text
+apps/desktop/             Tauri v2 and Svelte desktop app
+crates/sheets-core/       Workbook, sheet, cell, formatting, and data tools
+crates/sheets-formula/    Formula parser, evaluator, functions, and dependencies
+crates/sheets-xlsx/       XLSX import and export
+crates/sheets-csv/        CSV import and export
+crates/sheets-json/       JSON and native workbook formats
+crates/sheets-chart/      Chart data and SVG previews
+crates/sheets-pivot/      Pivot engine
+crates/sheets-validation/ Validation and conditional formatting
+crates/sheets-i18n/       Locale and accessibility helpers
+crates/sheets-print/      Print layout and PDF output
+crates/sheets-advanced/   Protection, goal seek, scenarios, and comments
+```
+
+See [Architecture](docs/ARCHITECTURE.md) for the data flow and crate boundaries.
+
+## Quality gate
+
+Run the complete local gate before opening a pull request:
 
 ```bash
 ./scripts/verify-local.sh
 ```
 
-The local quality gate includes Rust formatting, clippy, Rust tests, Svelte type checks, the frontend build, and Playwright spreadsheet interaction smokes. On a fresh machine, if Playwright reports that Chromium is missing, run:
+The v0.3.0 gate covers 418 Rust tests, 4 mutation-queue unit tests, and 8 Playwright interaction tests, plus Rust formatting, clippy with warnings denied, Svelte and TypeScript diagnostics, and a production frontend build. The Rust suite includes an external LibreOffice XLSX round trip. CI installs LibreOffice and requires that test to run; local systems without `soffice` report a skip.
+
+If Playwright cannot find Chromium, install it with:
 
 ```bash
 npx --prefix apps/desktop playwright install chromium
 ```
 
-Tagged releases run the macOS release workflow and upload an unsigned
-`900Sheets.app` artifact. Code signing, notarization, and Windows/Linux release
-artifacts remain release-operations follow-ups.
+## Contributing and support
 
-## Test Suite
-
-The project includes 396 unit tests across Rust crates and the desktop backend, plus 6 Playwright spreadsheet interaction smoke tests:
-
-| Crate | Tests | Description |
-|-------|-------|-------------|
-| sheets-core | 65 | Workbook, sheet, cell, address, format |
-| sheets-formula | 112 | Parser, evaluator, 174 functions |
-| sheets-xlsx | 12 | Import/export round-trip and import resource limits |
-| sheets-csv | 24 | Delimiter detection, import/export, import resource limits |
-| sheets-json | 18 | Import/export and import resource limits |
-| sheets-chart | 9 | Chart types, SVG generation |
-| sheets-pivot | 11 | Grouping, aggregation, filtering |
-| sheets-validation | 35 | Data validation, conditional formatting |
-| sheets-i18n | 44 | Locales, translations, formatting, accessibility |
-| sheets-print | 25 | Page layout, HTML, PDF generation |
-| sheets-advanced | 32 | Protection, goal seek, scenarios, comments |
-| sheets-desktop backend | 9 | Tauri protection/path helper behavior, formula graph safety, reset cleanup |
-| Playwright E2E | 6 | Cell typing, Delete/Backspace clearing, formula bar/fx, copy/paste undo/redo, compact toolbar menu viewport checks |
-
-## Documentation
-
+- [Contributing guide](CONTRIBUTING.md)
+- [Support guide](SUPPORT.md)
+- [Security policy](SECURITY.md)
 - [Documentation index](docs/README.md)
-- [Architecture](docs/ARCHITECTURE.md)
-- [Roadmap](docs/ROADMAP.md)
-- [Quality gate](docs/QUALITY_GATE.md)
+- [Release process](docs/RELEASING.md)
 
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md). Contributions must include matching documentation updates when behavior, workflows, public APIs, or contributor expectations change.
+Bug reports, compatibility fixtures, translations, documentation improvements, and focused performance work are welcome.
 
 ## License
 
-900Sheets is licensed under Apache License 2.0. See [LICENSE](LICENSE) for details.
+900Sheets is licensed under the Apache License 2.0. See [LICENSE](LICENSE).

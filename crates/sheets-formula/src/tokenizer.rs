@@ -238,6 +238,7 @@ impl Tokenizer {
             }
         }
         let s: String = self.input[start..self.pos].iter().collect();
+
         let n = s
             .parse::<f64>()
             .map_err(|e| FormulaError::ParseError(e.to_string()))?;
@@ -266,10 +267,9 @@ impl Tokenizer {
 
     fn read_error_literal(&mut self) -> Result<Token, FormulaError> {
         let start = self.pos;
+        self.pos += 1;
         while self.pos < self.input.len()
-            && self.input[self.pos].is_ascii_alphanumeric()
-            && self.input[self.pos] != '!'
-            && self.input[self.pos] != '?'
+            && (self.input[self.pos].is_ascii_alphanumeric() || self.input[self.pos] == '/')
         {
             self.pos += 1;
         }
@@ -293,6 +293,12 @@ impl Tokenizer {
             }
         }
         let s: String = self.input[start..self.pos].iter().collect();
+
+        if self.peek() == Some('!') {
+            return Err(FormulaError::ParseError(
+                "Cross-sheet references are not supported in this release".into(),
+            ));
+        }
 
         if self.peek() == Some('(') {
             return Ok(Token::Function(s.to_uppercase()));
@@ -374,6 +380,12 @@ mod tests {
     fn test_tokenize_cell_ref() {
         let tokens = tokenize("A1").unwrap();
         assert_eq!(tokens, vec![Token::CellRef("A1".into())]);
+    }
+
+    #[test]
+    fn test_cross_sheet_reference_has_clear_error() {
+        let error = tokenize("Sheet2!A1").unwrap_err();
+        assert!(error.to_string().contains("Cross-sheet references"));
     }
 
     #[test]

@@ -1,15 +1,18 @@
 use crate::sheet::Sheet;
 
+#[derive(Clone)]
 pub struct Workbook {
     sheets: Vec<Sheet>,
     active_sheet: usize,
+    next_sheet_id: u64,
 }
 
 impl Workbook {
     pub fn new() -> Self {
         Self {
-            sheets: vec![Sheet::new("Sheet1")],
+            sheets: vec![Sheet::with_stable_id(1, "Sheet1")],
             active_sheet: 0,
+            next_sheet_id: 2,
         }
     }
 
@@ -37,15 +40,27 @@ impl Workbook {
 
     pub fn add_sheet(&mut self, name: impl Into<String>) -> usize {
         let name = name.into();
-        let sheet = Sheet::new(name);
+        let sheet = Sheet::with_stable_id(self.next_sheet_id, name);
+        self.next_sheet_id = self.next_sheet_id.saturating_add(1);
         self.sheets.push(sheet);
         self.sheets.len() - 1
     }
 
     pub fn insert_sheet(&mut self, index: usize, name: impl Into<String>) {
         if index <= self.sheets.len() {
-            self.sheets.insert(index, Sheet::new(name));
+            self.sheets
+                .insert(index, Sheet::with_stable_id(self.next_sheet_id, name));
+            self.next_sheet_id = self.next_sheet_id.saturating_add(1);
         }
+    }
+
+    pub fn set_sheet_stable_id(&mut self, index: usize, stable_id: u64) -> bool {
+        let Some(sheet) = self.sheets.get_mut(index) else {
+            return false;
+        };
+        sheet.set_stable_id(stable_id);
+        self.next_sheet_id = self.next_sheet_id.max(stable_id.saturating_add(1));
+        true
     }
 
     pub fn delete_sheet(&mut self, index: usize) -> bool {
@@ -122,5 +137,16 @@ mod tests {
         let mut wb = Workbook::new();
         assert!(wb.rename_sheet(0, "Data"));
         assert_eq!(wb.sheets()[0].name(), "Data");
+    }
+
+    #[test]
+    fn sheet_stable_ids_survive_index_changes() {
+        let mut workbook = Workbook::new();
+        let first_id = workbook.sheet(0).unwrap().stable_id();
+        let second = workbook.add_sheet("Second");
+        let second_id = workbook.sheet(second).unwrap().stable_id();
+        workbook.delete_sheet(0);
+        assert_ne!(first_id, second_id);
+        assert_eq!(workbook.sheet(0).unwrap().stable_id(), second_id);
     }
 }

@@ -6,7 +6,7 @@ Wire all backend crates into the Tauri IPC layer, verify full system integration
 ## Scope Delivered
 
 ### Tauri IPC Commands (apps/desktop/src-tauri/src/lib.rs)
-- [x] Formula evaluation: `evaluate_formula` — parse and evaluate formula in sheet context
+- [x] Formula evaluation: `evaluate_formula` - parse and evaluate formula in sheet context
 - [x] XLSX import/export: `import_xlsx`, `export_xlsx`
 - [x] CSV import/export: `import_csv_data`, `export_csv` (with configurable delimiter)
 - [x] JSON import/export: `import_json_data`, `export_json`

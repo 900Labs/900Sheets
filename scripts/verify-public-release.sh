@@ -40,4 +40,13 @@ if grep -rE --exclude-dir=target --exclude-dir=node_modules --exclude-dir=dist \
 fi
 
 echo "PASS: No local paths, secrets, or sensitive artifacts found"
+
+if ! grep -q -- '--keepParent' .github/workflows/release.yml || \
+  ! grep -q 'test -x' .github/workflows/release.yml || \
+  ! grep -q 'macos.zip' .github/workflows/release.yml; then
+  echo "FAIL: Release workflow must archive the app and verify executable permission"
+  exit 1
+fi
+
+echo "PASS: Release archive preserves and verifies executable permission"
 echo "=== Public release checks passed ==="

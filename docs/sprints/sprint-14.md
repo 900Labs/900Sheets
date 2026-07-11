@@ -12,7 +12,7 @@ Implement print layout configuration, HTML print rendering, and PDF generation.
 - **Repeat rows/columns**: repeating headers on each page
 - **Gridlines and headings**: configurable printing of gridlines and row/column labels
 - **HTML rendering**: `render_html()` generates complete HTML document with `@page` CSS, per-page tables, cell formatting
-- **PDF generation**: `render_pdf()` produces minimal valid PDF 1.4 with `PdfBuilder` — catalog, pages, content streams, Helvetica font, gridlines, cell text
+- **PDF generation**: `render_pdf()` produces minimal valid PDF 1.4 with `PdfBuilder` - catalog, pages, content streams, Helvetica font, gridlines, cell text
 - **Print preview**: `generate_preview()` returns structured `PrintPreview` data for frontend
 - Tauri IPC: `get_print_preview`, `render_print_html`, `export_pdf`, `get_page_count`, `save_pdf_to_file`
 

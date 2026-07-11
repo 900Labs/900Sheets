@@ -15,11 +15,17 @@ async function installTauriMock(page: Page) {
 
     const cells = new Map<string, CellRecord>()
     const formats = new Map<string, Record<string, unknown>>()
+    const comments = new Map<string, { row: number; col: number; text: string; author: string }>()
     const callbacks = new Map<number, (data: unknown) => unknown>()
-    const sheets = [{ id: 1, name: 'Sheet1' }]
+    const sheets = [
+      { id: 0, stable_id: 1, name: 'Sheet1' },
+      { id: 1, stable_id: 2, name: 'Sheet2' },
+    ]
+    comments.set('0:0:1', { row: 0, col: 1, text: 'existing B1 comment', author: 'tester' })
     let callbackId = 1
 
     const keyFor = (row: unknown, col: unknown) => `${Number(row)}:${Number(col)}`
+    const commentKeyFor = (sheetId: unknown, row: unknown, col: unknown) => `${Number(sheetId)}:${Number(row)}:${Number(col)}`
 
     const tauriWindow = window as TauriWindow
     tauriWindow.__TAURI_INTERNALS__ = {
@@ -43,6 +49,8 @@ async function installTauriMock(page: Page) {
             cells.clear()
             formats.clear()
             return sheets
+          case 'set_active_sheet':
+            return null
           case 'get_sheet_data':
             return Array.from(cells.entries()).map(([key, cell]) => {
               const [row, col] = key.split(':').map(Number)
@@ -60,6 +68,18 @@ async function installTauriMock(page: Page) {
             cells.set(keyFor(args.row, args.col), { value, display: value })
             return null
           }
+          case 'batch_set_cells': {
+            const changes = (args.changes as Array<{ row: number; col: number; value: string }>) ?? []
+            for (const change of changes) {
+              const key = keyFor(change.row, change.col)
+              if (change.value) {
+                cells.set(key, { value: change.value, display: change.value })
+              } else {
+                cells.delete(key)
+              }
+            }
+            return null
+          }
           case 'clear_cell':
             cells.delete(keyFor(args.row, args.col))
             formats.delete(keyFor(args.row, args.col))
@@ -69,8 +89,31 @@ async function installTauriMock(page: Page) {
           case 'set_cell_format':
             formats.set(keyFor(args.row, args.col), (args.format as Record<string, unknown>) ?? {})
             return null
-          default:
+          case 'batch_set_formats': {
+            const changes = (args.changes as Array<{ row: number; col: number; format: Record<string, unknown> }>) ?? []
+            for (const change of changes) {
+              formats.set(keyFor(change.row, change.col), change.format)
+            }
             return null
+          }
+          case 'get_cell_comment':
+            return comments.get(commentKeyFor(args.sheetId, args.row, args.col)) ?? null
+          case 'list_comments':
+            return Array.from(comments.entries())
+              .filter(([key]) => key.startsWith(`${Number(args.sheetId)}:`))
+              .map(([, comment]) => comment)
+          case 'add_cell_comment':
+            comments.set(commentKeyFor(args.sheetId, args.row, args.col), {
+              row: Number(args.row),
+              col: Number(args.col),
+              text: String(args.text ?? ''),
+              author: String(args.author ?? ''),
+            })
+            return null
+          case 'remove_cell_comment':
+            return comments.delete(commentKeyFor(args.sheetId, args.row, args.col))
+          default:
+            throw new Error(`Unrecognized Tauri command in test mock: ${cmd}`)
         }
       },
     }
@@ -80,11 +123,11 @@ async function installTauriMock(page: Page) {
 async function openWorkbook(page: Page) {
   await installTauriMock(page)
   await page.goto('/')
-  await expect(page.locator('button.cell[aria-label="A1"]')).toBeVisible()
+  await expect(page.locator('button.cell[aria-label^="A1,"]')).toBeVisible()
 }
 
 function cell(page: Page, label: string) {
-  return page.locator(`button.cell[aria-label="${label}"]`)
+  return page.locator(`button.cell[aria-label^="${label},"]`)
 }
 
 async function enterCellText(page: Page, label: string, value: string) {
@@ -108,6 +151,7 @@ test('typing into a selected cell preserves the first character', async ({ page 
   await openWorkbook(page)
 
   const a1 = cell(page, 'A1')
+  await expect(a1).toHaveAccessibleName('A1, blank, selected')
   await a1.click()
   await a1.press('1')
 
@@ -121,6 +165,7 @@ test('typing into a selected cell preserves the first character', async ({ page 
 
   await editor.press('Enter')
   await expect(a1).toHaveText('12')
+  await expect(a1).toHaveAccessibleName('A1, 12, not selected')
 })
 
 test('delete and backspace clear the selected cell visibly', async ({ page }) => {
@@ -217,4 +262,54 @@ test('compact toolbar menus stay inside the viewport', async ({ page }) => {
   expect(box!.y).toBeGreaterThanOrEqual(0)
   expect(box!.x + box!.width).toBeLessThanOrEqual(viewport!.width)
   expect(box!.y + box!.height).toBeLessThanOrEqual(viewport!.height)
+})
+
+test('named range metadata stays isolated by stable sheet identity', async ({ page }) => {
+  await openWorkbook(page)
+
+  await page.locator('.menu-bar button').filter({ hasText: /^Data$/ }).click()
+  await page.getByRole('button', { name: 'Named Ranges...' }).click()
+  const nameInput = page.getByLabel('Name')
+  await nameInput.fill('Revenue')
+  await page.getByRole('button', { name: 'Add Named Range' }).click()
+  await expect(page.getByText('Revenue', { exact: true })).toBeVisible()
+  await page.getByRole('button', { name: 'Close' }).click()
+
+  await page.getByRole('button', { name: 'Sheet2', exact: true }).click()
+  await page.locator('.menu-bar button').filter({ hasText: /^Data$/ }).click()
+  await page.getByRole('button', { name: 'Named Ranges...' }).click()
+  await expect(page.getByText('Revenue', { exact: true })).toHaveCount(0)
+  await page.getByRole('button', { name: 'Close' }).click()
+
+  await page.getByRole('button', { name: 'Sheet1', exact: true }).click()
+  await page.locator('.menu-bar button').filter({ hasText: /^Data$/ }).click()
+  await page.getByRole('button', { name: 'Named Ranges...' }).click()
+  await expect(page.getByText('Revenue', { exact: true })).toBeVisible()
+})
+
+test('comment drafts cannot follow cell or sheet selection changes', async ({ page }) => {
+  await openWorkbook(page)
+
+  await page.locator('.menu-bar button').filter({ hasText: /^Insert$/ }).click()
+  await page.getByRole('button', { name: 'Comment...' }).click()
+  const commentInput = page.locator('textarea.panel-input')
+  await expect(commentInput).toBeVisible()
+  await commentInput.fill('draft for A1')
+
+  await page.locator('.result-row').filter({ hasText: 'B1' }).click()
+  await expect(commentInput).toHaveCount(0)
+
+  await page.locator('.menu-bar button').filter({ hasText: /^Insert$/ }).click()
+  await page.getByRole('button', { name: 'Comment...' }).click()
+  await expect(page.locator('textarea.panel-input')).toHaveValue('existing B1 comment')
+  await page.locator('textarea.panel-input').fill('draft for Sheet1 B1')
+
+  const sheet2 = page.getByRole('button', { name: 'Sheet2', exact: true })
+  await sheet2.evaluate((button: HTMLButtonElement) => button.click())
+  await expect(page.locator('textarea.panel-input')).toHaveCount(0)
+  await expect(sheet2).toHaveClass(/active/)
+
+  await page.locator('.menu-bar button').filter({ hasText: /^Insert$/ }).click()
+  await page.getByRole('button', { name: 'Comment...' }).click()
+  await expect(page.locator('textarea.panel-input')).toHaveValue('')
 })

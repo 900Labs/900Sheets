@@ -22,15 +22,15 @@ sheets-xlsx/csv/json (File I/O) [Sprints 4-5]
 
 #### sheets-core
 The core data model. Owns:
-- `Workbook` — collection of sheets with active sheet tracking
-- `Sheet` — grid of cells with sparse storage via `HashMap<(u32, u32), CellValue>`
-- `CellValue` — tagged union: Number, Text, Boolean, Error, Empty, Formula
-- `CellAddress` — A1 notation parsing and serialization with absolute/relative support
-- `CoreError` — typed errors for out-of-bounds and parse failures
-- `CellFormat` — bold, italic, underline, font size/name/color, background color, alignment, borders, number format
-- `NumberFormat` — general, number, currency, percentage, date, time, scientific
+- `Workbook` - collection of sheets with active sheet tracking
+- `Sheet` - grid of cells with sparse storage via `HashMap<(u32, u32), CellValue>`
+- `CellValue` - tagged union: Number, Text, Boolean, Error, Empty, Formula
+- `CellAddress` - A1 notation parsing and serialization with absolute/relative support
+- `CoreError` - typed errors for out-of-bounds and parse failures
+- `CellFormat` - bold, italic, underline, font size/name/color, background color, alignment, borders, number format
+- `NumberFormat` - general, number, currency, percentage, date, time, scientific
 
-Sheet dimensions default to 1,000,000 rows × 16,384 columns and cells are stored sparsely — only non-empty cells consume memory.
+Sheet dimensions default to 1,000,000 rows × 16,384 columns and cells are stored sparsely - only non-empty cells consume memory.
 
 #### sheets-formula
 Custom formula engine:
@@ -131,14 +131,14 @@ Commands exposed to the frontend:
 - **Print & PDF**: `get_print_preview`, `render_print_html`, `export_pdf`, `get_page_count`, `save_pdf_to_file`
 - **Advanced**: `protect_sheet`, `unprotect_sheet`, `set_cell_locked`, `lock_cell_range`, `is_cell_locked`, `goal_seek_cmd`, `apply_scenario`, `get_cell_comment`, `add_cell_comment`, `remove_cell_comment`, `list_comments`
 
-Protected sheets are enforced at the Tauri command boundary for mutating cell edits, clears, formatting, sorting, replace, CSV overwrite, scenario application, protected-sheet deletion, and pivot use. Cell-level locking uses `CellLockManager` — when a sheet is protected, only cells explicitly unlocked via `set_cell_locked` or `lock_cell_range` are editable; all others are locked by default.
+Protected sheets are enforced at the Tauri command boundary for mutating cell edits, clears, formatting, sorting, replace, CSV overwrite, scenario application, protected-sheet deletion, and pivot use. Cell-level locking uses `CellLockManager` - when a sheet is protected, only cells explicitly unlocked via `set_cell_locked` or `lock_cell_range` are editable; all others are locked by default.
 
 ### Design Principles
 
-1. **Rust owns the truth** — all data models live in Rust, the frontend is a projection
-2. **Sanitize at the boundary** — all imported content is validated in Rust
-3. **Sparse storage** — only non-empty cells consume memory
-4. **Bounded operations** — resource limits prevent pathological files
-5. **No telemetry** — no data leaves the machine unless explicitly exported
-6. **Offline-first** — all features work without network connectivity
-7. **Low-resource optimized** — designed for modest hardware in developing economies
+1. **Rust owns the truth** - all data models live in Rust, the frontend is a projection
+2. **Sanitize at the boundary** - all imported content is validated in Rust
+3. **Sparse storage** - only non-empty cells consume memory
+4. **Bounded operations** - resource limits prevent pathological files
+5. **No telemetry** - no data leaves the machine unless explicitly exported
+6. **Offline-first** - all features work without network connectivity
+7. **Low-resource optimized** - designed for modest hardware in developing economies

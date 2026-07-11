@@ -1,52 +1,63 @@
 # Contributing to 900Sheets
 
-We welcome contributions from developers worldwide — especially those in the regions 900Sheets serves. Every line of code from a developer in Lagos, Nairobi, Accra, or Mumbai makes this tool better for the people it's built for.
+Contributions are welcome from spreadsheet users, developers, technical writers, translators, educators, and compatibility testers.
 
-## Setup
+## Before you start
 
-1. Clone the repository
-2. Install dependencies:
-   ```bash
-   npm install --prefix apps/desktop
-   ```
-3. Run in development mode:
-   ```bash
-   npm run tauri:dev --prefix apps/desktop
-   ```
+- Search open issues and pull requests to avoid duplicate work.
+- Open an issue before a large feature or architecture change.
+- Keep fixes focused on one behavior.
+- Never add a workbook containing personal, customer, financial, or confidential data.
 
-## Coding Standards
+Good first contributions include documentation corrections, small accessibility improvements, formula tests, import and export fixtures with invented data, and focused performance fixes.
 
-- Rust code must pass `cargo clippy` with zero warnings
-- Rust code must pass `cargo test --workspace`
-- Frontend code must pass `npm run check --prefix apps/desktop`
-- All new features must include unit tests
-- All new features must include matching documentation updates
+## Development setup
 
-## Sprint Process
+Install Rust 1.92.0, a supported Node.js version, and the Tauri v2 system prerequisites. Then run:
 
-1. Each sprint has a defined scope from the roadmap
-2. Work in feature branches: `sprint-N-description`
-3. After each sprint, run the sprint review:
-   - Code audit for correctness, style, and security
-   - Test verification — all tests must pass
-   - Documentation check — all features documented
-   - Performance check — no regressions
-   - Sprint record written to `docs/sprints/sprint-N.md`
-4. **Do not proceed to the next sprint until the current one has been fixed**
+```bash
+git clone https://github.com/900Labs/900Sheets.git
+cd 900Sheets
+npm ci --prefix apps/desktop
+npm run tauri:dev --prefix apps/desktop
+```
 
-## Pull Request Process
+## Working rules
 
-1. Create a feature branch from `main`
-2. Make your changes with matching tests and documentation
-3. Run `./scripts/verify-local.sh` — must pass with zero warnings
-4. Open a pull request with a clear description
-5. Address review feedback
-6. Squash-merge after approval
+- Rust must pass `cargo fmt` and clippy with warnings denied.
+- Behavior changes need tests at the closest reliable layer.
+- File-format regressions need a minimal fixture or generated test archive.
+- User-visible changes need matching documentation.
+- Do not claim compatibility that the tests do not prove.
+- Keep new prose direct and do not use em dashes.
+- Preserve unrelated changes in the worktree.
 
-## Quick Contribution Ideas
+## Validate your change
 
-- Add a formula function to `crates/sheets-formula`
-- Improve grid rendering performance in `apps/desktop/src/App.svelte`
-- Add a test fixture to `crates/sheets-fixtures`
-- Improve documentation clarity in `docs/`
-- Report bugs in your operating environment
+Run the complete gate:
+
+```bash
+./scripts/verify-local.sh
+```
+
+For public-release or packaging changes, also run:
+
+```bash
+./scripts/verify-public-release.sh
+npm run tauri:build --prefix apps/desktop
+```
+
+## Pull requests
+
+1. Create a branch from the current `main` branch.
+2. Make the smallest complete change.
+3. Add tests and documentation.
+4. Run the local quality gate.
+5. Complete the pull request template with exact verification evidence.
+6. Address review feedback without mixing unrelated cleanup into the branch.
+
+Maintainers may ask for an Excel or LibreOffice fixture when a change affects XLSX behavior. Fixtures must use invented data and must be safe to publish.
+
+## Reporting problems
+
+Use the issue forms and follow [SUPPORT.md](SUPPORT.md). Security vulnerabilities must follow [SECURITY.md](SECURITY.md) and must not be posted publicly.

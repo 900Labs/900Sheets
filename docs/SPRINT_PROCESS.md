@@ -6,9 +6,9 @@
 2. **Implementation**: Work in feature branch `sprint-N-description`
 3. **Sprint review** (mandatory before next sprint):
    - Code audit for correctness, style, and security
-   - Test verification — all unit and integration tests pass
-   - Documentation check — all new features documented
-   - Performance check — no regressions on target hardware
+   - Test verification - all unit and integration tests pass
+   - Documentation check - all new features documented
+   - Performance check - no regressions on target hardware
    - Sprint record written to `docs/sprints/sprint-N.md`
 4. **Fix gate**: Any issues found in review must be fixed before starting the next sprint
 5. **Quality gate**: `./scripts/verify-local.sh` must pass with zero warnings

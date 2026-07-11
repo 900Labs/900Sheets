@@ -20,11 +20,18 @@ jobs:
         with:
           node-version: 22
       - name: Install frontend dependencies
-        run: npm install --prefix apps/desktop
+        run: npm ci --prefix apps/desktop
       - name: Build Tauri app
         run: npm run tauri:build --prefix apps/desktop
-      - name: Upload unsigned app bundle
+      - name: Archive app bundle with permissions
+        run: ditto -c -k --sequesterRsrc --keepParent target/release/bundle/macos/900Sheets.app "target/release/bundle/macos/900Sheets-${GITHUB_REF_NAME}-macos.zip"
+      - name: Verify archived executable permission
+        run: |
+          mkdir -p "$RUNNER_TEMP/900sheets-archive-check"
+          ditto -x -k "target/release/bundle/macos/900Sheets-${GITHUB_REF_NAME}-macos.zip" "$RUNNER_TEMP/900sheets-archive-check"
+          test -x "$RUNNER_TEMP/900sheets-archive-check/900Sheets.app/Contents/MacOS/sheets-desktop"
+      - name: Upload unsigned app archive
         uses: actions/upload-artifact@v4
         with:
-          name: 900Sheets-macos-app
-          path: target/release/bundle/macos/900Sheets.app
+          name: 900Sheets-${{ github.ref_name }}-macos
+          path: target/release/bundle/macos/900Sheets-${{ github.ref_name }}-macos.zip

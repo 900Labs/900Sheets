@@ -1,66 +1,50 @@
 # Roadmap
 
-## MVP (Sprints 1–8)
+The roadmap is ordered by user risk and community value. It does not assign dates or promise delivery.
 
-### Sprint 1: Project Scaffold & Core Data Model ✅
-- Tauri v2 + Svelte 5 project initialized
-- Rust workspace with all crate stubs
-- sheets-core: Workbook, Sheet, CellValue, CellAddress
-- Basic grid UI with sheet tabs
-- Tauri IPC: new_workbook, get_cell, set_cell
-- Project docs and CI
+## v0.3.0 baseline
 
-### Sprint 2: Grid UI & Cell Editing ✅
-### Sprint 3: Formula Engine — Parser & Basic Functions ✅
-### Sprint 4: XLSX Import/Export ✅
-### Sprint 5: CSV & JSON Import/Export ✅
-### Sprint 6: Cell Formatting & Number Formats ✅
-### Sprint 7: Data Tools ✅
-### Sprint 8: MVP Polish, Testing & Documentation ✅
+The first public-release baseline includes local workbook editing, the native `.900sheets` format, supported XLSX import and export, CSV and JSON exchange, PDF output, formulas, formatting, data tools, chart previews, pivots, validation, conditional formatting, comments, and protection.
 
-## Post-MVP (Sprints 9–16) — All Complete ✅
+The exact compatibility boundary is documented in [COMPATIBILITY.md](COMPATIBILITY.md).
 
-### Sprint 9: Pivot Tables ✅
-- Pivot table engine with row/column grouping
-- Aggregation: sum, count, average, min, max, product
-- Filtering and grand totals
-- Write pivot results back to sheet
+## Next priorities
 
-### Sprint 10: Charts & Data Visualization ✅
-- Chart types: bar, line, pie, scatter, area, column, doughnut
-- Series extraction from sheet data
-- SVG generation for frontend rendering
+### Data safety
 
-### Sprint 11: Advanced Formula Functions ✅
-- ~100 additional functions: statistical, financial, engineering, date/time, lookup, array
-- Total: 160+ built-in functions
+- Add autosave and crash recovery with clear recovery prompts.
+- Extend undo and redo to structural edits and format-only changes.
+- Make all native feature state explicitly sheet-scoped in the frontend model.
+- Add atomic-save recovery tests for interrupted writes.
 
-### Sprint 12: Data Validation & Advanced Conditional Formatting ✅
-- Data validation rules: whole number, decimal, list, text length, date, time, custom
-- Conditional formatting: cell rules, top/bottom, data bars, color scales, icon sets, formula-based
-- Input messages and error alerts
+### Spreadsheet compatibility
 
-### Sprint 13: Internationalization & Accessibility ✅
-- 22 supported locales with RTL support
-- 88 translation keys
-- Locale-aware number/currency/percentage/date/time formatting
-- ARIA labels, screen reader support, keyboard navigation metadata
+- Implement cross-sheet cell and range references.
+- Add Excel and LibreOffice fixture workbooks to the test corpus.
+- Expand XLSX support for validations, conditional formatting, tables, charts, and pivot metadata.
+- Publish a versioned compatibility matrix backed by fixture results.
 
-### Sprint 14: Print & PDF Export ✅
-- Page layout: A4, A3, Letter, Legal, Tabloid
-- Portrait/landscape, margins, scaling, headers/footers
-- HTML print rendering and minimal PDF 1.4 generation
-- Print preview data for frontend
+### Large workbooks
 
-### Sprint 15: Advanced Features ✅
-- Sheet protection with password hashing and granular permissions
-- Cell locking manager
-- Goal seek (Newton's method + bisection fallback)
-- Scenario manager for what-if analysis
-- Cell comments/notes with author tracking
+- Virtualize columns as well as rows.
+- Expose the engine's full row and column range through navigation controls.
+- Add workload benchmarks for sparse and dense sheets.
+- Keep export budgets visible and configurable where that can be done safely.
 
-### Sprint 16: Post-MVP Polish & Release ✅
-- Updated README, ARCHITECTURE.md, and ROADMAP.md with full feature documentation
-- Updated CI workflow and verify-local.sh with frontend build check
-- Sprint documentation for sprints 9–16
-- Historical sprint-close quality gate passed; the current public release gate and test counts are tracked in `docs/QUALITY_GATE.md` and the README test suite table.
+### Desktop distribution
+
+- Sign and notarize macOS builds.
+- Add tested Windows packages.
+- Add tested Linux packages for a documented set of distributions.
+- Publish release assets through GitHub Releases after workflow verification.
+
+### Community use
+
+- Add more task-based examples and screenshots.
+- Expand keyboard and screen-reader testing.
+- Complete the locale settings interface and verify translated workflows.
+- Build a public collection of small business, school, and community organization templates using invented data.
+
+## Historical records
+
+The sprint files in `docs/sprints/` describe how the initial codebase was assembled. They are historical notes, not the current release contract.
