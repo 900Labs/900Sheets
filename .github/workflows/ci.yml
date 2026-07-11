@@ -24,6 +24,8 @@ jobs:
           sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev librsvg2-dev libreoffice-calc
       - name: Install frontend dependencies
         run: npm ci --prefix apps/desktop
+      - name: Build frontend assets for Tauri
+        run: npm run build --prefix apps/desktop
       - name: cargo fmt
         run: cargo fmt --all -- --check
       - name: cargo clippy
