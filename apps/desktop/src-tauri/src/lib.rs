@@ -3124,18 +3124,22 @@ mod tests {
 
     #[test]
     fn checked_absolute_path_rejects_relative_and_parent_paths() {
+        let root = std::env::current_dir().unwrap();
+        let parent_traversal = root.join("nested").join("..").join("secret.xlsx");
+        let valid = root.join("900sheets.xlsx");
+
         assert!(checked_absolute_path("relative/file.xlsx").is_err());
-        assert!(checked_absolute_path("/tmp/../secret.xlsx").is_err());
+        assert!(checked_absolute_path(parent_traversal.to_str().unwrap()).is_err());
         assert_eq!(
-            checked_absolute_path("/tmp/900sheets.xlsx").unwrap(),
-            PathBuf::from("/tmp/900sheets.xlsx")
+            checked_absolute_path(valid.to_str().unwrap()).unwrap(),
+            valid
         );
     }
 
     #[test]
     fn allowed_extension_is_case_insensitive() {
-        assert!(ensure_allowed_extension(&PathBuf::from("/tmp/data.XLSX"), &["xlsx"]).is_ok());
-        assert!(ensure_allowed_extension(&PathBuf::from("/tmp/data.exe"), &["xlsx"]).is_err());
+        assert!(ensure_allowed_extension(&PathBuf::from("data.XLSX"), &["xlsx"]).is_ok());
+        assert!(ensure_allowed_extension(&PathBuf::from("data.exe"), &["xlsx"]).is_err());
     }
 
     #[test]
