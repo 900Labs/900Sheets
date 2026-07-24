@@ -534,7 +534,7 @@ test('canceling Open after a delayed sheet switch keeps tab and cells paired', a
 
   await page.getByRole('button', { name: 'Sheet2', exact: true }).click()
   await page.locator('.menu-bar button').filter({ hasText: /^File$/ }).click()
-  await page.getByRole('button', { name: 'Open Workbook...' }).click()
+  await page.getByRole('button', { name: 'Open 900Sheets Workbook...' }).click()
 
   await expect(page.getByRole('button', { name: 'Sheet2', exact: true })).toHaveClass(/active/)
   await expect(cell(page, 'A1')).toHaveText('two')
@@ -551,7 +551,7 @@ test('slow replacement blocks edits until the restored workbook is coherent', as
 
   await page.locator('.menu-bar button').filter({ hasText: /^File$/ }).click()
   const confirmation = page.waitForEvent('dialog')
-  const opening = page.getByRole('button', { name: 'Open Workbook...' }).click()
+  const opening = page.getByRole('button', { name: 'Open 900Sheets Workbook...' }).click()
   const dialog = await confirmation
   await dialog.accept()
   await opening

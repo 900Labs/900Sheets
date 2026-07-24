@@ -2029,6 +2029,13 @@
       e.preventDefault()
       return
     }
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+      e.preventDefault()
+      e.stopPropagation()
+      if (!commitFormulaBarDraft()) return
+      void handleSaveNative()
+      return
+    }
     e.stopPropagation()
     if (e.key === 'Enter') {
       e.preventDefault()
@@ -2122,7 +2129,9 @@
   }
 
   function selectSheet(id: number, allowDuringReplacement: boolean = false): Promise<void> {
-    if ((replacementInProgress && !allowDuringReplacement) || saveInProgress || closeInProgress) return Promise.resolve()
+    if (closeInProgress) return Promise.resolve()
+    if (replacementInProgress && !allowDuringReplacement) return Promise.resolve()
+    if (saveInProgress && !(replacementInProgress && allowDuringReplacement)) return Promise.resolve()
     const generation = ++sheetSelectionGeneration
     const selection = sheetSelectionTail.then(() => selectSheetInner(id, generation))
     sheetSelectionTail = selection.catch(() => undefined)
