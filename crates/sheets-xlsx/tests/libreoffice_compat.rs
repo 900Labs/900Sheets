@@ -31,6 +31,7 @@ fn libreoffice_can_open_and_resave_exported_workbook() {
                 validations,
                 conditional_formats,
                 tables: Vec::new(),
+                charts: Vec::new(),
             })
             .collect(),
     };

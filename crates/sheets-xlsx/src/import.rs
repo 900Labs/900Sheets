@@ -1,6 +1,7 @@
 use crate::document::{XlsxDocument, XlsxSheetFeatures};
 use crate::error::XlsxError;
-use roxmltree::Document;
+use roxmltree::{Document, Node};
+use sheets_chart::{ChartAnchor, ChartObject, ChartObjectSeries, ChartType, LegendPosition};
 use sheets_core::cell::CellValue;
 use sheets_core::format::CellFormat;
 use sheets_core::workbook::Workbook;
@@ -74,14 +75,16 @@ pub fn import_document(data: &[u8]) -> Result<XlsxDocument, XlsxError> {
         }
         let mut features = parse_sheet_features(&xml, &styles)?;
         features.tables = parse_sheet_tables(&mut archive, sheet_file, &xml)?;
+        features.charts = parse_sheet_charts(&mut archive, sheet_file, &xml)?;
         total_features = total_features
             .checked_add(features.validations.len())
             .and_then(|count| count.checked_add(features.conditional_formats.len()))
             .and_then(|count| count.checked_add(features.tables.len()))
+            .and_then(|count| count.checked_add(features.charts.len()))
             .ok_or_else(|| XlsxError::InvalidFormat("Too many worksheet feature records".into()))?;
         if total_features > MAX_FEATURE_RECORDS {
             return Err(XlsxError::InvalidFormat(format!(
-                "Workbook contains {total_features} validation, conditional-format, and table records; the limit is {MAX_FEATURE_RECORDS}"
+                "Workbook contains {total_features} validation, conditional-format, table, and chart records; the limit is {MAX_FEATURE_RECORDS}"
             )));
         }
         sheet_features.push(features);
@@ -239,32 +242,35 @@ fn normalize_zip_path(dir: &str, target: &str) -> String {
     parts.join("/")
 }
 
-/// Read a worksheet's relationship part and return the table relationships as
-/// a map of relationship id to archive path. Missing relationship parts are
-/// treated as an empty table set.
-fn read_table_relationship_targets<R: std::io::Read + std::io::Seek>(
+/// Read a worksheet's relationship part and return the relationships of a
+/// given type as a map of relationship id to archive path. The `type_suffix`
+/// is matched against the end of the OOXML relationship `Type` attribute, for
+/// example `/table`, `/drawing`, or `/chart`. Missing relationship parts are
+/// treated as an empty set.
+fn read_relationship_targets<R: std::io::Read + std::io::Seek>(
     archive: &mut zip::ZipArchive<R>,
-    sheet_file: &str,
+    owner_file: &str,
+    type_suffix: &str,
 ) -> Result<HashMap<String, String>, XlsxError> {
-    let rels_path = worksheet_rels_path(sheet_file);
+    let rels_path = worksheet_rels_path(owner_file);
     let xml = match read_zip_file(archive, &rels_path) {
         Ok(content) => content,
         Err(XlsxError::Zip(zip::result::ZipError::FileNotFound)) => return Ok(HashMap::new()),
         Err(error) => return Err(error),
     };
     let doc = Document::parse(&xml)?;
-    let sheet_dir = sheet_directory(sheet_file);
+    let owner_dir = sheet_directory(owner_file);
     let mut targets = HashMap::new();
     for node in doc
         .descendants()
         .filter(|node| node.has_tag_name("Relationship"))
     {
         let relationship_type = node.attribute("Type").unwrap_or("");
-        if !relationship_type.ends_with("/table") {
+        if !relationship_type.ends_with(type_suffix) {
             continue;
         }
         if let (Some(id), Some(target)) = (node.attribute("Id"), node.attribute("Target")) {
-            targets.insert(id.to_string(), normalize_zip_path(sheet_dir, target));
+            targets.insert(id.to_string(), normalize_zip_path(owner_dir, target));
         }
     }
     Ok(targets)
@@ -279,7 +285,7 @@ fn parse_sheet_tables<R: std::io::Read + std::io::Seek>(
     sheet_file: &str,
     worksheet_xml: &str,
 ) -> Result<Vec<Table>, XlsxError> {
-    let table_targets = read_table_relationship_targets(archive, sheet_file)?;
+    let table_targets = read_relationship_targets(archive, sheet_file, "/table")?;
     if table_targets.is_empty() {
         return Ok(Vec::new());
     }
@@ -391,6 +397,258 @@ fn parse_table_part(xml: &str) -> Result<Option<Table>, XlsxError> {
     } else {
         Ok(None)
     }
+}
+
+/// Parse the `<drawing r:id="..."/>` references embedded in a worksheet,
+/// follow each to its drawing part, and load the charts anchored there.
+/// Charts of an unsupported family, or charts whose references cannot be
+/// resolved, are skipped rather than failing the whole import, matching how
+/// unsupported table and validation records are handled.
+fn parse_sheet_charts<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    sheet_file: &str,
+    worksheet_xml: &str,
+) -> Result<Vec<ChartObject>, XlsxError> {
+    let drawing_targets = read_relationship_targets(archive, sheet_file, "/drawing")?;
+    if drawing_targets.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let referenced_ids: Vec<String> = Document::parse(worksheet_xml)?
+        .descendants()
+        .filter(|node| node.has_tag_name("drawing"))
+        .filter_map(|node| {
+            node.attributes()
+                .find(|attribute| attribute.name() == "id")
+                .map(|attribute| attribute.value().to_string())
+        })
+        .collect();
+    if referenced_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut charts = Vec::new();
+    for relationship_id in referenced_ids {
+        let Some(drawing_path) = drawing_targets.get(&relationship_id) else {
+            continue;
+        };
+        let drawing_xml = read_zip_file(archive, drawing_path)?;
+        let anchored_charts = parse_drawing_anchors(&drawing_xml)?;
+        if anchored_charts.is_empty() {
+            continue;
+        }
+        let chart_targets = read_relationship_targets(archive, drawing_path, "/chart")?;
+        for (anchor, chart_rid) in anchored_charts {
+            let Some(chart_path) = chart_targets.get(&chart_rid) else {
+                continue;
+            };
+            let chart_xml = read_zip_file(archive, chart_path)?;
+            if let Some(mut chart) = parse_chart_space(&chart_xml)? {
+                chart.anchor = anchor;
+                charts.push(chart);
+            }
+        }
+    }
+    Ok(charts)
+}
+
+/// Extract each `(anchor, chart relationship id)` pair from a drawing part.
+/// Only `twoCellAnchor`, `oneCellAnchor`, and `absoluteAnchor` frames that
+/// reference a chart are considered.
+fn parse_drawing_anchors(drawing_xml: &str) -> Result<Vec<(ChartAnchor, String)>, XlsxError> {
+    let doc = Document::parse(drawing_xml)?;
+    let mut result = Vec::new();
+    for anchor_node in doc.descendants().filter(|node| {
+        node.has_tag_name("twoCellAnchor")
+            || node.has_tag_name("oneCellAnchor")
+            || node.has_tag_name("absoluteAnchor")
+    }) {
+        let Some(chart_rid) = anchor_node
+            .descendants()
+            .find(|node| node.has_tag_name("chart"))
+            .and_then(|node| {
+                node.attributes()
+                    .find(|attribute| attribute.name() == "id")
+                    .map(|attribute| attribute.value().to_string())
+            })
+        else {
+            continue;
+        };
+
+        let anchor = if anchor_node.has_tag_name("absoluteAnchor") {
+            // `absoluteAnchor` pins the frame by EMU coordinates instead of a
+            // cell marker. 900Sheets does not preserve absolute coordinates, so
+            // it is recorded as a zero-cell anchor that still round-trips the
+            // chart definition.
+            ChartAnchor::new(0, 0, 0, 0)
+        } else {
+            let from = parse_anchor_marker(anchor_node, "from").unwrap_or((0, 0));
+            let to = parse_anchor_marker(anchor_node, "to").unwrap_or(from);
+            ChartAnchor::new(from.0, from.1, to.0, to.1)
+        };
+        result.push((anchor, chart_rid));
+    }
+    Ok(result)
+}
+
+/// Read a `from` or `to` anchor marker as `(row, col)`. Returns `None` when the
+/// marker or its numeric cells are absent.
+fn parse_anchor_marker(anchor_node: Node<'_, '_>, marker_name: &str) -> Option<(u32, u32)> {
+    let marker = anchor_node
+        .children()
+        .find(|child| child.has_tag_name(marker_name))?;
+    let col = marker
+        .children()
+        .find(|child| child.has_tag_name("col"))
+        .and_then(|node| node.text())
+        .and_then(|text| text.trim().parse::<u32>().ok())?;
+    let row = marker
+        .children()
+        .find(|child| child.has_tag_name("row"))
+        .and_then(|node| node.text())
+        .and_then(|text| text.trim().parse::<u32>().ok())?;
+    Some((row, col))
+}
+
+/// Parse a `chartN.xml` part into a `ChartObject` without an anchor. Returns
+/// `None` for a chart whose family 900Sheets does not preserve (for example
+/// `scatterChart`) or one with no plottable series.
+fn parse_chart_space(xml: &str) -> Result<Option<ChartObject>, XlsxError> {
+    let doc = Document::parse(xml)?;
+    let Some(chart) = doc.descendants().find(|node| node.has_tag_name("chart")) else {
+        return Ok(None);
+    };
+
+    let title = parse_chart_title(chart);
+    let legend_position = parse_legend_position(chart);
+    let Some(plot_area) = chart.children().find(|node| node.has_tag_name("plotArea")) else {
+        return Ok(None);
+    };
+    let Some((chart_type, type_node)) = detect_chart_type(plot_area) else {
+        return Ok(None);
+    };
+
+    let mut series = Vec::new();
+    for ser in type_node
+        .descendants()
+        .filter(|node| node.has_tag_name("ser"))
+    {
+        series.push(parse_series(ser));
+    }
+    if series.is_empty() {
+        return Ok(None);
+    }
+
+    let chart_object = ChartObject {
+        title,
+        chart_type,
+        anchor: ChartAnchor::new(0, 0, 0, 0),
+        series,
+        legend_position,
+    };
+    if chart_object.validate(MAX_ROWS, MAX_COLS).is_ok() {
+        Ok(Some(chart_object))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Detect the OOXML chart family within a plot area and map it to the
+/// `ChartType` 900Sheets preserves, returning the chart-type element so its
+/// series can be read. Bar direction distinguishes `Bar` (horizontal) from
+/// `Column` (vertical).
+fn detect_chart_type<'a>(plot_area: Node<'a, 'a>) -> Option<(ChartType, Node<'a, 'a>)> {
+    for node in plot_area.children() {
+        if node.has_tag_name("barChart") {
+            let horizontal = node
+                .children()
+                .find(|child| child.has_tag_name("barDir"))
+                .and_then(|child| child.attribute("val"))
+                == Some("bar");
+            let chart_type = if horizontal {
+                ChartType::Bar
+            } else {
+                ChartType::Column
+            };
+            return Some((chart_type, node));
+        }
+        if node.has_tag_name("lineChart") {
+            return Some((ChartType::Line, node));
+        }
+        if node.has_tag_name("pieChart") {
+            return Some((ChartType::Pie, node));
+        }
+        if node.has_tag_name("areaChart") {
+            return Some((ChartType::Area, node));
+        }
+        if node.has_tag_name("doughnutChart") {
+            return Some((ChartType::Doughnut, node));
+        }
+    }
+    None
+}
+
+/// Extract the literal title text of a chart, joining rich-text runs. Returns
+/// `None` when the title is only a dynamic reference or is absent.
+fn parse_chart_title(chart: Node<'_, '_>) -> Option<String> {
+    let title = chart.children().find(|node| node.has_tag_name("title"))?;
+    let text: String = title
+        .descendants()
+        .filter(|node| node.has_tag_name("t"))
+        .filter_map(|node| node.text())
+        .collect::<Vec<_>>()
+        .join("");
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+/// Map a chart legend position to the persisted enum. A present legend with an
+/// unrecognized position defaults to `Right`, matching Excel's default.
+fn parse_legend_position(chart: Node<'_, '_>) -> LegendPosition {
+    let Some(legend) = chart.children().find(|node| node.has_tag_name("legend")) else {
+        return LegendPosition::None;
+    };
+    match legend
+        .descendants()
+        .find(|node| node.has_tag_name("legendPos"))
+        .and_then(|node| node.attribute("val"))
+    {
+        Some("b") => LegendPosition::Bottom,
+        Some("t") => LegendPosition::Top,
+        Some("l") => LegendPosition::Left,
+        _ => LegendPosition::Right,
+    }
+}
+
+/// Read a single persisted chart series: title, category, and value worksheet
+/// range references. Each reference is the OOXML `<c:f>` child of the series'
+/// `tx`, `cat`, or `val` element.
+fn parse_series(ser: Node<'_, '_>) -> ChartObjectSeries {
+    ChartObjectSeries {
+        name_ref: ser
+            .children()
+            .find(|node| node.has_tag_name("tx"))
+            .and_then(|tx| first_child_formula(tx)),
+        category_ref: ser
+            .children()
+            .find(|node| node.has_tag_name("cat"))
+            .and_then(|cat| first_child_formula(cat)),
+        value_ref: ser
+            .children()
+            .find(|node| node.has_tag_name("val"))
+            .and_then(|val| first_child_formula(val)),
+    }
+}
+
+/// First `<c:f>` formula text within a node, trimmed.
+fn first_child_formula(node: Node<'_, '_>) -> Option<String> {
+    node.descendants()
+        .find(|descendant| descendant.has_tag_name("f"))
+        .and_then(|formula| formula.text())
+        .map(|text| text.trim().to_string())
 }
 
 #[derive(Default)]

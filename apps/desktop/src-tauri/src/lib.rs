@@ -5,7 +5,7 @@ use sheets_advanced::{
     CellComment, CellLockManager, GoalSeekConfig, GoalSeekResult, ProtectionAction, Scenario,
     SheetProtection,
 };
-use sheets_chart::{ChartConfig, ChartResult};
+use sheets_chart::{ChartConfig, ChartObject, ChartResult};
 use sheets_core::format::CellFormat;
 use sheets_core::number_format::NumberFormat;
 use sheets_core::workbook::Workbook;
@@ -2261,6 +2261,11 @@ struct FrontendTable {
     table: sheets_tables::Table,
 }
 
+#[derive(serde::Deserialize)]
+struct FrontendChart {
+    chart: ChartObject,
+}
+
 fn xlsx_features_from_metadata(
     workbook: &Workbook,
     metadata: &serde_json::Value,
@@ -2309,10 +2314,19 @@ fn xlsx_features_from_metadata(
                     .map(|stored| stored.table)
                     .collect(),
             };
+            let charts = match state.get("charts") {
+                None => Vec::new(),
+                Some(value) => serde_json::from_value::<Vec<FrontendChart>>(value.clone())
+                    .map_err(|error| format!("Invalid chart metadata for XLSX export: {error}"))?
+                    .into_iter()
+                    .map(|stored| stored.chart)
+                    .collect(),
+            };
             Ok(sheets_xlsx::XlsxSheetFeatures {
                 validations,
                 conditional_formats,
                 tables,
+                charts,
             })
         })
         .collect()
@@ -2324,6 +2338,7 @@ fn xlsx_metadata_from_document(document: &sheets_xlsx::XlsxDocument) -> serde_js
         if features.validations.is_empty()
             && features.conditional_formats.is_empty()
             && features.tables.is_empty()
+            && features.charts.is_empty()
         {
             continue;
         }
@@ -2372,12 +2387,25 @@ fn xlsx_metadata_from_document(document: &sheets_xlsx::XlsxDocument) -> serde_js
                 })
             })
             .collect();
+        let charts: Vec<_> = features
+            .charts
+            .iter()
+            .enumerate()
+            .map(|(index, chart)| {
+                serde_json::json!({
+                    "id": format!("xlsx-chart-{index}"),
+                    "label": "Imported XLSX chart",
+                    "chart": chart,
+                })
+            })
+            .collect();
         states.insert(
             sheet.stable_id().to_string(),
             serde_json::json!({
                 "validationRules": validation_rules,
                 "conditionalRules": conditional_rules,
                 "tables": tables,
+                "charts": charts,
             }),
         );
     }
@@ -4078,6 +4106,7 @@ mod tests {
                 validations: Vec::new(),
                 conditional_formats: Vec::new(),
                 tables: vec![table.clone()],
+                charts: Vec::new(),
             }],
         };
 
@@ -4106,6 +4135,72 @@ mod tests {
 
         // Native-format round-trip: metadata (including tables) is an opaque
         // blob that survives .900sheets save and reopen unchanged.
+        let native_json =
+            sheets_json::export_native_workbook_with_metadata(&workbook, metadata.clone()).unwrap();
+        let (_, restored_metadata) =
+            sheets_json::import_native_workbook_with_metadata(&native_json).unwrap();
+        assert_eq!(restored_metadata, metadata);
+    }
+
+    #[test]
+    fn chart_metadata_roundtrips_through_xlsx_import_export_and_native_format() {
+        use sheets_chart::{
+            ChartAnchor, ChartObject, ChartObjectSeries, ChartType, LegendPosition,
+        };
+
+        let workbook = Workbook::new();
+        let stable_id = workbook.sheet(0).unwrap().stable_id();
+        let chart = ChartObject {
+            title: Some("Sales by Month".into()),
+            chart_type: ChartType::Column,
+            anchor: ChartAnchor::new(0, 4, 18, 12),
+            series: vec![ChartObjectSeries {
+                name_ref: Some("Sheet1!$B$1".into()),
+                category_ref: Some("Sheet1!$A$2:$A$4".into()),
+                value_ref: Some("Sheet1!$B$2:$B$4".into()),
+            }],
+            legend_position: LegendPosition::Right,
+        };
+        let document = sheets_xlsx::XlsxDocument {
+            workbook: workbook.clone(),
+            sheet_features: vec![sheets_xlsx::XlsxSheetFeatures {
+                validations: Vec::new(),
+                conditional_formats: Vec::new(),
+                tables: Vec::new(),
+                charts: vec![chart.clone()],
+            }],
+        };
+
+        // xlsx_metadata_from_document: charts appear in sheet_states metadata.
+        let metadata = xlsx_metadata_from_document(&document);
+        let state = &metadata["sheet_states"][stable_id.to_string()];
+        assert_eq!(state["charts"].as_array().unwrap().len(), 1);
+        assert_eq!(state["charts"][0]["chart"]["title"], "Sales by Month");
+
+        // xlsx_features_from_metadata: charts are reconstructed for XLSX export.
+        let features = xlsx_features_from_metadata(&workbook, &metadata).unwrap();
+        assert_eq!(features[0].charts.len(), 1);
+        assert_eq!(features[0].charts[0], chart);
+
+        // Full XLSX round-trip through the desktop metadata bridge.
+        let bytes = sheets_xlsx::export_document(&sheets_xlsx::XlsxDocument {
+            workbook: workbook.clone(),
+            sheet_features: features,
+        })
+        .unwrap();
+        let reimported = sheets_xlsx::import_document(&bytes).unwrap();
+        assert_eq!(reimported.sheet_features[0].charts.len(), 1);
+        assert_eq!(
+            reimported.sheet_features[0].charts[0].chart_type,
+            ChartType::Column
+        );
+        assert_eq!(
+            reimported.sheet_features[0].charts[0].title.as_deref(),
+            Some("Sales by Month")
+        );
+
+        // Native-format round-trip: chart metadata survives .900sheets save
+        // and reopen unchanged as an opaque blob.
         let native_json =
             sheets_json::export_native_workbook_with_metadata(&workbook, metadata.clone()).unwrap();
         let (_, restored_metadata) =

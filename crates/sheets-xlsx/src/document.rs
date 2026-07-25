@@ -1,3 +1,4 @@
+use sheets_chart::ChartObject;
 use sheets_core::workbook::Workbook;
 use sheets_tables::Table;
 use sheets_validation::{ConditionalFormat, ValidationRule};
@@ -29,4 +30,5 @@ pub struct XlsxSheetFeatures {
     pub validations: Vec<ValidationRule>,
     pub conditional_formats: Vec<ConditionalFormat>,
     pub tables: Vec<Table>,
+    pub charts: Vec<ChartObject>,
 }
