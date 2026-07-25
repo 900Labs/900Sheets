@@ -2995,6 +2995,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sheets-tables"
+version = "0.5.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "sheets-validation"
 version = "0.5.0"
 dependencies = [
@@ -3012,6 +3020,7 @@ dependencies = [
  "serde_json",
  "sheets-core",
  "sheets-fixtures",
+ "sheets-tables",
  "sheets-validation",
  "thiserror 2.0.18",
  "zip",

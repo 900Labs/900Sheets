@@ -4,6 +4,7 @@ use roxmltree::Document;
 use sheets_core::cell::CellValue;
 use sheets_core::format::CellFormat;
 use sheets_core::workbook::Workbook;
+use sheets_tables::{Table, TableColumn, TableStyleInfo, TotalsRowFunction};
 use sheets_validation::{
     ConditionOperator, ConditionType, ConditionalFormat, DataValidation, ValidationErrorStyle,
     ValidationOperator, ValidationRule, ValidationType,
@@ -71,14 +72,16 @@ pub fn import_document(data: &[u8]) -> Result<XlsxDocument, XlsxError> {
             }
             apply_styles(sheet, &xml, &styles);
         }
-        let features = parse_sheet_features(&xml, &styles)?;
+        let mut features = parse_sheet_features(&xml, &styles)?;
+        features.tables = parse_sheet_tables(&mut archive, sheet_file, &xml)?;
         total_features = total_features
             .checked_add(features.validations.len())
             .and_then(|count| count.checked_add(features.conditional_formats.len()))
+            .and_then(|count| count.checked_add(features.tables.len()))
             .ok_or_else(|| XlsxError::InvalidFormat("Too many worksheet feature records".into()))?;
         if total_features > MAX_FEATURE_RECORDS {
             return Err(XlsxError::InvalidFormat(format!(
-                "Workbook contains {total_features} validation and conditional-format records; the limit is {MAX_FEATURE_RECORDS}"
+                "Workbook contains {total_features} validation, conditional-format, and table records; the limit is {MAX_FEATURE_RECORDS}"
             )));
         }
         sheet_features.push(features);
@@ -199,6 +202,196 @@ fn read_workbook_rels<R: std::io::Read + std::io::Seek>(
 }
 
 type CellList = Vec<((u32, u32), CellValue)>;
+
+/// Path of a worksheet's relationship part: `xl/worksheets/sheet1.xml` becomes
+/// `xl/worksheets/_rels/sheet1.xml.rels`.
+fn worksheet_rels_path(sheet_file: &str) -> String {
+    match sheet_file.rsplit_once('/') {
+        Some((dir, file)) => format!("{dir}/_rels/{file}.rels"),
+        None => format!("_rels/{sheet_file}.rels"),
+    }
+}
+
+/// Parent directory of a worksheet file: `xl/worksheets/sheet1.xml` -> `xl/worksheets`.
+fn sheet_directory(sheet_file: &str) -> &str {
+    sheet_file.rsplit_once('/').map_or("", |(dir, _)| dir)
+}
+
+/// Resolve a relationship target that may be package-relative (starting with
+/// `/`), part-relative, or use `..` segments, to a normalized archive path.
+fn normalize_zip_path(dir: &str, target: &str) -> String {
+    if let Some(stripped) = target.strip_prefix('/') {
+        return stripped.to_string();
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    if !dir.is_empty() {
+        parts.extend(dir.split('/'));
+    }
+    for segment in target.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            s => parts.push(s),
+        }
+    }
+    parts.join("/")
+}
+
+/// Read a worksheet's relationship part and return the table relationships as
+/// a map of relationship id to archive path. Missing relationship parts are
+/// treated as an empty table set.
+fn read_table_relationship_targets<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    sheet_file: &str,
+) -> Result<HashMap<String, String>, XlsxError> {
+    let rels_path = worksheet_rels_path(sheet_file);
+    let xml = match read_zip_file(archive, &rels_path) {
+        Ok(content) => content,
+        Err(XlsxError::Zip(zip::result::ZipError::FileNotFound)) => return Ok(HashMap::new()),
+        Err(error) => return Err(error),
+    };
+    let doc = Document::parse(&xml)?;
+    let sheet_dir = sheet_directory(sheet_file);
+    let mut targets = HashMap::new();
+    for node in doc
+        .descendants()
+        .filter(|node| node.has_tag_name("Relationship"))
+    {
+        let relationship_type = node.attribute("Type").unwrap_or("");
+        if !relationship_type.ends_with("/table") {
+            continue;
+        }
+        if let (Some(id), Some(target)) = (node.attribute("Id"), node.attribute("Target")) {
+            targets.insert(id.to_string(), normalize_zip_path(sheet_dir, target));
+        }
+    }
+    Ok(targets)
+}
+
+/// Parse the `<tablePart r:id="..."/>` references embedded in a worksheet and
+/// load each referenced table part, returning the table definitions for the
+/// sheet. Malformed or out-of-bounds tables are skipped rather than failing
+/// the whole import, matching how unsupported validation types are handled.
+fn parse_sheet_tables<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    sheet_file: &str,
+    worksheet_xml: &str,
+) -> Result<Vec<Table>, XlsxError> {
+    let table_targets = read_table_relationship_targets(archive, sheet_file)?;
+    if table_targets.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let referenced_ids: Vec<String> = Document::parse(worksheet_xml)?
+        .descendants()
+        .filter(|node| node.has_tag_name("tablePart"))
+        .filter_map(|node| {
+            node.attributes()
+                .find(|attribute| attribute.name() == "id")
+                .map(|attribute| attribute.value().to_string())
+        })
+        .collect();
+    if referenced_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut tables = Vec::new();
+    for relationship_id in referenced_ids {
+        let Some(target) = table_targets.get(&relationship_id) else {
+            continue;
+        };
+        let xml = read_zip_file(archive, target)?;
+        if let Some(table) = parse_table_part(&xml)? {
+            tables.push(table);
+        }
+    }
+    Ok(tables)
+}
+
+/// Parse a single `xl/tables/tableN.xml` part. Returns `None` for a part that
+/// lacks a name or a parseable range so the importer can skip it.
+fn parse_table_part(xml: &str) -> Result<Option<Table>, XlsxError> {
+    let doc = Document::parse(xml)?;
+    let Some(root) = doc.descendants().find(|node| node.has_tag_name("table")) else {
+        return Ok(None);
+    };
+
+    let name = root.attribute("name").unwrap_or("").to_string();
+    let display_name = root
+        .attribute("displayName")
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&name)
+        .to_string();
+    let Some(range) = parse_range_ref(root.attribute("ref").unwrap_or("")) else {
+        return Ok(None);
+    };
+
+    let header_row_count = root
+        .attribute("headerRowCount")
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(1);
+    let totals_row_shown = match root.attribute("totalsRowShown") {
+        Some(value) => bool_attribute(Some(value), false),
+        None => root
+            .attribute("totalsRowCount")
+            .and_then(|value| value.parse::<u32>().ok())
+            .map(|count| count != 0)
+            .unwrap_or(false),
+    };
+    let auto_filter_range = root
+        .children()
+        .find(|child| child.has_tag_name("autoFilter"))
+        .and_then(|filter| filter.attribute("ref"))
+        .and_then(parse_range_ref);
+
+    let mut columns = Vec::new();
+    for column in doc
+        .descendants()
+        .filter(|node| node.has_tag_name("tableColumn"))
+    {
+        columns.push(TableColumn {
+            id: column
+                .attribute("id")
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or(0),
+            name: column.attribute("name").unwrap_or("").to_string(),
+            totals_row_function: column
+                .attribute("totalsRowFunction")
+                .and_then(TotalsRowFunction::from_xml),
+            totals_row_label: column.attribute("totalsRowLabel").map(str::to_string),
+        });
+    }
+
+    let style = doc
+        .descendants()
+        .find(|node| node.has_tag_name("tableStyleInfo"))
+        .map(|node| TableStyleInfo {
+            name: node.attribute("name").map(str::to_string),
+            show_first_column: bool_attribute(node.attribute("showFirstColumn"), false),
+            show_last_column: bool_attribute(node.attribute("showLastColumn"), false),
+            show_row_stripes: bool_attribute(node.attribute("showRowStripes"), true),
+            show_column_stripes: bool_attribute(node.attribute("showColumnStripes"), false),
+        })
+        .unwrap_or_default();
+
+    let table = Table {
+        name,
+        display_name,
+        range,
+        header_row_count,
+        totals_row_shown,
+        columns,
+        style,
+        auto_filter_range,
+    };
+    if table.validate(MAX_ROWS, MAX_COLS).is_ok() {
+        Ok(Some(table))
+    } else {
+        Ok(None)
+    }
+}
 
 #[derive(Default)]
 struct XlsxStyles {
@@ -1363,4 +1556,112 @@ mod tests {
 </row>
 </sheetData>
 </worksheet>";
+
+    #[test]
+    fn worksheet_relationship_resolves_excel_table_parts() {
+        use std::io::Write;
+
+        let buf: Vec<u8> = Vec::new();
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(buf));
+        let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default();
+
+        zip.start_file("[Content_Types].xml", opts).unwrap();
+        zip.write_all(BRACKET_CONTENT_TYPES).unwrap();
+        zip.start_file("_rels/.rels", opts).unwrap();
+        zip.write_all(RELS).unwrap();
+        zip.start_file("xl/workbook.xml", opts).unwrap();
+        zip.write_all(WORKBOOK_XML).unwrap();
+        zip.start_file("xl/_rels/workbook.xml.rels", opts).unwrap();
+        zip.write_all(WORKBOOK_RELS).unwrap();
+        zip.start_file("xl/sharedStrings.xml", opts).unwrap();
+        zip.write_all(SHARED_STRINGS).unwrap();
+
+        // Worksheet with a <tableParts> reference and the relationships namespace.
+        zip.start_file("xl/worksheets/sheet1.xml", opts).unwrap();
+        zip.write_all(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">
+<sheetData><row r=\"1\"><c r=\"A1\" t=\"s\"><v>0</v></c></row></sheetData>
+<tableParts count=\"1\"><tablePart r:id=\"rId1\"/></tableParts>
+</worksheet>").unwrap();
+
+        // Worksheet relationship part pointing at a table via the ../tables
+        // relative target that Excel emits.
+        zip.start_file("xl/worksheets/_rels/sheet1.xml.rels", opts)
+            .unwrap();
+        zip.write_all(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">
+<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/table\" Target=\"../tables/table1.xml\"/>
+</Relationships>").unwrap();
+
+        zip.start_file("xl/tables/table1.xml", opts).unwrap();
+        zip.write_all(b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>
+<table xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" id=\"1\" name=\"Inventory\" displayName=\"Inventory\" ref=\"A1:C4\" headerRowCount=\"1\" totalsRowCount=\"1\">
+<autoFilter ref=\"A1:C4\"/>
+<tableColumns count=\"3\">
+<tableColumn id=\"1\" name=\"SKU\"/>
+<tableColumn id=\"2\" name=\"Name\"/>
+<tableColumn id=\"3\" name=\"Qty\" totalsRowFunction=\"sum\"/>
+</tableColumns>
+<tableStyleInfo name=\"TableStyleMedium2\" showFirstColumn=\"0\" showLastColumn=\"0\" showRowStripes=\"1\" showColumnStripes=\"0\"/>
+</table>").unwrap();
+
+        let data = zip.finish().unwrap().into_inner();
+        let document = import_document(&data).unwrap();
+
+        assert_eq!(document.sheet_features[0].tables.len(), 1);
+        let table = &document.sheet_features[0].tables[0];
+        assert_eq!(table.name, "Inventory");
+        assert_eq!(table.range, (0, 0, 3, 2));
+        assert!(table.totals_row_shown);
+        assert_eq!(table.columns.len(), 3);
+        assert_eq!(table.columns[0].name, "SKU");
+        assert_eq!(
+            table.columns[2].totals_row_function,
+            Some(sheets_tables::TotalsRowFunction::Sum)
+        );
+        assert_eq!(table.auto_filter_range, Some((0, 0, 3, 2)));
+        assert!(table.style.show_row_stripes);
+    }
+
+    #[test]
+    fn out_of_bounds_table_parts_are_skipped_not_fatal() {
+        use std::io::Write;
+
+        let buf: Vec<u8> = Vec::new();
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(buf));
+        let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default();
+
+        zip.start_file("[Content_Types].xml", opts).unwrap();
+        zip.write_all(BRACKET_CONTENT_TYPES).unwrap();
+        zip.start_file("_rels/.rels", opts).unwrap();
+        zip.write_all(RELS).unwrap();
+        zip.start_file("xl/workbook.xml", opts).unwrap();
+        zip.write_all(WORKBOOK_XML).unwrap();
+        zip.start_file("xl/_rels/workbook.xml.rels", opts).unwrap();
+        zip.write_all(WORKBOOK_RELS).unwrap();
+        zip.start_file("xl/sharedStrings.xml", opts).unwrap();
+        zip.write_all(SHARED_STRINGS).unwrap();
+        zip.start_file("xl/worksheets/sheet1.xml", opts).unwrap();
+        zip.write_all(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">
+<sheetData/>
+<tableParts count=\"1\"><tablePart r:id=\"rId1\"/></tableParts>
+</worksheet>").unwrap();
+        zip.start_file("xl/worksheets/_rels/sheet1.xml.rels", opts)
+            .unwrap();
+        zip.write_all(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">
+<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/table\" Target=\"../tables/table1.xml\"/>
+</Relationships>").unwrap();
+        // Range extends past the column limit; importer must skip, not error.
+        zip.start_file("xl/tables/table1.xml", opts).unwrap();
+        zip.write_all(b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>
+<table xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" id=\"1\" name=\"Wide\" displayName=\"Wide\" ref=\"A1:ZZZ1\">
+<tableColumns count=\"1\"><tableColumn id=\"1\" name=\"X\"/></tableColumns>
+</table>").unwrap();
+
+        let data = zip.finish().unwrap().into_inner();
+        let document = import_document(&data).unwrap();
+        assert!(document.sheet_features[0].tables.is_empty());
+    }
 }

@@ -8,6 +8,7 @@ authors.workspace = true
 [dependencies]
 sheets-core = { path = "../sheets-core" }
 sheets-validation = { path = "../sheets-validation" }
+sheets-tables = { path = "../sheets-tables" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

@@ -3,6 +3,7 @@ use crate::error::XlsxError;
 use sheets_core::cell::CellType;
 use sheets_core::format::CellFormat;
 use sheets_core::workbook::Workbook;
+use sheets_tables::Table;
 use sheets_validation::{
     ConditionOperator, ConditionType, ConditionalFormat, ValidationErrorStyle, ValidationOperator,
     ValidationRule, ValidationType,
@@ -25,9 +26,11 @@ pub fn export_document(document: &XlsxDocument) -> Result<Vec<u8>, XlsxError> {
     let style_table = build_style_table(workbook, &document.sheet_features);
     let has_styles =
         !style_table.formats.is_empty() || !style_table.differential_formats.is_empty();
+    let table_plan = plan_tables(document);
+    let table_count = table_plan.len();
 
     zip.start_file("[Content_Types].xml", opts)?;
-    zip.write_all(generate_content_types_xml(workbook, has_styles).as_bytes())?;
+    zip.write_all(generate_content_types_xml(workbook, has_styles, table_count).as_bytes())?;
 
     zip.start_file("_rels/.rels", opts)?;
     zip.write_all(ROOT_RELS_XML.as_bytes())?;
@@ -70,14 +73,39 @@ pub fn export_document(document: &XlsxDocument) -> Result<Vec<u8>, XlsxError> {
         let path = format!("xl/worksheets/sheet{}.xml", sheet_idx + 1);
         zip.start_file(&path, opts)?;
         let features = &document.sheet_features[sheet_idx];
+        let sheet_table_ids: Vec<String> = table_plan
+            .iter()
+            .filter(|assignment| assignment.sheet_idx == sheet_idx)
+            .map(|assignment| assignment.relationship_id.clone())
+            .collect();
         let xml = generate_sheet_xml(
             workbook,
             sheet_idx,
             &shared_string_index,
             &style_table,
             features,
+            &sheet_table_ids,
         );
         zip.write_all(xml.as_bytes())?;
+    }
+
+    for sheet_idx in 0..workbook.sheet_count() {
+        let sheet_assignments: Vec<&TablePartAssignment<'_>> = table_plan
+            .iter()
+            .filter(|assignment| assignment.sheet_idx == sheet_idx)
+            .collect();
+        if sheet_assignments.is_empty() {
+            continue;
+        }
+        let rels_path = format!("xl/worksheets/_rels/sheet{}.xml.rels", sheet_idx + 1);
+        zip.start_file(&rels_path, opts)?;
+        zip.write_all(generate_worksheet_rels_xml(&sheet_assignments).as_bytes())?;
+    }
+
+    for assignment in &table_plan {
+        let path = format!("xl/tables/table{}.xml", assignment.part_number);
+        zip.start_file(&path, opts)?;
+        zip.write_all(generate_table_xml(assignment).as_bytes())?;
     }
 
     let result = zip.finish()?;
@@ -144,9 +172,10 @@ fn generate_sheet_xml(
     shared_string_index: &std::collections::HashMap<String, usize>,
     style_table: &StyleTable,
     features: &XlsxSheetFeatures,
+    table_relationship_ids: &[String],
 ) -> String {
     let mut xml = String::from(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">\n<sheetData>\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\n<sheetData>\n",
     );
 
     let sheet = match workbook.sheet(sheet_idx) {
@@ -249,6 +278,7 @@ fn generate_sheet_xml(
     xml.push_str("</sheetData>\n");
     write_conditional_formats(&mut xml, &features.conditional_formats, style_table);
     write_data_validations(&mut xml, &features.validations);
+    write_table_parts(&mut xml, table_relationship_ids);
     xml.push_str("</worksheet>");
     xml
 }
@@ -264,6 +294,142 @@ fn col_to_label(col: u32) -> String {
         c = c / 26 - 1;
     }
     label
+}
+
+fn bool_int(value: bool) -> &'static str {
+    if value {
+        "1"
+    } else {
+        "0"
+    }
+}
+
+/// A table assigned a workbook-global part number during export.
+struct TablePartAssignment<'a> {
+    sheet_idx: usize,
+    relationship_id: String,
+    part_number: u32,
+    table_id: u32,
+    table: &'a Table,
+}
+
+/// Assign each table a workbook-global part number (`tableN.xml`) and a
+/// per-worksheet relationship id. Part numbers and OOXML `id` values are
+/// 1-based and unique across the workbook, matching Excel's output.
+fn plan_tables(document: &XlsxDocument) -> Vec<TablePartAssignment<'_>> {
+    let mut plan = Vec::new();
+    let mut next_part = 1u32;
+    for (sheet_idx, features) in document.sheet_features.iter().enumerate() {
+        let mut next_rel_id = 1u32;
+        for table in &features.tables {
+            plan.push(TablePartAssignment {
+                sheet_idx,
+                relationship_id: format!("rId{next_rel_id}"),
+                part_number: next_part,
+                table_id: next_part,
+                table,
+            });
+            next_part += 1;
+            next_rel_id += 1;
+        }
+    }
+    plan
+}
+
+fn write_table_parts(xml: &mut String, relationship_ids: &[String]) {
+    if relationship_ids.is_empty() {
+        return;
+    }
+    xml.push_str(&format!(
+        "<tableParts count=\"{}\">",
+        relationship_ids.len()
+    ));
+    for id in relationship_ids {
+        xml.push_str(&format!("<tablePart r:id=\"{id}\"/>"));
+    }
+    xml.push_str("</tableParts>\n");
+}
+
+fn generate_worksheet_rels_xml(assignments: &[&TablePartAssignment<'_>]) -> String {
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\n",
+    );
+    for assignment in assignments {
+        xml.push_str(&format!(
+            "<Relationship Id=\"{}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/table\" Target=\"../tables/table{}.xml\"/>\n",
+            assignment.relationship_id, assignment.part_number
+        ));
+    }
+    xml.push_str("</Relationships>");
+    xml
+}
+
+fn generate_table_xml(assignment: &TablePartAssignment<'_>) -> String {
+    let table = assignment.table;
+    let (start_row, start_col, end_row, end_col) = table.range;
+    let reference = format!(
+        "{}{}:{}{}",
+        col_to_label(start_col),
+        start_row + 1,
+        col_to_label(end_col),
+        end_row + 1
+    );
+    let totals_row_count = if table.totals_row_shown { 1 } else { 0 };
+    let mut xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<table xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" id=\"{}\" name=\"{}\" displayName=\"{}\" ref=\"{}\" headerRowCount=\"{}\" totalsRowCount=\"{}\">\n",
+        assignment.table_id,
+        escape_xml(&table.name),
+        escape_xml(&table.display_name),
+        reference,
+        table.header_row_count,
+        totals_row_count
+    );
+    if let Some((af_start_row, af_start_col, af_end_row, af_end_col)) = table.auto_filter_range {
+        let af_reference = format!(
+            "{}{}:{}{}",
+            col_to_label(af_start_col),
+            af_start_row + 1,
+            col_to_label(af_end_col),
+            af_end_row + 1
+        );
+        xml.push_str(&format!("<autoFilter ref=\"{af_reference}\"/>\n"));
+    }
+    xml.push_str(&format!(
+        "<tableColumns count=\"{}\">\n",
+        table.columns.len()
+    ));
+    for column in &table.columns {
+        let function = column
+            .totals_row_function
+            .map(|function: sheets_tables::TotalsRowFunction| {
+                format!(" totalsRowFunction=\"{}\"", function.as_xml())
+            })
+            .unwrap_or_default();
+        let label = column
+            .totals_row_label
+            .as_ref()
+            .map(|label| format!(" totalsRowLabel=\"{}\"", escape_xml(label)))
+            .unwrap_or_default();
+        xml.push_str(&format!(
+            "<tableColumn id=\"{}\" name=\"{}\"{}{}/>\n",
+            column.id,
+            escape_xml(&column.name),
+            function,
+            label
+        ));
+    }
+    xml.push_str("</tableColumns>\n");
+    let style = &table.style;
+    xml.push_str(&format!(
+        "<tableStyleInfo name=\"{}\" showFirstColumn=\"{}\" showLastColumn=\"{}\" showRowStripes=\"{}\" showColumnStripes=\"{}\"/>\n",
+        escape_xml(style.name.as_deref().unwrap_or("")),
+        bool_int(style.show_first_column),
+        bool_int(style.show_last_column),
+        bool_int(style.show_row_stripes),
+        bool_int(style.show_column_stripes)
+    ));
+    xml.push_str("</table>");
+    xml
 }
 
 struct StyleTable {
@@ -688,6 +854,7 @@ fn validate_document(document: &XlsxDocument) -> Result<(), XlsxError> {
         total = total
             .checked_add(features.validations.len())
             .and_then(|count| count.checked_add(features.conditional_formats.len()))
+            .and_then(|count| count.checked_add(features.tables.len()))
             .ok_or_else(|| XlsxError::InvalidFormat("Too many worksheet feature records".into()))?;
         if total > MAX_FEATURE_RECORDS {
             return Err(XlsxError::InvalidFormat(format!(
@@ -703,6 +870,14 @@ fn validate_document(document: &XlsxDocument) -> Result<(), XlsxError> {
             if !valid_range(range) {
                 return Err(XlsxError::InvalidFormat(format!(
                     "Sheet {} contains an invalid worksheet feature range",
+                    sheet_index + 1
+                )));
+            }
+        }
+        for table in &features.tables {
+            if table.validate(1_000_000, 16_384).is_err() {
+                return Err(XlsxError::InvalidFormat(format!(
+                    "Sheet {} contains an invalid table definition",
                     sheet_index + 1
                 )));
             }
@@ -878,7 +1053,7 @@ fn escape_xml(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-fn generate_content_types_xml(workbook: &Workbook, has_styles: bool) -> String {
+fn generate_content_types_xml(workbook: &Workbook, has_styles: bool, table_count: usize) -> String {
     let mut xml = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\n<Default Extension=\"xml\" ContentType=\"application/xml\"/>\n<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\n<Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>\n<Override PartName=\"/xl/sharedStrings.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml\"/>\n",
     );
@@ -889,6 +1064,12 @@ fn generate_content_types_xml(workbook: &Workbook, has_styles: bool) -> String {
         xml.push_str(&format!(
             "<Override PartName=\"/xl/worksheets/sheet{}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>\n",
             i + 1
+        ));
+    }
+    for part_number in 1..=table_count {
+        xml.push_str(&format!(
+            "<Override PartName=\"/xl/tables/table{}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml\"/>\n",
+            part_number
         ));
     }
     xml.push_str("</Types>");
@@ -1056,6 +1237,7 @@ mod tests {
                 .map(|(validations, conditional_formats)| XlsxSheetFeatures {
                     validations,
                     conditional_formats,
+                    tables: Vec::new(),
                 })
                 .collect(),
         };
@@ -1101,6 +1283,7 @@ mod tests {
                     validation: validation.clone(),
                 }],
                 conditional_formats: Vec::new(),
+                tables: Vec::new(),
             }],
         };
 
@@ -1133,6 +1316,7 @@ mod tests {
             sheet_features: vec![XlsxSheetFeatures {
                 validations,
                 conditional_formats: Vec::new(),
+                tables: Vec::new(),
             }],
         };
 
@@ -1177,6 +1361,7 @@ mod tests {
             sheet_features: vec![XlsxSheetFeatures {
                 validations: Vec::new(),
                 conditional_formats: rules,
+                tables: Vec::new(),
             }],
         };
 
@@ -1242,6 +1427,7 @@ mod tests {
             sheet_features: vec![XlsxSheetFeatures {
                 validations: Vec::new(),
                 conditional_formats: rules,
+                tables: Vec::new(),
             }],
         };
 
@@ -1277,6 +1463,7 @@ mod tests {
                     validation: Default::default(),
                 }],
                 conditional_formats: Vec::new(),
+                tables: Vec::new(),
             }],
         };
         assert!(matches!(
@@ -1292,6 +1479,7 @@ mod tests {
                     condition_type: ConditionType::ColorScale,
                     ..Default::default()
                 }],
+                tables: Vec::new(),
             }],
         };
         assert!(matches!(
@@ -1343,5 +1531,165 @@ mod tests {
     fn test_escape_xml() {
         assert_eq!(escape_xml("a<b>c"), "a&lt;b&gt;c");
         assert_eq!(escape_xml("a&b"), "a&amp;b");
+    }
+
+    #[test]
+    fn excel_tables_roundtrip_through_xlsx() {
+        use sheets_tables::{Table, TableColumn, TableStyleInfo, TotalsRowFunction};
+
+        let mut workbook = Workbook::new();
+        workbook
+            .sheet_mut(0)
+            .unwrap()
+            .set_cell_value(0, 0, "Region".into());
+        let table = Table {
+            name: "Sales".into(),
+            display_name: "Sales".into(),
+            range: (0, 0, 3, 2),
+            header_row_count: 1,
+            totals_row_shown: true,
+            columns: vec![
+                TableColumn {
+                    id: 1,
+                    name: "Region".into(),
+                    totals_row_function: None,
+                    totals_row_label: Some("Total".into()),
+                },
+                TableColumn {
+                    id: 2,
+                    name: "Item".into(),
+                    totals_row_function: None,
+                    totals_row_label: None,
+                },
+                TableColumn {
+                    id: 3,
+                    name: "Total".into(),
+                    totals_row_function: Some(TotalsRowFunction::Sum),
+                    totals_row_label: None,
+                },
+            ],
+            style: TableStyleInfo {
+                name: Some("TableStyleMedium9".into()),
+                show_first_column: true,
+                show_last_column: false,
+                show_row_stripes: true,
+                show_column_stripes: true,
+            },
+            auto_filter_range: Some((0, 0, 3, 2)),
+        };
+        let document = XlsxDocument {
+            workbook,
+            sheet_features: vec![XlsxSheetFeatures {
+                validations: Vec::new(),
+                conditional_formats: Vec::new(),
+                tables: vec![table],
+            }],
+        };
+
+        let exported = export_document(&document).unwrap();
+        let restored = crate::import_document(&exported).unwrap();
+
+        assert_eq!(restored.sheet_features[0].tables.len(), 1);
+        let restored_table = &restored.sheet_features[0].tables[0];
+        assert_eq!(restored_table.name, "Sales");
+        assert_eq!(restored_table.display_name, "Sales");
+        assert_eq!(restored_table.range, (0, 0, 3, 2));
+        assert_eq!(restored_table.header_row_count, 1);
+        assert!(restored_table.totals_row_shown);
+        assert_eq!(restored_table.columns.len(), 3);
+        assert_eq!(restored_table.columns[0].name, "Region");
+        assert_eq!(
+            restored_table.columns[0].totals_row_label.as_deref(),
+            Some("Total")
+        );
+        assert_eq!(
+            restored_table.columns[2].totals_row_function,
+            Some(TotalsRowFunction::Sum)
+        );
+        assert_eq!(
+            restored_table.style.name.as_deref(),
+            Some("TableStyleMedium9")
+        );
+        assert!(restored_table.style.show_first_column);
+        assert!(restored_table.style.show_column_stripes);
+        assert_eq!(restored_table.auto_filter_range, Some((0, 0, 3, 2)));
+    }
+
+    #[test]
+    fn tables_on_multiple_sheets_get_distinct_workbook_scoped_parts() {
+        use sheets_tables::Table;
+
+        let mut workbook = Workbook::new();
+        workbook.add_sheet("Second").unwrap();
+        let document = XlsxDocument {
+            workbook,
+            sheet_features: vec![
+                XlsxSheetFeatures {
+                    validations: Vec::new(),
+                    conditional_formats: Vec::new(),
+                    tables: vec![
+                        Table::new("FirstA", (0, 0, 2, 1)),
+                        Table::new("FirstB", (0, 3, 2, 4)),
+                    ],
+                },
+                XlsxSheetFeatures {
+                    validations: Vec::new(),
+                    conditional_formats: Vec::new(),
+                    tables: vec![Table::new("SecondA", (0, 0, 1, 0))],
+                },
+            ],
+        };
+
+        let restored = crate::import_document(&export_document(&document).unwrap()).unwrap();
+        assert_eq!(restored.sheet_features[0].tables.len(), 2);
+        assert_eq!(restored.sheet_features[1].tables.len(), 1);
+        let names: Vec<&str> = restored
+            .sheet_features
+            .iter()
+            .flat_map(|features| features.tables.iter())
+            .map(|table| table.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["FirstA", "FirstB", "SecondA"]);
+    }
+
+    #[test]
+    fn exported_archive_includes_table_parts_and_content_types() {
+        use sheets_tables::Table;
+        use std::io::Read;
+
+        let document = XlsxDocument {
+            workbook: Workbook::new(),
+            sheet_features: vec![XlsxSheetFeatures {
+                validations: Vec::new(),
+                conditional_formats: Vec::new(),
+                tables: vec![Table::new("Sales", (0, 0, 2, 1))],
+            }],
+        };
+        let data = export_document(&document).unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(data)).unwrap();
+
+        // Table part, worksheet relationship part, and content-types override
+        // must all be present.
+        assert!(archive.by_name("xl/tables/table1.xml").is_ok());
+        assert!(archive
+            .by_name("xl/worksheets/_rels/sheet1.xml.rels")
+            .is_ok());
+
+        let mut content = String::new();
+        archive
+            .by_name("[Content_Types].xml")
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
+        assert!(content.contains("/xl/tables/table1.xml"));
+
+        let mut sheet = String::new();
+        archive
+            .by_name("xl/worksheets/sheet1.xml")
+            .unwrap()
+            .read_to_string(&mut sheet)
+            .unwrap();
+        assert!(sheet.contains("xmlns:r="));
+        assert!(sheet.contains("<tableParts count=\"1\">"));
     }
 }

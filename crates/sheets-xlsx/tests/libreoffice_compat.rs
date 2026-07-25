@@ -30,6 +30,7 @@ fn libreoffice_can_open_and_resave_exported_workbook() {
             .map(|(validations, conditional_formats)| XlsxSheetFeatures {
                 validations,
                 conditional_formats,
+                tables: Vec::new(),
             })
             .collect(),
     };

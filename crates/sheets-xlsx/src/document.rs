@@ -1,4 +1,5 @@
 use sheets_core::workbook::Workbook;
+use sheets_tables::Table;
 use sheets_validation::{ConditionalFormat, ValidationRule};
 
 /// Workbook content plus the worksheet feature records that 900Sheets can map
@@ -27,4 +28,5 @@ impl XlsxDocument {
 pub struct XlsxSheetFeatures {
     pub validations: Vec<ValidationRule>,
     pub conditional_formats: Vec<ConditionalFormat>,
+    pub tables: Vec<Table>,
 }

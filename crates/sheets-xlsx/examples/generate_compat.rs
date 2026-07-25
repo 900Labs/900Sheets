@@ -13,6 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|(validations, conditional_formats)| XlsxSheetFeatures {
             validations,
             conditional_formats,
+            tables: Vec::new(),
         })
         .collect();
     let document = XlsxDocument {

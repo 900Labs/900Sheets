@@ -2299,6 +2299,7 @@ fn xlsx_features_from_metadata(
             Ok(sheets_xlsx::XlsxSheetFeatures {
                 validations,
                 conditional_formats,
+                tables: Vec::new(),
             })
         })
         .collect()
