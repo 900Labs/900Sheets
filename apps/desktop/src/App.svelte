@@ -289,11 +289,42 @@
     }
   }
 
+  interface StoredChartSeries {
+    name_ref: string | null
+    category_ref: string | null
+    value_ref: string | null
+  }
+
+  interface StoredChartAnchor {
+    kind: 'TwoCell' | 'OneCell' | 'Absolute'
+    from_row: number
+    from_col: number
+    to_row: number
+    to_col: number
+    ext_cx: number
+    ext_cy: number
+    pos_x: number
+    pos_y: number
+  }
+
+  interface StoredChart {
+    id: string
+    label: string
+    chart: {
+      title: string | null
+      chart_type: string
+      anchor: StoredChartAnchor
+      series: StoredChartSeries[]
+      legend_position: string
+    }
+  }
+
   interface SheetFeatureState {
     validationRules: StoredValidationRule[]
     conditionalRules: StoredConditionalRule[]
     namedRanges: NamedRange[]
     tables: StoredTable[]
+    charts: StoredChart[]
     frozenRowCount: number
     frozenColCount: number
     hiddenRows: Record<number, boolean>
@@ -379,6 +410,7 @@
   let conditionalMatches: Array<[number, number]> = $state([])
   let conditionalRules: StoredConditionalRule[] = $state([])
   let tables: StoredTable[] = $state([])
+  let charts: StoredChart[] = $state([])
   let duplicateValueCounts: Record<string, Map<string, number>> = $derived(buildDuplicateValueCounts())
   let sheetFeatureStates: Record<string, SheetFeatureState> = $state({})
   let printPageSize: string = $state('Letter')
@@ -1506,6 +1538,7 @@
       conditionalRules: clonePlain(conditionalRules),
       namedRanges: clonePlain(namedRanges),
       tables: clonePlain(tables),
+      charts: clonePlain(charts),
       frozenRowCount,
       frozenColCount,
       hiddenRows: { ...hiddenRows },
@@ -1534,6 +1567,7 @@
     conditionalRules = clonePlain(state?.conditionalRules ?? [])
     namedRanges = clonePlain(state?.namedRanges ?? [])
     tables = clonePlain(state?.tables ?? [])
+    charts = clonePlain(state?.charts ?? [])
     frozenRowCount = Math.min(state?.frozenRowCount ?? 0, MAX_FROZEN_ROWS)
     frozenColCount = Math.min(state?.frozenColCount ?? 0, MAX_FROZEN_COLUMNS)
     hiddenRows = { ...(state?.hiddenRows ?? {}) }
@@ -1560,6 +1594,8 @@
     validationRules = []
     conditionalRules = []
     namedRanges = []
+    tables = []
+    charts = []
     conditionalMatches = []
     validationResults = []
     frozenRowCount = 0
@@ -1576,6 +1612,7 @@
     activeFilterLabel = ''
     namedRanges = []
     tables = []
+    charts = []
     validationRules = []
     conditionalRules = []
     conditionalMatches = []

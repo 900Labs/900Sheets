@@ -454,8 +454,11 @@ fn parse_sheet_charts<R: std::io::Read + std::io::Seek>(
 
 /// Extract each `(anchor, chart relationship id)` pair from a drawing part.
 /// Only `twoCellAnchor`, `oneCellAnchor`, and `absoluteAnchor` frames that
-/// reference a chart are considered.
+/// reference a chart are considered. The anchor kind is preserved so a
+/// one-cell or absolute frame is not collapsed into a degenerate two-cell
+/// frame on re-export.
 fn parse_drawing_anchors(drawing_xml: &str) -> Result<Vec<(ChartAnchor, String)>, XlsxError> {
+    use sheets_chart::ChartAnchorKind;
     let doc = Document::parse(drawing_xml)?;
     let mut result = Vec::new();
     for anchor_node in doc.descendants().filter(|node| {
@@ -475,16 +478,30 @@ fn parse_drawing_anchors(drawing_xml: &str) -> Result<Vec<(ChartAnchor, String)>
             continue;
         };
 
-        let anchor = if anchor_node.has_tag_name("absoluteAnchor") {
-            // `absoluteAnchor` pins the frame by EMU coordinates instead of a
-            // cell marker. 900Sheets does not preserve absolute coordinates, so
-            // it is recorded as a zero-cell anchor that still round-trips the
-            // chart definition.
-            ChartAnchor::new(0, 0, 0, 0)
+        let kind = if anchor_node.has_tag_name("absoluteAnchor") {
+            ChartAnchorKind::Absolute
+        } else if anchor_node.has_tag_name("oneCellAnchor") {
+            ChartAnchorKind::OneCell
         } else {
-            let from = parse_anchor_marker(anchor_node, "from").unwrap_or((0, 0));
-            let to = parse_anchor_marker(anchor_node, "to").unwrap_or(from);
-            ChartAnchor::new(from.0, from.1, to.0, to.1)
+            ChartAnchorKind::TwoCell
+        };
+
+        let anchor = match kind {
+            ChartAnchorKind::Absolute => {
+                let pos = parse_anchor_pos(anchor_node).unwrap_or((0, 0));
+                let ext = parse_anchor_ext(anchor_node).unwrap_or((0, 0));
+                ChartAnchor::absolute(pos.0, pos.1, ext.0, ext.1)
+            }
+            ChartAnchorKind::OneCell => {
+                let from = parse_anchor_marker(anchor_node, "from").unwrap_or((0, 0));
+                let ext = parse_anchor_ext(anchor_node).unwrap_or((0, 0));
+                ChartAnchor::one_cell(from.0, from.1, ext.0, ext.1)
+            }
+            ChartAnchorKind::TwoCell => {
+                let from = parse_anchor_marker(anchor_node, "from").unwrap_or((0, 0));
+                let to = parse_anchor_marker(anchor_node, "to").unwrap_or(from);
+                ChartAnchor::new(from.0, from.1, to.0, to.1)
+            }
         };
         result.push((anchor, chart_rid));
     }
@@ -508,6 +525,35 @@ fn parse_anchor_marker(anchor_node: Node<'_, '_>, marker_name: &str) -> Option<(
         .and_then(|node| node.text())
         .and_then(|text| text.trim().parse::<u32>().ok())?;
     Some((row, col))
+}
+
+/// Read the EMU extent `(cx, cy)` of an anchor's `<ext>` child. Used by
+/// `oneCellAnchor` and `absoluteAnchor` frames.
+fn parse_anchor_ext(anchor_node: Node<'_, '_>) -> Option<(u32, u32)> {
+    let ext = anchor_node
+        .children()
+        .find(|child| child.has_tag_name("ext"))?;
+    let cx = ext
+        .attribute("cx")
+        .and_then(|value| value.trim().parse::<u32>().ok())?;
+    let cy = ext
+        .attribute("cy")
+        .and_then(|value| value.trim().parse::<u32>().ok())?;
+    Some((cx, cy))
+}
+
+/// Read the EMU position `(x, y)` of an `absoluteAnchor`'s `<pos>` child.
+fn parse_anchor_pos(anchor_node: Node<'_, '_>) -> Option<(u32, u32)> {
+    let pos = anchor_node
+        .children()
+        .find(|child| child.has_tag_name("pos"))?;
+    let x = pos
+        .attribute("x")
+        .and_then(|value| value.trim().parse::<u32>().ok())?;
+    let y = pos
+        .attribute("y")
+        .and_then(|value| value.trim().parse::<u32>().ok())?;
+    Some((x, y))
 }
 
 /// Parse a `chartN.xml` part into a `ChartObject` without an anchor. Returns

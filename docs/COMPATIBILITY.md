@@ -88,12 +88,15 @@ The supported conditional-formatting subset includes cell-value, formula, text c
 
 The supported Excel table subset includes table name and display name, the worksheet range, header and totals row visibility, column names and identifiers, per-column totals-row functions (sum, average, count, count numbers, max, min, standard deviation, variance, and custom) and totals-row labels, the auto-filter range, and table style information (style name and the first-column, last-column, row-stripe, and column-stripe flags). Tables are preserved through XLSX round trips by reading each worksheet's table relationship parts. Tables authored outside workbook bounds or with inconsistent column counts are skipped on import and rejected on export. 900Sheets preserves table metadata for interoperability; it does not yet evaluate structured references (`TableName[Column]`) in formulas, render table styles in the grid, or expose table authoring in the desktop editor.
 
+The supported Excel chart subset preserves bar, column, line, area, pie, and doughnut chart objects through XLSX round trips. Each chart's title, legend position, on-sheet anchor (two-cell, one-cell, or absolute), and per-series worksheet references (series title, category axis, and values) are read from the drawing and chart parts and re-emitted on export. Scatter charts, combo charts beyond the first family, and chart formatting (colors, markers, data labels) are outside the preserved subset and are skipped on import. The desktop chart panel continues to build SVG previews from sheet data; those previews are not exported as native chart objects.
+
 The following Excel features are not preserved:
 
 - Macros and VBA
 - External workbook links
 - Table slicers
-- Native Excel charts and pivot caches
+- Pivot caches
+- Scatter charts and chart formatting beyond the preserved subset
 - Images, shapes, and embedded objects
 - Conditional-formatting features outside the documented subset, including color scales, data bars, icon sets, top or bottom rules, time periods, and above-average rules
 - Validation extensions and records outside the documented subset

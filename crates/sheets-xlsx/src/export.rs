@@ -589,21 +589,40 @@ fn generate_drawing_rels_xml(assignments: &[&ChartPartAssignment<'_>]) -> String
 }
 
 fn generate_drawing_xml(assignments: &[&ChartPartAssignment<'_>]) -> String {
+    use sheets_chart::ChartAnchorKind;
     let mut xml = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<xdr:wsDr xmlns:xdr=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\n",
     );
     for assignment in assignments {
         let anchor = &assignment.chart.anchor;
         let frame_id = assignment.chart_part_number;
-        xml.push_str(&format!(
-            "<xdr:twoCellAnchor editAs=\"oneCell\">\n<xdr:from><xdr:col>{from_col}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{from_row}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>\n<xdr:to><xdr:col>{to_col}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{to_row}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>\n<xdr:graphicFrame macro=\"\">\n<xdr:nvGraphicFramePr><xdr:cNvPr id=\"{frame_id}\" name=\"Chart {frame_id}\"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr>\n<xdr:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"0\" cy=\"0\"/></xdr:xfrm>\n<a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><c:chart xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" r:id=\"{rid}\"/></a:graphicData></a:graphic>\n</xdr:graphicFrame>\n<xdr:clientData/>\n</xdr:twoCellAnchor>\n",
-            from_col = anchor.from_col,
-            from_row = anchor.from_row,
-            to_col = anchor.to_col,
-            to_row = anchor.to_row,
-            frame_id = frame_id,
-            rid = assignment.drawing_relationship_id
-        ));
+        let rid = &assignment.drawing_relationship_id;
+        let graphic_frame = format!(
+            "<xdr:graphicFrame macro=\"\">\n<xdr:nvGraphicFramePr><xdr:cNvPr id=\"{frame_id}\" name=\"Chart {frame_id}\"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr>\n<xdr:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"0\" cy=\"0\"/></xdr:xfrm>\n<a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><c:chart xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" r:id=\"{rid}\"/></a:graphicData></a:graphic>\n</xdr:graphicFrame>\n<xdr:clientData/>\n"
+        );
+        match anchor.kind {
+            ChartAnchorKind::TwoCell => xml.push_str(&format!(
+                "<xdr:twoCellAnchor editAs=\"oneCell\">\n<xdr:from><xdr:col>{from_col}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{from_row}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>\n<xdr:to><xdr:col>{to_col}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{to_row}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>\n{graphic_frame}</xdr:twoCellAnchor>\n",
+                from_col = anchor.from_col,
+                from_row = anchor.from_row,
+                to_col = anchor.to_col,
+                to_row = anchor.to_row,
+            )),
+            ChartAnchorKind::OneCell => xml.push_str(&format!(
+                "<xdr:oneCellAnchor>\n<xdr:from><xdr:col>{from_col}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{from_row}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>\n<xdr:ext cx=\"{ext_cx}\" cy=\"{ext_cy}\"/>\n{graphic_frame}</xdr:oneCellAnchor>\n",
+                from_col = anchor.from_col,
+                from_row = anchor.from_row,
+                ext_cx = anchor.ext_cx,
+                ext_cy = anchor.ext_cy,
+            )),
+            ChartAnchorKind::Absolute => xml.push_str(&format!(
+                "<xdr:absoluteAnchor>\n<xdr:pos x=\"{pos_x}\" y=\"{pos_y}\"/>\n<xdr:ext cx=\"{ext_cx}\" cy=\"{ext_cy}\"/>\n{graphic_frame}</xdr:absoluteAnchor>\n",
+                pos_x = anchor.pos_x,
+                pos_y = anchor.pos_y,
+                ext_cx = anchor.ext_cx,
+                ext_cy = anchor.ext_cy,
+            )),
+        }
     }
     xml.push_str("</xdr:wsDr>");
     xml
@@ -2294,5 +2313,80 @@ mod tests {
             }],
         };
         assert!(export_document(&document).is_err());
+    }
+
+    #[test]
+    fn one_cell_and_absolute_chart_anchors_round_trip_their_kind() {
+        use sheets_chart::ChartAnchorKind;
+        use std::io::Read;
+
+        for anchor in [
+            ChartAnchor::one_cell(3, 2, 1_828_800, 1_371_600),
+            ChartAnchor::absolute(457_200, 274_320, 1_828_800, 1_371_600),
+        ] {
+            let document = XlsxDocument {
+                workbook: Workbook::new(),
+                sheet_features: vec![XlsxSheetFeatures {
+                    validations: Vec::new(),
+                    conditional_formats: Vec::new(),
+                    tables: Vec::new(),
+                    charts: vec![ChartObject {
+                        title: None,
+                        chart_type: ChartType::Column,
+                        anchor,
+                        series: vec![ChartObjectSeries {
+                            name_ref: Some("Sheet1!$B$1".into()),
+                            category_ref: Some("Sheet1!$A$2:$A$4".into()),
+                            value_ref: Some("Sheet1!$B$2:$B$4".into()),
+                        }],
+                        legend_position: LegendPosition::None,
+                    }],
+                }],
+            };
+            let bytes = export_document(&document).unwrap();
+
+            // The drawing must emit the matching anchor element, not a
+            // collapsed twoCellAnchor.
+            let mut drawing = String::new();
+            let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes.clone())).unwrap();
+            archive
+                .by_name("xl/drawings/drawing1.xml")
+                .unwrap()
+                .read_to_string(&mut drawing)
+                .unwrap();
+            let (expected_open, expected_close) = match anchor.kind {
+                ChartAnchorKind::OneCell => ("oneCellAnchor", "oneCellAnchor"),
+                ChartAnchorKind::Absolute => ("absoluteAnchor", "absoluteAnchor"),
+                ChartAnchorKind::TwoCell => ("twoCellAnchor", "twoCellAnchor"),
+            };
+            assert!(
+                drawing.contains(&format!("<xdr:{expected_open}>")),
+                "expected <xdr:{expected_open}> in drawing for {:?}",
+                anchor.kind
+            );
+            assert!(
+                drawing.contains(&format!("</xdr:{expected_close}>")),
+                "expected </xdr:{expected_close}> in drawing for {:?}",
+                anchor.kind
+            );
+            if anchor.kind == ChartAnchorKind::OneCell {
+                assert!(drawing.contains("<xdr:ext"));
+                assert!(
+                    !drawing.contains("<xdr:to>"),
+                    "oneCellAnchor must not emit a <to> marker"
+                );
+            }
+
+            let reimported = crate::import::import_document(&bytes).unwrap();
+            assert_eq!(reimported.sheet_features[0].charts.len(), 1);
+            assert_eq!(
+                reimported.sheet_features[0].charts[0].anchor.kind, anchor.kind,
+                "anchor kind changed on round trip"
+            );
+            assert_eq!(
+                reimported.sheet_features[0].charts[0].anchor, anchor,
+                "anchor fields changed on round trip"
+            );
+        }
     }
 }
