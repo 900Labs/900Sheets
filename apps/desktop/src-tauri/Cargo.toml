@@ -25,6 +25,7 @@ sheets-json = { path = "../../../crates/sheets-json" }
 sheets-pivot = { path = "../../../crates/sheets-pivot" }
 sheets-chart = { path = "../../../crates/sheets-chart" }
 sheets-validation = { path = "../../../crates/sheets-validation" }
+sheets-tables = { path = "../../../crates/sheets-tables" }
 sheets-i18n = { path = "../../../crates/sheets-i18n" }
 sheets-print = { path = "../../../crates/sheets-print" }
 sheets-advanced = { path = "../../../crates/sheets-advanced" }

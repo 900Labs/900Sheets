@@ -1,3 +1,6 @@
+mod export_preflight;
+
+use export_preflight::{preflight_workbook, ExportKind, ExportPreflight};
 use sheets_advanced::{
     CellComment, CellLockManager, GoalSeekConfig, GoalSeekResult, ProtectionAction, Scenario,
     SheetProtection,
@@ -111,12 +114,69 @@ struct RecoveryStore {
     fail_cleanup_after_retire: Arc<std::sync::atomic::AtomicBool>,
 }
 
-static RECOVERY_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+#[derive(Clone)]
+struct NativeBackupStore {
+    root: PathBuf,
+    io_lock: Arc<Mutex<()>>,
+    #[cfg(test)]
+    fail_before_replace: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    fail_rotation_cleanup: Arc<std::sync::atomic::AtomicBool>,
+}
 
-#[derive(serde::Deserialize, serde::Serialize)]
+static PRIVATE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+const MAX_NATIVE_BACKUPS_PER_DOCUMENT: usize = 5;
+
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
 struct RecoveryEntry {
     id: String,
     modified_millis: u128,
+    size_bytes: u64,
+}
+
+#[derive(serde::Serialize)]
+struct RecoveryInspection {
+    entry: RecoveryEntry,
+    sheets: Vec<SheetInfo>,
+    metadata: serde_json::Value,
+}
+
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+struct NativeBackupEntry {
+    id: String,
+    document_id: String,
+    document_name: String,
+    created_millis: u128,
+    size_bytes: u64,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct NativeBackupEnvelope {
+    schema_version: u32,
+    entry: NativeBackupEntry,
+    native_workbook: String,
+}
+
+#[derive(serde::Serialize)]
+struct NativeBackupInspection {
+    entry: NativeBackupEntry,
+    sheets: Vec<SheetInfo>,
+    metadata: serde_json::Value,
+}
+
+#[derive(serde::Serialize)]
+struct NativeBackupWriteResult {
+    entry: NativeBackupEntry,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rotation_warning: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct NativeSaveResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backup: Option<NativeBackupEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backup_warning: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -372,23 +432,155 @@ fn ensure_allowed_extension(path: &Path, allowed_extensions: &[&str]) -> Result<
     ))
 }
 
-fn write_atomic(path: &Path, data: &[u8]) -> Result<(), String> {
-    let temporary = path.with_extension(format!(
-        "{}.tmp",
-        path.extension()
-            .and_then(|extension| extension.to_str())
-            .unwrap_or("file")
-    ));
+fn ensure_regular_file_or_missing(path: &Path, label: &str) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            Err(format!("{label} must be a regular file"))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn unique_sibling_temporary_path(path: &Path) -> Result<PathBuf, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Destination must have a parent directory".to_string())?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "Destination file name must be valid UTF-8".to_string())?;
+    let sequence = PRIVATE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    Ok(parent.join(format!(
+        ".{file_name}.{}.{}.{}.tmp",
+        std::process::id(),
+        nanos,
+        sequence
+    )))
+}
+
+#[cfg(windows)]
+fn replace_file_platform(temporary: &Path, target: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+    let source: Vec<u16> = temporary
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let destination: Vec<u16> = target
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let result = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(std::io::Error::last_os_error().to_string())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_file_platform(temporary: &Path, target: &Path) -> Result<(), String> {
+    std::fs::rename(temporary, target).map_err(|error| error.to_string())
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Destination must have a parent directory".to_string())?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    use std::os::unix::fs::OpenOptionsExt;
+    options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
+    options
+        .open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+fn write_atomic_with_faults(
+    path: &Path,
+    data: &[u8],
+    interrupt_before_replace: bool,
+    fail_parent_sync_after_replace: bool,
+) -> Result<Option<String>, String> {
+    use std::io::Write;
+    ensure_regular_file_or_missing(path, "Destination")?;
+    let temporary = unique_sibling_temporary_path(path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
     {
-        use std::io::Write;
-        let mut file = std::fs::File::create(&temporary).map_err(|error| error.to_string())?;
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options
+        .open(&temporary)
+        .map_err(|error| error.to_string())?;
+    let result = (|| -> Result<Option<String>, String> {
         file.write_all(data).map_err(|error| error.to_string())?;
         file.sync_all().map_err(|error| error.to_string())?;
-    }
-    std::fs::rename(&temporary, path).map_err(|error| {
+        drop(file);
+        if interrupt_before_replace {
+            return Err("injected interruption before atomic replacement".into());
+        }
+        replace_file_platform(&temporary, path)?;
+        let parent_sync = if fail_parent_sync_after_replace {
+            Err("injected parent-directory sync failure".to_string())
+        } else {
+            sync_parent_directory(path)
+        };
+        Ok(parent_sync.err().map(|error| {
+            format!(
+                "The file was replaced, but directory durability could not be confirmed: {error}"
+            )
+        }))
+    })();
+    if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
-        error.to_string()
-    })
+    }
+    result
+}
+
+fn write_atomic_with_interruption(
+    path: &Path,
+    data: &[u8],
+    interrupt_before_replace: bool,
+) -> Result<(), String> {
+    write_atomic_with_faults(path, data, interrupt_before_replace, false).map(|_| ())
+}
+
+fn write_atomic(path: &Path, data: &[u8]) -> Result<(), String> {
+    write_atomic_with_interruption(path, data, false)
+}
+
+fn combine_warnings(left: Option<String>, right: Option<String>) -> Option<String> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(format!("{left} {right}")),
+        (Some(warning), None) | (None, Some(warning)) => Some(warning),
+        (None, None) => None,
+    }
 }
 
 impl RecoveryStore {
@@ -458,7 +650,7 @@ impl RecoveryStore {
     }
 
     fn unique_temporary_path(&self, id: &str) -> PathBuf {
-        let sequence = RECOVERY_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let sequence = PRIVATE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_nanos())
@@ -613,7 +805,7 @@ impl RecoveryStore {
         self.ensure_root()?;
         let source = self.path(id)?;
         Self::ensure_regular_target_or_missing(&source)?;
-        let sequence = RECOVERY_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let sequence = PRIVATE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let target = self.root.join(format!("{id}.900sheets.corrupt.{sequence}"));
         Self::replace_file(&source, &target)?;
         self.sync_root()
@@ -653,10 +845,271 @@ impl RecoveryStore {
             result.push(RecoveryEntry {
                 id: id.to_string(),
                 modified_millis,
+                size_bytes: metadata.len(),
             });
         }
         result.sort_by(|left, right| right.modified_millis.cmp(&left.modified_millis));
         Ok(result)
+    }
+
+    fn describe(&self, id: &str) -> Result<RecoveryEntry, String> {
+        let _guard = self.io_lock.lock().map_err(|error| error.to_string())?;
+        self.ensure_root()?;
+        let path = self.path(id)?;
+        Self::ensure_regular_target_or_missing(&path)?;
+        let metadata = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+        let modified_millis = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_millis())
+            .unwrap_or_default();
+        Ok(RecoveryEntry {
+            id: id.to_string(),
+            modified_millis,
+            size_bytes: metadata.len(),
+        })
+    }
+}
+
+impl NativeBackupStore {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            io_lock: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            fail_before_replace: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_rotation_cleanup: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    fn ensure_root(&self) -> Result<(), String> {
+        match std::fs::symlink_metadata(&self.root) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err("Backup directory must be a real directory".into());
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&self.root).map_err(|error| error.to_string())?;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&self.root, std::fs::Permissions::from_mode(0o700))
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    fn validate_id(id: &str) -> Result<(), String> {
+        if id.is_empty()
+            || id.len() > 128
+            || !id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        {
+            return Err("Backup ID must contain only letters, numbers, '-' or '_'".into());
+        }
+        Ok(())
+    }
+
+    fn path(&self, id: &str) -> Result<PathBuf, String> {
+        Self::validate_id(id)?;
+        Ok(self.root.join(format!("{id}.900sheets.backup")))
+    }
+
+    fn document_id(path: &Path) -> String {
+        // FNV-1a is used only as an opaque, stable grouping key. No source path is
+        // persisted in the private backup directory.
+        let mut hash = 0xcbf29ce484222325_u64;
+        for byte in path.as_os_str().to_string_lossy().as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        format!("{hash:016x}")
+    }
+
+    fn document_name(path: &Path) -> String {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("Workbook.900sheets");
+        name.chars().take(128).collect()
+    }
+
+    fn read_envelope_unlocked(&self, id: &str) -> Result<NativeBackupEnvelope, String> {
+        use std::io::Read;
+        let path = self.path(id)?;
+        ensure_regular_file_or_missing(&path, "Backup")?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut contents = String::new();
+        options
+            .open(path)
+            .and_then(|mut file| file.read_to_string(&mut contents))
+            .map_err(|error| error.to_string())?;
+        let envelope: NativeBackupEnvelope =
+            serde_json::from_str(&contents).map_err(|error| error.to_string())?;
+        if envelope.schema_version != 1 || envelope.entry.id != id {
+            return Err("Backup envelope is invalid".into());
+        }
+        sheets_json::import_native_workbook_with_metadata(&envelope.native_workbook)
+            .map_err(|error| format!("Backup workbook is invalid: {error}"))?;
+        Ok(envelope)
+    }
+
+    fn list_unlocked(&self) -> Result<Vec<NativeBackupEntry>, String> {
+        let mut result = Vec::new();
+        for entry in std::fs::read_dir(&self.root).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(id) = name.strip_suffix(".900sheets.backup") else {
+                continue;
+            };
+            if Self::validate_id(id).is_err() {
+                continue;
+            }
+            if let Ok(envelope) = self.read_envelope_unlocked(id) {
+                result.push(envelope.entry);
+            }
+        }
+        result.sort_by(|left, right| {
+            right
+                .created_millis
+                .cmp(&left.created_millis)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        Ok(result)
+    }
+
+    fn list(&self) -> Result<Vec<NativeBackupEntry>, String> {
+        let _guard = self.io_lock.lock().map_err(|error| error.to_string())?;
+        self.ensure_root()?;
+        self.list_unlocked()
+    }
+
+    fn read(&self, id: &str) -> Result<NativeBackupEnvelope, String> {
+        let _guard = self.io_lock.lock().map_err(|error| error.to_string())?;
+        self.ensure_root()?;
+        self.read_envelope_unlocked(id)
+    }
+
+    fn delete(&self, id: &str) -> Result<(), String> {
+        let _guard = self.io_lock.lock().map_err(|error| error.to_string())?;
+        self.ensure_root()?;
+        let path = self.path(id)?;
+        ensure_regular_file_or_missing(&path, "Backup")?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => sync_parent_directory(&path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn write_for_path(
+        &self,
+        source_path: &Path,
+        data: &str,
+    ) -> Result<NativeBackupWriteResult, String> {
+        // Reject an invalid native payload before it can enter backup rotation.
+        sheets_json::import_native_workbook_with_metadata(data)
+            .map_err(|error| format!("Cannot back up an invalid native workbook: {error}"))?;
+        let _guard = self.io_lock.lock().map_err(|error| error.to_string())?;
+        self.ensure_root()?;
+        let document_id = Self::document_id(source_path);
+        let created_millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or_default();
+        let sequence = PRIVATE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let id = format!("{document_id}_{created_millis}_{sequence:020}");
+        let entry = NativeBackupEntry {
+            id: id.clone(),
+            document_id: document_id.clone(),
+            document_name: Self::document_name(source_path),
+            created_millis,
+            size_bytes: data.len() as u64,
+        };
+        let envelope = NativeBackupEnvelope {
+            schema_version: 1,
+            entry: entry.clone(),
+            native_workbook: data.to_string(),
+        };
+        let encoded = serde_json::to_vec(&envelope).map_err(|error| error.to_string())?;
+        let destination = self.path(&id)?;
+        #[cfg(test)]
+        let interrupt = self.fail_before_replace.swap(false, Ordering::SeqCst);
+        #[cfg(not(test))]
+        let interrupt = false;
+        write_atomic_with_interruption(&destination, &encoded, interrupt)?;
+
+        let mut rotation_warning = None;
+        let mut document_backups: Vec<_> = self
+            .list_unlocked()?
+            .into_iter()
+            .filter(|candidate| candidate.document_id == document_id)
+            .collect();
+        document_backups.sort_by(|left, right| {
+            right
+                .created_millis
+                .cmp(&left.created_millis)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        if document_backups.len() > MAX_NATIVE_BACKUPS_PER_DOCUMENT {
+            #[cfg(test)]
+            let inject_cleanup_failure = self.fail_rotation_cleanup.swap(false, Ordering::SeqCst);
+            #[cfg(not(test))]
+            let inject_cleanup_failure = false;
+            if inject_cleanup_failure {
+                rotation_warning = Some(
+                    "The newest backup was kept, but older backups could not be rotated".into(),
+                );
+            } else {
+                let mut removed_any = false;
+                for stale in document_backups
+                    .into_iter()
+                    .skip(MAX_NATIVE_BACKUPS_PER_DOCUMENT)
+                {
+                    let stale_path = self.path(&stale.id)?;
+                    match std::fs::remove_file(&stale_path) {
+                        Ok(()) => removed_any = true,
+                        Err(error) => {
+                            rotation_warning = Some(format!(
+                                "The newest backup was kept, but an older backup could not be removed: {error}"
+                            ));
+                            break;
+                        }
+                    }
+                }
+                if removed_any {
+                    if let Err(error) = sync_parent_directory(&destination) {
+                        rotation_warning = Some(format!(
+                            "The newest backup was kept, but backup rotation could not be fully synchronized: {error}"
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(NativeBackupWriteResult {
+            entry,
+            rotation_warning,
+        })
     }
 }
 
@@ -1762,19 +2215,196 @@ fn evaluate_formula(
 }
 
 #[tauri::command]
+fn get_export_preflight(
+    format: String,
+    sheet_id: Option<u32>,
+    print_area: Option<[u32; 4]>,
+    state: State<AppState>,
+) -> Result<ExportPreflight, String> {
+    let workbook = state.workbook.lock().map_err(|error| error.to_string())?;
+    preflight_workbook(
+        &workbook,
+        ExportKind::parse(&format)?,
+        sheet_id.map(|value| value as usize),
+        print_area,
+    )
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FrontendFeatureRange {
+    start_row: u32,
+    start_col: u32,
+    end_row: u32,
+    end_col: u32,
+}
+
+impl FrontendFeatureRange {
+    fn tuple(&self) -> (u32, u32, u32, u32) {
+        (self.start_row, self.start_col, self.end_row, self.end_col)
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct FrontendValidationRule {
+    range: FrontendFeatureRange,
+    validation: DataValidation,
+}
+
+#[derive(serde::Deserialize)]
+struct FrontendConditionalRule {
+    rule: ConditionalFormat,
+}
+
+#[derive(serde::Deserialize)]
+struct FrontendTable {
+    table: sheets_tables::Table,
+}
+
+fn xlsx_features_from_metadata(
+    workbook: &Workbook,
+    metadata: &serde_json::Value,
+) -> Result<Vec<sheets_xlsx::XlsxSheetFeatures>, String> {
+    let states = metadata
+        .get("sheet_states")
+        .and_then(serde_json::Value::as_object);
+    workbook
+        .sheets()
+        .iter()
+        .map(|sheet| {
+            let Some(state) = states.and_then(|states| states.get(&sheet.stable_id().to_string()))
+            else {
+                return Ok(sheets_xlsx::XlsxSheetFeatures::default());
+            };
+            let validations = match state.get("validationRules") {
+                None => Vec::new(),
+                Some(value) => serde_json::from_value::<Vec<FrontendValidationRule>>(value.clone())
+                    .map_err(|error| {
+                        format!("Invalid validation metadata for XLSX export: {error}")
+                    })?
+                    .into_iter()
+                    .map(|stored| ValidationRule {
+                        range: stored.range.tuple(),
+                        validation: stored.validation,
+                    })
+                    .collect(),
+            };
+            let conditional_formats = match state.get("conditionalRules") {
+                None => Vec::new(),
+                Some(value) => {
+                    serde_json::from_value::<Vec<FrontendConditionalRule>>(value.clone())
+                        .map_err(|error| {
+                            format!("Invalid conditional-format metadata for XLSX export: {error}")
+                        })?
+                        .into_iter()
+                        .map(|stored| stored.rule)
+                        .collect()
+                }
+            };
+            let tables = match state.get("tables") {
+                None => Vec::new(),
+                Some(value) => serde_json::from_value::<Vec<FrontendTable>>(value.clone())
+                    .map_err(|error| format!("Invalid table metadata for XLSX export: {error}"))?
+                    .into_iter()
+                    .map(|stored| stored.table)
+                    .collect(),
+            };
+            Ok(sheets_xlsx::XlsxSheetFeatures {
+                validations,
+                conditional_formats,
+                tables,
+            })
+        })
+        .collect()
+}
+
+fn xlsx_metadata_from_document(document: &sheets_xlsx::XlsxDocument) -> serde_json::Value {
+    let mut states = serde_json::Map::new();
+    for (sheet_index, features) in document.sheet_features.iter().enumerate() {
+        if features.validations.is_empty()
+            && features.conditional_formats.is_empty()
+            && features.tables.is_empty()
+        {
+            continue;
+        }
+        let Some(sheet) = document.workbook.sheet(sheet_index) else {
+            continue;
+        };
+        let validation_rules: Vec<_> = features
+            .validations
+            .iter()
+            .enumerate()
+            .map(|(index, rule)| {
+                let (start_row, start_col, end_row, end_col) = rule.range;
+                serde_json::json!({
+                    "id": format!("xlsx-validation-{index}"),
+                    "label": "Imported XLSX validation",
+                    "range": {
+                        "startRow": start_row,
+                        "startCol": start_col,
+                        "endRow": end_row,
+                        "endCol": end_col,
+                    },
+                    "validation": rule.validation,
+                })
+            })
+            .collect();
+        let conditional_rules: Vec<_> = features
+            .conditional_formats
+            .iter()
+            .enumerate()
+            .map(|(index, rule)| {
+                serde_json::json!({
+                    "id": format!("xlsx-conditional-{index}"),
+                    "label": "Imported XLSX conditional format",
+                    "rule": rule,
+                })
+            })
+            .collect();
+        let tables: Vec<_> = features
+            .tables
+            .iter()
+            .map(|table| {
+                serde_json::json!({
+                    "id": format!("xlsx-table-{}", table.name),
+                    "label": "Imported XLSX table",
+                    "table": table,
+                })
+            })
+            .collect();
+        states.insert(
+            sheet.stable_id().to_string(),
+            serde_json::json!({
+                "validationRules": validation_rules,
+                "conditionalRules": conditional_rules,
+                "tables": tables,
+            }),
+        );
+    }
+    serde_json::json!({ "sheet_states": states })
+}
+
+#[tauri::command]
 fn import_xlsx(
     data: Vec<u8>,
     state: State<AppState>,
     comments: State<'_, Mutex<SheetComments>>,
-) -> Result<Vec<SheetInfo>, String> {
-    let imported = sheets_xlsx::import_workbook(&data).map_err(|e| e.to_string())?;
-    replace_loaded_workbook(state.inner(), comments.inner(), imported)
+) -> Result<NativeOpenResult, String> {
+    let document = sheets_xlsx::import_document(&data).map_err(|error| error.to_string())?;
+    let metadata = xlsx_metadata_from_document(&document);
+    let sheets = replace_loaded_workbook(state.inner(), comments.inner(), document.workbook)?;
+    Ok(NativeOpenResult { sheets, metadata })
 }
 
 #[tauri::command]
-fn export_xlsx(state: State<AppState>) -> Result<Vec<u8>, String> {
-    let wb = state.workbook.lock().map_err(|e| e.to_string())?;
-    sheets_xlsx::export_workbook(&wb).map_err(|e| e.to_string())
+fn export_xlsx(metadata: serde_json::Value, state: State<AppState>) -> Result<Vec<u8>, String> {
+    let workbook = state.workbook.lock().map_err(|error| error.to_string())?;
+    let sheet_features = xlsx_features_from_metadata(&workbook, &metadata)?;
+    sheets_xlsx::export_document(&sheets_xlsx::XlsxDocument {
+        workbook: workbook.clone(),
+        sheet_features,
+    })
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -1782,7 +2412,7 @@ fn import_xlsx_file(
     file_path: String,
     state: State<AppState>,
     comments: State<'_, Mutex<SheetComments>>,
-) -> Result<Vec<SheetInfo>, String> {
+) -> Result<NativeOpenResult, String> {
     let path = checked_absolute_path(&file_path)?;
     ensure_allowed_extension(&path, &["xlsx"])?;
     let data = std::fs::read(path).map_err(|e| e.to_string())?;
@@ -1790,11 +2420,15 @@ fn import_xlsx_file(
 }
 
 #[tauri::command]
-fn export_xlsx_file(file_path: String, state: State<AppState>) -> Result<(), String> {
+fn export_xlsx_file(
+    file_path: String,
+    metadata: serde_json::Value,
+    state: State<AppState>,
+) -> Result<(), String> {
     let path = checked_absolute_path(&file_path)?;
     ensure_allowed_extension(&path, &["xlsx"])?;
-    let data = export_xlsx(state)?;
-    std::fs::write(path, data).map_err(|e| e.to_string())
+    let data = export_xlsx(metadata, state)?;
+    write_atomic(&path, &data)
 }
 
 #[tauri::command]
@@ -1874,7 +2508,7 @@ fn export_csv_file(
     let path = checked_absolute_path(&file_path)?;
     ensure_allowed_extension(&path, &["csv", "tsv", "txt"])?;
     let data = export_csv(sheet_id, delimiter, state)?;
-    std::fs::write(path, data).map_err(|e| e.to_string())
+    write_atomic(&path, data.as_bytes())
 }
 
 #[tauri::command]
@@ -1910,7 +2544,7 @@ fn export_json_file(file_path: String, state: State<AppState>) -> Result<(), Str
     let path = checked_absolute_path(&file_path)?;
     ensure_allowed_extension(&path, &["json"])?;
     let data = export_json(state)?;
-    std::fs::write(path, data).map_err(|e| e.to_string())
+    write_atomic(&path, data.as_bytes())
 }
 
 fn metadata_with_backend_sheet_states(
@@ -2082,23 +2716,6 @@ fn parse_backend_sheet_states(
     Ok((restored_comments, restored_protections, restored_locks))
 }
 
-fn restore_backend_sheet_states(
-    workbook: &Workbook,
-    metadata: &serde_json::Value,
-    state: &AppState,
-    comments: &Mutex<SheetComments>,
-) -> Result<(), String> {
-    let (next_comments, next_protections, next_locks) =
-        parse_backend_sheet_states(workbook, metadata)?;
-    *comments.lock().map_err(|error| error.to_string())? = next_comments;
-    *state
-        .protections
-        .lock()
-        .map_err(|error| error.to_string())? = next_protections;
-    *state.cell_locks.lock().map_err(|error| error.to_string())? = next_locks;
-    Ok(())
-}
-
 fn export_native_contents(
     metadata: serde_json::Value,
     state: &AppState,
@@ -2122,6 +2739,14 @@ fn export_native_contents(
         .map_err(|error| error.to_string())
 }
 
+fn inspect_native_contents(data: &str) -> Result<(Vec<SheetInfo>, serde_json::Value), String> {
+    let (workbook, metadata) = sheets_json::import_native_workbook_with_metadata(data)
+        .map_err(|error| error.to_string())?;
+    dependency_graphs_for_workbook(&workbook)?;
+    parse_backend_sheet_states(&workbook, &metadata)?;
+    Ok((sheet_infos(&workbook), metadata))
+}
+
 fn import_native_contents(
     data: &str,
     state: &AppState,
@@ -2129,11 +2754,33 @@ fn import_native_contents(
 ) -> Result<NativeOpenResult, String> {
     let (imported, metadata) = sheets_json::import_native_workbook_with_metadata(data)
         .map_err(|error| error.to_string())?;
-    let sheets = replace_loaded_workbook(state, comments, imported)?;
-    {
-        let workbook = state.workbook.lock().map_err(|error| error.to_string())?;
-        restore_backend_sheet_states(&workbook, &metadata, state, comments)?;
+    // Build and validate every candidate component before acquiring the live
+    // state locks. A malformed backup, recovery, or native file can therefore
+    // never leave a partially replaced workbook behind.
+    let candidate_graphs = dependency_graphs_for_workbook(&imported)?;
+    let (candidate_comments, candidate_protections, candidate_locks) =
+        parse_backend_sheet_states(&imported, &metadata)?;
+    let sheets = sheet_infos(&imported);
+
+    let mut history = state.history.lock().map_err(|error| error.to_string())?;
+    if history.pending.is_some() {
+        return Err("Workbook replacement is a non-transactional session operation".into());
     }
+    let mut workbook = state.workbook.lock().map_err(|error| error.to_string())?;
+    let mut dep_graph = state.dep_graphs.lock().map_err(|error| error.to_string())?;
+    let mut protections = state
+        .protections
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let mut cell_locks = state.cell_locks.lock().map_err(|error| error.to_string())?;
+    let mut live_comments = comments.lock().map_err(|error| error.to_string())?;
+
+    *workbook = imported;
+    *dep_graph = candidate_graphs;
+    *protections = candidate_protections;
+    *cell_locks = candidate_locks;
+    *live_comments = candidate_comments;
+    *history = TransactionHistory::default();
     Ok(NativeOpenResult { sheets, metadata })
 }
 
@@ -2155,11 +2802,30 @@ fn export_native_file(
     metadata: serde_json::Value,
     state: State<AppState>,
     comments: State<'_, Mutex<SheetComments>>,
-) -> Result<(), String> {
+    backups: State<NativeBackupStore>,
+) -> Result<NativeSaveResult, String> {
     let path = checked_absolute_path(&file_path)?;
     ensure_allowed_extension(&path, &["900sheets"])?;
     let data = export_native_contents(metadata, state.inner(), comments.inner())?;
-    write_atomic(&path, data.as_bytes())
+    let durability_warning = write_atomic_with_faults(&path, data.as_bytes(), false, false)?;
+    // A successful primary save remains successful if backup maintenance fails.
+    // The result lets the UI surface the warning without telling the user that
+    // their already-written workbook was not saved.
+    match backups.write_for_path(&path, &data) {
+        Ok(result) => Ok(NativeSaveResult {
+            backup: Some(result.entry),
+            backup_warning: combine_warnings(durability_warning, result.rotation_warning),
+        }),
+        Err(error) => Ok(NativeSaveResult {
+            backup: None,
+            backup_warning: combine_warnings(
+                durability_warning,
+                Some(format!(
+                    "Workbook saved, but its rotating backup could not be created: {error}"
+                )),
+            ),
+        }),
+    }
 }
 
 #[tauri::command]
@@ -2177,6 +2843,20 @@ fn write_recovery_snapshot(
 #[tauri::command]
 fn list_recovery_snapshots(recovery: State<RecoveryStore>) -> Result<Vec<RecoveryEntry>, String> {
     recovery.list()
+}
+
+#[tauri::command]
+fn inspect_recovery_snapshot(
+    recovery_id: String,
+    recovery: State<RecoveryStore>,
+) -> Result<RecoveryInspection, String> {
+    let data = recovery.read(&recovery_id)?;
+    let (sheets, metadata) = inspect_native_contents(&data)?;
+    Ok(RecoveryInspection {
+        entry: recovery.describe(&recovery_id)?,
+        sheets,
+        metadata,
+    })
 }
 
 #[tauri::command]
@@ -2202,6 +2882,74 @@ fn discard_recovery_snapshot(
     recovery: State<RecoveryStore>,
 ) -> Result<(), String> {
     recovery.discard(&recovery_id)
+}
+
+#[tauri::command]
+fn delete_recovery_snapshot(
+    recovery_id: String,
+    recovery: State<RecoveryStore>,
+) -> Result<(), String> {
+    recovery.discard(&recovery_id)
+}
+
+#[tauri::command]
+fn create_native_backup(
+    file_path: String,
+    backups: State<NativeBackupStore>,
+) -> Result<NativeBackupWriteResult, String> {
+    let path = checked_absolute_path(&file_path)?;
+    ensure_allowed_extension(&path, &["900sheets"])?;
+    ensure_regular_file_or_missing(&path, "Native workbook")?;
+    let data = std::fs::read_to_string(&path).map_err(|error| error.to_string())?;
+    backups.write_for_path(&path, &data)
+}
+
+#[tauri::command]
+fn list_native_backups(
+    file_path: Option<String>,
+    backups: State<NativeBackupStore>,
+) -> Result<Vec<NativeBackupEntry>, String> {
+    let mut entries = backups.list()?;
+    if let Some(file_path) = file_path {
+        let path = checked_absolute_path(&file_path)?;
+        ensure_allowed_extension(&path, &["900sheets"])?;
+        let document_id = NativeBackupStore::document_id(&path);
+        entries.retain(|entry| entry.document_id == document_id);
+    }
+    Ok(entries)
+}
+
+#[tauri::command]
+fn inspect_native_backup(
+    backup_id: String,
+    backups: State<NativeBackupStore>,
+) -> Result<NativeBackupInspection, String> {
+    let envelope = backups.read(&backup_id)?;
+    let (sheets, metadata) = inspect_native_contents(&envelope.native_workbook)?;
+    Ok(NativeBackupInspection {
+        entry: envelope.entry,
+        sheets,
+        metadata,
+    })
+}
+
+#[tauri::command]
+fn restore_native_backup(
+    backup_id: String,
+    state: State<AppState>,
+    comments: State<'_, Mutex<SheetComments>>,
+    backups: State<NativeBackupStore>,
+) -> Result<NativeOpenResult, String> {
+    let envelope = backups.read(&backup_id)?;
+    import_native_contents(&envelope.native_workbook, state.inner(), comments.inner())
+}
+
+#[tauri::command]
+fn delete_native_backup(
+    backup_id: String,
+    backups: State<NativeBackupStore>,
+) -> Result<(), String> {
+    backups.delete(&backup_id)
 }
 
 #[tauri::command]
@@ -2428,6 +3176,49 @@ struct ValidationResult {
     error: String,
 }
 
+fn bounded_range_cells(
+    sheet: &Sheet,
+    range: (u32, u32, u32, u32),
+    operation: &str,
+) -> Result<usize, String> {
+    let (start_row, start_col, end_row, end_col) = range;
+    if start_row > end_row || start_col > end_col {
+        return Err(format!("{operation} range start must not be after its end"));
+    }
+    if end_row >= sheet.max_rows() || end_col >= sheet.max_cols() {
+        return Err(format!("{operation} range is outside the workbook grid"));
+    }
+    let rows = u64::from(end_row - start_row + 1);
+    let columns = u64::from(end_col - start_col + 1);
+    let cells = rows.saturating_mul(columns);
+    if cells > MAX_TRANSACTION_CELLS as u64 {
+        return Err(format!(
+            "{operation} range contains {cells} cells; the interactive limit is {MAX_TRANSACTION_CELLS}"
+        ));
+    }
+    Ok(cells as usize)
+}
+
+fn ensure_conditional_rule_budget(
+    sheet: &Sheet,
+    rules: &[ConditionalFormat],
+) -> Result<(), String> {
+    let mut total = 0usize;
+    for rule in rules {
+        total = total.saturating_add(bounded_range_cells(
+            sheet,
+            rule.range,
+            "Conditional formatting",
+        )?);
+        if total > MAX_TRANSACTION_CELLS {
+            return Err(format!(
+                "Conditional formatting rules cover more than {MAX_TRANSACTION_CELLS} cells in one request"
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn validate_cell_value(
     sheet_id: u32,
@@ -2453,6 +3244,7 @@ fn validate_range_cmd(
     let sheet = wb
         .sheet(sheet_id as usize)
         .ok_or_else(|| format!("Sheet {} not found", sheet_id))?;
+    bounded_range_cells(sheet, rule.range, "Validation")?;
     let errors = sheets_validation::validate_range(sheet, &rule);
     Ok(errors
         .into_iter()
@@ -2493,6 +3285,7 @@ fn evaluate_conditional_formats(
     let sheet = wb
         .sheet(sheet_id as usize)
         .ok_or_else(|| format!("Sheet {} not found", sheet_id))?;
+    ensure_conditional_rule_budget(sheet, &rules)?;
     let base_format = sheet.get_format(row, col);
     let results = sheets_validation::evaluate_all_conditions(sheet, row, col, &rules);
     let mut merged = base_format.cloned().unwrap_or_default();
@@ -2532,6 +3325,7 @@ fn find_conditional_format_matches(
     let sheet = wb
         .sheet(sheet_id as usize)
         .ok_or_else(|| format!("Sheet {} not found", sheet_id))?;
+    ensure_conditional_rule_budget(sheet, std::slice::from_ref(&rule))?;
     Ok(sheets_validation::find_matching_cells(sheet, &rule))
 }
 
@@ -2735,7 +3529,7 @@ fn save_pdf_to_file(
         .sheet(sheet_id as usize)
         .ok_or_else(|| format!("Sheet {} not found", sheet_id))?;
     let pdf_bytes = sheets_print::render_pdf(sheet, &config).map_err(|e| e.to_string())?;
-    std::fs::write(path, pdf_bytes).map_err(|e| e.to_string())
+    write_atomic(&path, &pdf_bytes)
 }
 
 // --- Advanced Features IPC ---
@@ -2951,6 +3745,9 @@ pub fn run() {
             let recovery = RecoveryStore::new(app_data.join("recovery"));
             recovery.ensure_root().map_err(std::io::Error::other)?;
             app.manage(recovery);
+            let backups = NativeBackupStore::new(app_data.join("backups"));
+            backups.ensure_root().map_err(std::io::Error::other)?;
+            app.manage(backups);
             Ok(())
         })
         .manage(AppState {
@@ -2983,6 +3780,7 @@ pub fn run() {
             edit_sheet_structure,
             get_sheet_data,
             evaluate_formula,
+            get_export_preflight,
             import_xlsx,
             export_xlsx,
             import_xlsx_file,
@@ -2999,8 +3797,15 @@ pub fn run() {
             export_native_file,
             write_recovery_snapshot,
             list_recovery_snapshots,
+            inspect_recovery_snapshot,
             restore_recovery_snapshot,
             discard_recovery_snapshot,
+            delete_recovery_snapshot,
+            create_native_backup,
+            list_native_backups,
+            inspect_native_backup,
+            restore_native_backup,
+            delete_native_backup,
             set_cell_format,
             get_cell_format,
             sort_data,
@@ -3060,6 +3865,19 @@ mod tests {
             cell_locks: Mutex::new(Vec::new()),
             history: Mutex::new(TransactionHistory::default()),
         }
+    }
+
+    fn native_test_data(value: &str) -> String {
+        let mut workbook = Workbook::new();
+        workbook
+            .sheet_mut(0)
+            .unwrap()
+            .set_cell_value(0, 0, value.into());
+        sheets_json::export_native_workbook_with_metadata(
+            &workbook,
+            serde_json::json!({"sheet_states": {}}),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -3140,6 +3958,159 @@ mod tests {
     fn allowed_extension_is_case_insensitive() {
         assert!(ensure_allowed_extension(&PathBuf::from("data.XLSX"), &["xlsx"]).is_ok());
         assert!(ensure_allowed_extension(&PathBuf::from("data.exe"), &["xlsx"]).is_err());
+    }
+
+    #[test]
+    fn interactive_validation_and_conditional_ranges_are_bounded() {
+        let sheet = Sheet::new("Bounds");
+        assert_eq!(
+            bounded_range_cells(&sheet, (0, 0, 399, 499), "Validation").unwrap(),
+            MAX_TRANSACTION_CELLS
+        );
+        assert!(bounded_range_cells(&sheet, (0, 0, 400, 499), "Validation").is_err());
+        assert!(bounded_range_cells(&sheet, (4, 0, 3, 0), "Validation").is_err());
+        assert!(bounded_range_cells(
+            &sheet,
+            (0, 0, sheet.max_rows(), 0),
+            "Conditional formatting"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn xlsx_features_follow_imported_sheet_stable_ids() {
+        let mut workbook = Workbook::new();
+        workbook.rename_sheet(0, "Budget").unwrap();
+        let assumptions = workbook.add_sheet("Assumptions").unwrap();
+        let assumption_id = workbook.sheet(assumptions).unwrap().stable_id();
+        let validation = DataValidation::list("Low,Medium,High");
+        let conditional = ConditionalFormat::cell_value(
+            sheets_validation::ConditionOperator::LessThan,
+            "0",
+            CellFormat::new().bg_color("#FFC7CE"),
+            (1, 3, 4, 3),
+        );
+        let metadata = serde_json::json!({
+            "sheet_states": {
+                (assumption_id.to_string()): {
+                    "validationRules": [{
+                        "id": "validation-1",
+                        "label": "Priority",
+                        "range": {"startRow": 1, "startCol": 1, "endRow": 3, "endCol": 1},
+                        "validation": validation,
+                    }],
+                    "conditionalRules": [{
+                        "id": "conditional-1",
+                        "label": "Negative",
+                        "rule": conditional,
+                    }],
+                }
+            }
+        });
+        let features = xlsx_features_from_metadata(&workbook, &metadata).unwrap();
+        assert!(features[0].validations.is_empty());
+        assert_eq!(features[1].validations.len(), 1);
+        assert_eq!(features[1].conditional_formats.len(), 1);
+
+        let bytes = sheets_xlsx::export_document(&sheets_xlsx::XlsxDocument {
+            workbook,
+            sheet_features: features,
+        })
+        .unwrap();
+        let imported = sheets_xlsx::import_document(&bytes).unwrap();
+        assert_eq!(imported.workbook.sheet(1).unwrap().name(), "Assumptions");
+        let imported_id = imported.workbook.sheet(1).unwrap().stable_id();
+        let imported_metadata = xlsx_metadata_from_document(&imported);
+        let imported_state = &imported_metadata["sheet_states"][imported_id.to_string()];
+        assert_eq!(
+            imported_state["validationRules"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            imported_state["conditionalRules"].as_array().unwrap().len(),
+            1
+        );
+        assert!(imported_metadata["sheet_states"]
+            .get(imported.workbook.sheet(0).unwrap().stable_id().to_string())
+            .is_none());
+    }
+
+    #[test]
+    fn table_metadata_roundtrips_through_xlsx_import_export_and_native_format() {
+        use sheets_tables::{Table, TableColumn, TotalsRowFunction};
+
+        // Simulate an XLSX document with one table, the way import_document
+        // returns it.
+        let workbook = Workbook::new();
+        let stable_id = workbook.sheet(0).unwrap().stable_id();
+        let table = Table {
+            name: "Inventory".into(),
+            display_name: "Inventory".into(),
+            range: (0, 0, 3, 2),
+            header_row_count: 1,
+            totals_row_shown: true,
+            columns: vec![
+                TableColumn {
+                    id: 1,
+                    name: "SKU".into(),
+                    totals_row_function: None,
+                    totals_row_label: None,
+                },
+                TableColumn {
+                    id: 2,
+                    name: "Name".into(),
+                    totals_row_function: None,
+                    totals_row_label: None,
+                },
+                TableColumn {
+                    id: 3,
+                    name: "Qty".into(),
+                    totals_row_function: Some(TotalsRowFunction::Sum),
+                    totals_row_label: None,
+                },
+            ],
+            style: sheets_tables::TableStyleInfo::default(),
+            auto_filter_range: Some((0, 0, 3, 2)),
+        };
+        let document = sheets_xlsx::XlsxDocument {
+            workbook: workbook.clone(),
+            sheet_features: vec![sheets_xlsx::XlsxSheetFeatures {
+                validations: Vec::new(),
+                conditional_formats: Vec::new(),
+                tables: vec![table.clone()],
+            }],
+        };
+
+        // xlsx_metadata_from_document: tables appear in sheet_states metadata.
+        let metadata = xlsx_metadata_from_document(&document);
+        let state = &metadata["sheet_states"][stable_id.to_string()];
+        assert_eq!(state["tables"].as_array().unwrap().len(), 1);
+        assert_eq!(state["tables"][0]["table"]["name"], "Inventory");
+
+        // xlsx_features_from_metadata: tables are reconstructed for XLSX export.
+        let features = xlsx_features_from_metadata(&workbook, &metadata).unwrap();
+        assert_eq!(features[0].tables.len(), 1);
+        assert_eq!(features[0].tables[0], table);
+
+        // Full XLSX round-trip through the desktop metadata bridge.
+        let bytes = sheets_xlsx::export_document(&sheets_xlsx::XlsxDocument {
+            workbook: workbook.clone(),
+            sheet_features: features,
+        })
+        .unwrap();
+        let reimported = sheets_xlsx::import_document(&bytes).unwrap();
+        assert_eq!(reimported.sheet_features[0].tables.len(), 1);
+        assert_eq!(reimported.sheet_features[0].tables[0].name, "Inventory");
+        assert_eq!(reimported.sheet_features[0].tables[0].range, (0, 0, 3, 2));
+        assert!(reimported.sheet_features[0].tables[0].totals_row_shown);
+
+        // Native-format round-trip: metadata (including tables) is an opaque
+        // blob that survives .900sheets save and reopen unchanged.
+        let native_json =
+            sheets_json::export_native_workbook_with_metadata(&workbook, metadata.clone()).unwrap();
+        let (_, restored_metadata) =
+            sheets_json::import_native_workbook_with_metadata(&native_json).unwrap();
+        assert_eq!(restored_metadata, metadata);
     }
 
     #[test]
@@ -4076,5 +5047,271 @@ mod tests {
             .to_string_lossy()
             .contains(".corrupt.")));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn atomic_native_write_replaces_existing_file_and_cleans_unique_temporary_files() {
+        let root = std::env::temp_dir().join(format!(
+            "900sheets-atomic-native-test-{}-{}",
+            std::process::id(),
+            PRIVATE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let target = root.join("Workbook.900sheets");
+        write_atomic(&target, b"first").unwrap();
+        write_atomic(&target, b"second").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"second");
+        assert!(std::fs::read_dir(&root).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tmp")));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn interrupted_native_write_retains_last_good_file() {
+        let root = std::env::temp_dir().join(format!(
+            "900sheets-atomic-interruption-test-{}-{}",
+            std::process::id(),
+            PRIVATE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let target = root.join("Workbook.900sheets");
+        write_atomic(&target, b"last good").unwrap();
+        assert!(write_atomic_with_interruption(&target, b"incomplete", true).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"last good");
+        assert!(std::fs::read_dir(&root).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tmp")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn interrupted_exchange_export_write_retains_last_good_file() {
+        let root = std::env::temp_dir().join(format!(
+            "900sheets-exchange-atomic-interruption-test-{}-{}",
+            std::process::id(),
+            PRIVATE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let target = root.join("Workbook.xlsx");
+        write_atomic(&target, b"last good exchange export").unwrap();
+        assert!(write_atomic_with_interruption(&target, b"incomplete", true).is_err());
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"last good exchange export"
+        );
+        assert!(std::fs::read_dir(&root).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tmp")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn post_replace_directory_sync_failure_is_a_warning_not_a_false_write_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "900sheets-post-replace-warning-test-{}-{}",
+            std::process::id(),
+            PRIVATE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let target = root.join("Workbook.900sheets");
+        write_atomic(&target, b"old").unwrap();
+
+        let warning = write_atomic_with_faults(&target, b"new", false, true)
+            .unwrap()
+            .expect("post-replace sync failure should be reported as a warning");
+        assert!(warning.contains("file was replaced"));
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_native_write_rejects_symlink_target() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!(
+            "900sheets-atomic-symlink-test-{}-{}",
+            std::process::id(),
+            PRIVATE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let outside = root.join("outside");
+        let target = root.join("Workbook.900sheets");
+        std::fs::write(&outside, "outside").unwrap();
+        symlink(&outside, &target).unwrap();
+        assert!(write_atomic(&target, b"replacement").is_err());
+        assert_eq!(std::fs::read_to_string(outside).unwrap(), "outside");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permission_failure_does_not_replace_last_good_native_file() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "900sheets-atomic-permission-test-{}-{}",
+            std::process::id(),
+            PRIVATE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let target = root.join("Workbook.900sheets");
+        write_atomic(&target, b"last good").unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(write_atomic(&target, b"not written").is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"last good");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn native_backup_store_rotates_per_document_and_keeps_private_files() {
+        let root = std::env::temp_dir().join(format!(
+            "900sheets-native-backup-test-{}-{}",
+            std::process::id(),
+            PRIVATE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let store = NativeBackupStore::new(root.clone());
+        let source = std::env::temp_dir().join("Budget.900sheets");
+        for index in 0..7 {
+            store
+                .write_for_path(&source, &native_test_data(&index.to_string()))
+                .unwrap();
+        }
+        let entries = store.list().unwrap();
+        assert_eq!(entries.len(), MAX_NATIVE_BACKUPS_PER_DOCUMENT);
+        assert!(entries
+            .iter()
+            .all(|entry| entry.document_name == "Budget.900sheets"));
+        let newest = store.read(&entries[0].id).unwrap();
+        assert!(newest.native_workbook.contains('6'));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            for entry in &entries {
+                assert_eq!(
+                    std::fs::metadata(store.path(&entry.id).unwrap())
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
+                );
+            }
+        }
+        store.delete(&entries[0].id).unwrap();
+        assert_eq!(
+            store.list().unwrap().len(),
+            MAX_NATIVE_BACKUPS_PER_DOCUMENT - 1
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_backup_write_and_rotation_never_remove_last_good_backup() {
+        let root = std::env::temp_dir().join(format!(
+            "900sheets-native-backup-failure-test-{}-{}",
+            std::process::id(),
+            PRIVATE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let store = NativeBackupStore::new(root.clone());
+        let source = std::env::temp_dir().join("Failure.900sheets");
+        let first = store
+            .write_for_path(&source, &native_test_data("last good"))
+            .unwrap();
+        store.fail_before_replace.store(true, Ordering::SeqCst);
+        assert!(store
+            .write_for_path(&source, &native_test_data("interrupted"))
+            .is_err());
+        assert_eq!(store.list().unwrap().len(), 1);
+        assert_eq!(store.list().unwrap()[0].id, first.entry.id);
+
+        for index in 0..MAX_NATIVE_BACKUPS_PER_DOCUMENT {
+            store
+                .write_for_path(&source, &native_test_data(&format!("next-{index}")))
+                .unwrap();
+        }
+        store.fail_rotation_cleanup.store(true, Ordering::SeqCst);
+        let result = store
+            .write_for_path(&source, &native_test_data("newest survives"))
+            .unwrap();
+        assert!(result.rotation_warning.is_some());
+        assert!(store.list().unwrap().len() > MAX_NATIVE_BACKUPS_PER_DOCUMENT);
+        assert!(store.read(&result.entry.id).is_ok());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_backup_store_rejects_symlink_root_and_target() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!(
+            "900sheets-native-backup-symlink-test-{}-{}",
+            std::process::id(),
+            PRIVATE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&base).unwrap();
+        let real_root = base.join("real");
+        std::fs::create_dir(&real_root).unwrap();
+        let linked_root = base.join("linked");
+        symlink(&real_root, &linked_root).unwrap();
+        let source = std::env::temp_dir().join("Linked.900sheets");
+        assert!(NativeBackupStore::new(linked_root)
+            .write_for_path(&source, &native_test_data("data"))
+            .is_err());
+
+        let store = NativeBackupStore::new(real_root);
+        let id = "0123456789abcdef_1_00000000000000000001";
+        let outside = base.join("outside");
+        std::fs::write(&outside, "outside").unwrap();
+        symlink(&outside, store.path(id).unwrap()).unwrap();
+        assert!(write_atomic(&store.path(id).unwrap(), b"replacement").is_err());
+        assert_eq!(std::fs::read_to_string(outside).unwrap(), "outside");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn invalid_native_restore_leaves_live_workbook_unchanged() {
+        let state = test_state();
+        let comments = Mutex::new(SheetComments::default());
+        state
+            .workbook
+            .lock()
+            .unwrap()
+            .sheet_mut(0)
+            .unwrap()
+            .set_cell_value(0, 0, "live value".into());
+        assert!(import_native_contents("not a native workbook", &state, &comments).is_err());
+        assert_eq!(
+            state
+                .workbook
+                .lock()
+                .unwrap()
+                .sheet(0)
+                .unwrap()
+                .cell_value(0, 0),
+            Some("live value".into())
+        );
     }
 }

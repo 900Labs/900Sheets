@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use sheets_core::cell::CellType;
 use sheets_core::format::CellFormat;
 use sheets_core::sheet::Sheet;
+use std::collections::HashMap;
 use thiserror::Error;
 
 // ============================================================================
@@ -242,6 +243,12 @@ pub fn validate_cell(
 
 fn validate_list(value: &str, validation: &DataValidation) -> Result<(), ValidationError> {
     let source = validation.source.as_deref().unwrap_or("");
+    // XLSX list validations may point at a range or defined name. The core
+    // validator does not yet resolve workbook references, so preserve these
+    // rules without falsely rejecting values as if the formula were a literal.
+    if source.starts_with('=') {
+        return Ok(());
+    }
     let allowed: Vec<&str> = source.split(',').map(|s| s.trim()).collect();
     if allowed.iter().any(|&a| a.eq_ignore_ascii_case(value)) {
         Ok(())
@@ -1186,6 +1193,25 @@ pub fn apply_conditional_formatting(
 /// Get all cells in a range that match a given conditional format rule
 pub fn find_matching_cells(sheet: &Sheet, rule: &ConditionalFormat) -> Vec<(u32, u32)> {
     let (sr, sc, er, ec) = rule.range;
+    if rule.condition_type == ConditionType::Duplicate {
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for ((row, col), cell) in sheet.iter_cells() {
+            if row >= sr && row <= er && col >= sc && col <= ec && !cell.raw.is_empty() {
+                *counts.entry(cell.raw.as_str()).or_default() += 1;
+            }
+        }
+        return sheet
+            .iter_cells()
+            .filter_map(|((row, col), cell)| {
+                (row >= sr
+                    && row <= er
+                    && col >= sc
+                    && col <= ec
+                    && counts.get(cell.raw.as_str()).copied().unwrap_or_default() > 1)
+                    .then_some((row, col))
+            })
+            .collect();
+    }
     let all_values = collect_range_numbers(sheet, rule.range);
     let mut matching = Vec::new();
 
@@ -1212,6 +1238,22 @@ mod tests {
         Sheet::new("Test")
     }
 
+    #[test]
+    fn duplicate_match_collection_scans_sparse_values_once() {
+        let mut sheet = make_sheet();
+        for row in 0..50_000 {
+            sheet.set_cell_value(row, 0, format!("value-{row}"));
+        }
+        sheet.set_cell_value(49_999, 0, "value-0".into());
+        let rule = ConditionalFormat::duplicates(CellFormat::new().bold(true), (0, 0, 199_999, 0));
+
+        let matches = find_matching_cells(&sheet, &rule);
+
+        assert_eq!(matches.len(), 2);
+        assert!(matches.contains(&(0, 0)));
+        assert!(matches.contains(&(49_999, 0)));
+    }
+
     // --- Data Validation Tests ---
 
     #[test]
@@ -1235,6 +1277,14 @@ mod tests {
         sheet.set_cell_value(0, 0, "Grape".into());
         let validation = DataValidation::list("Apple,Banana,Cherry");
         assert!(validate_cell(&sheet, 0, 0, &validation).is_err());
+    }
+
+    #[test]
+    fn formula_backed_list_is_preserved_without_false_literal_rejection() {
+        let mut sheet = make_sheet();
+        sheet.set_cell_value(0, 0, "Any workbook value".into());
+        let validation = DataValidation::list("=$A$1:$A$3");
+        assert!(validate_cell(&sheet, 0, 0, &validation).is_ok());
     }
 
     #[test]

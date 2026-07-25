@@ -4,7 +4,8 @@ use sheets_core::sheet::Sheet;
 use std::fmt::Write as _;
 use thiserror::Error;
 
-const MAX_PRINT_CELLS: u64 = 5_000_000;
+pub const MAX_PRINT_CELLS: u64 = 5_000_000;
+pub const MAX_REPEAT_HEADER_CELLS: u64 = 10_000;
 
 // ============================================================================
 // Print Configuration
@@ -209,8 +210,19 @@ pub fn calculate_pages(sheet: &Sheet, config: &PrintConfig) -> Result<PageLayout
             start_row, start_col, end_row, end_col
         )));
     }
-    let cell_count =
-        u64::from(end_row - start_row + 1).saturating_mul(u64::from(end_col - start_col + 1));
+    if end_row >= sheet.max_rows() || end_col >= sheet.max_cols() {
+        return Err(PrintError::InvalidPrintArea(format!(
+            "end ({end_row},{end_col}) exceeds sheet bounds ({},{})",
+            sheet.max_rows() - 1,
+            sheet.max_cols() - 1
+        )));
+    }
+    validate_repeat_range("row", config.repeat_rows, sheet.max_rows())?;
+    validate_repeat_range("column", config.repeat_cols, sheet.max_cols())?;
+
+    let row_count = u64::from(end_row) - u64::from(start_row) + 1;
+    let col_count = u64::from(end_col) - u64::from(start_col) + 1;
+    let cell_count = row_count.saturating_mul(col_count);
     if cell_count > MAX_PRINT_CELLS {
         return Err(PrintError::InvalidPrintArea(format!(
             "print area contains {cell_count} cells; maximum is {MAX_PRINT_CELLS}"
@@ -230,7 +242,7 @@ pub fn calculate_pages(sheet: &Sheet, config: &PrintConfig) -> Result<PageLayout
         PrintScaling::ActualSize => 1.0,
         PrintScaling::Scale(s) => s,
         PrintScaling::FitToPageWidth => {
-            let total_w = (end_col - start_col + 1) as f64 * default_col_width;
+            let total_w = col_count as f64 * default_col_width;
             if total_w > usable_w {
                 usable_w / total_w
             } else {
@@ -238,8 +250,8 @@ pub fn calculate_pages(sheet: &Sheet, config: &PrintConfig) -> Result<PageLayout
             }
         }
         PrintScaling::FitToSinglePage => {
-            let total_w = (end_col - start_col + 1) as f64 * default_col_width;
-            let total_h = (end_row - start_row + 1) as f64 * default_row_height;
+            let total_w = col_count as f64 * default_col_width;
+            let total_h = row_count as f64 * default_row_height;
             let scale_w = if total_w > usable_w {
                 usable_w / total_w
             } else {
@@ -305,6 +317,34 @@ pub fn calculate_pages(sheet: &Sheet, config: &PrintConfig) -> Result<PageLayout
 
     let total_pages = pages.len();
     Ok(PageLayout { pages, total_pages })
+}
+
+fn validate_repeat_range(
+    axis: &str,
+    range: Option<(u32, u32)>,
+    sheet_limit: u32,
+) -> Result<(), PrintError> {
+    let Some((start, end)) = range else {
+        return Ok(());
+    };
+    if start > end {
+        return Err(PrintError::InvalidPrintArea(format!(
+            "repeat {axis} start {start} exceeds end {end}"
+        )));
+    }
+    if end >= sheet_limit {
+        return Err(PrintError::InvalidPrintArea(format!(
+            "repeat {axis} end {end} exceeds sheet bound {}",
+            sheet_limit - 1
+        )));
+    }
+    let count = u64::from(end) - u64::from(start) + 1;
+    if count > MAX_REPEAT_HEADER_CELLS {
+        return Err(PrintError::InvalidPrintArea(format!(
+            "repeat {axis} range contains {count} entries; maximum is {MAX_REPEAT_HEADER_CELLS}"
+        )));
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -1142,6 +1182,41 @@ mod tests {
         };
         let result = calculate_pages(&sheet, &config);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_calculate_pages_rejects_u32_max_without_overflow() {
+        let sheet = make_sheet();
+        let config = PrintConfig {
+            print_area: Some((u32::MAX, u32::MAX, u32::MAX, u32::MAX)),
+            ..PrintConfig::default()
+        };
+        assert!(matches!(
+            calculate_pages(&sheet, &config),
+            Err(PrintError::InvalidPrintArea(message)) if message.contains("sheet bounds")
+        ));
+    }
+
+    #[test]
+    fn test_calculate_pages_rejects_unbounded_repeat_headers() {
+        let sheet = make_sheet();
+        let oversized = PrintConfig {
+            repeat_rows: Some((0, MAX_REPEAT_HEADER_CELLS as u32)),
+            ..PrintConfig::default()
+        };
+        assert!(matches!(
+            calculate_pages(&sheet, &oversized),
+            Err(PrintError::InvalidPrintArea(message)) if message.contains("maximum")
+        ));
+
+        let outside_sheet = PrintConfig {
+            repeat_cols: Some((0, sheet.max_cols())),
+            ..PrintConfig::default()
+        };
+        assert!(matches!(
+            calculate_pages(&sheet, &outside_sheet),
+            Err(PrintError::InvalidPrintArea(message)) if message.contains("sheet bound")
+        ));
     }
 
     #[test]

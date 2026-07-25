@@ -1,6 +1,6 @@
 # Architecture
 
-900Sheets uses a Rust-owned workbook model behind a Tauri v2 command boundary. The Svelte 5 frontend is a projection of that state and coordinates user interactions, transactions, and recovery scheduling.
+900Sheets uses a Rust-owned workbook model behind a Tauri v2 command boundary. The Svelte 5 frontend is a projection of that state and coordinates user interactions, transactions, recovery scheduling, and bounded grid rendering.
 
 ## Runtime data flow
 
@@ -20,6 +20,12 @@ Rust AppState
 ```
 
 File operations pass through bounded Rust importers and exporters. The frontend never treats its visible grid as the authoritative workbook.
+
+## Virtualized grid and navigation
+
+The workbook and desktop grid share the same zero-based bounds: 1,000,000 rows and 16,384 columns. The UI does not create a DOM node for every coordinate. It derives a small row and column window from the scroll position, viewport size, zoom, frozen panes, hidden rows, and fixed overscan. Spacer columns preserve the full scroll geometry while keeping the rendered DOM bounded.
+
+**Go To** parses strict A1 cell or range input and rejects an address outside `A1:XFD1000000`. Selecting a distant address updates logical selection, reveals the appropriate virtual window, and returns focus to the single grid focus target. The grid exposes total row and column counts plus active-cell and selection semantics to assistive technology.
 
 ## Workbook and formula graph
 
@@ -48,9 +54,9 @@ Undo and redo clone live state, apply the complete transaction to the clone, reb
 
 Opening a new native, XLSX, or JSON workbook is a session replacement rather than a normal edit transaction. It rebuilds the graph and clears history. CSV import is a normal transaction against the active sheet.
 
-## Recovery design
+## Recovery and backup design
 
-The frontend marks a workbook dirty only after a successful transaction. `RecoveryAutosave` debounces for 750 milliseconds, serializes writes, flushes the mutation queue and transaction tail, then invokes the recovery command with the same native metadata used by Save Workbook.
+The frontend marks a workbook dirty only after a successful transaction. `RecoveryAutosave` uses a configurable debounce interval, serializes writes, flushes the mutation queue and transaction tail, then invokes the recovery command with the same native metadata used by Save Workbook. Changing the interval invalidates and reschedules a pending timer without allowing a stale write to pass an in-flight flush.
 
 The backend stores recoveries under the Tauri per-user app data directory:
 
@@ -62,9 +68,20 @@ Recovery IDs are validated before path construction. The store rejects a symlink
 
 Discard is a two-stage operation. The discoverable snapshot is first atomically moved to a `.cleanup-pending` path. Deletion follows. If deletion fails, the stale snapshot cannot masquerade as current recovery data, and Save Workbook can retry cleanup under the retained identity.
 
-Startup discovery returns only current recovery files, newest first. Restoring validates the native payload before replacing the workbook. Invalid data is moved to quarantine. The UI offers each snapshot explicitly, preserves unselected snapshots, and discards only the one a user declines.
+Startup discovery returns only current recovery files, newest first. Restoring validates the native payload before replacing the workbook. Invalid data is moved to quarantine. Startup prompts preserve unrelated snapshots. The **Recovery and Backups** panel can also inspect sheet summaries, restore, or delete a selected snapshot after startup.
 
 The close handler prevents normal close, flushes pending edits, writes a final recovery for dirty state, and destroys the window only after success. A failed final write requires an explicit user decision.
+
+Rotating native backups serve a different purpose. After a primary `.900sheets` save succeeds, the backend writes a private backup envelope under the per-user app data directory. The envelope stores the native workbook, a generated backup identity, the saved document's filename, an opaque document grouping key, creation time, and size. It does not persist the source path. The store keeps the newest five backups for each document.
+
+Backup writes use the same private-directory, regular-file, no-follow, synchronization, and atomic-replacement rules as other durable writes. A backup or rotation failure does not turn an already successful primary save into a failure. The UI reports it as a separate warning. Backup restore validates the complete native candidate before replacing live state. The **Recovery and Backups** panel can inspect, restore, or delete one version explicitly.
+
+Recovery and rotating backups are intentionally separate:
+
+- Recovery follows dirty session state and protects work that may not have been saved.
+- A normal save retires the current recovery.
+- A rotating backup is created only after a successful native save and represents saved versions of one document.
+- Neither store writes over the user's source file during inspection or restore.
 
 ## Persistence and file boundaries
 
@@ -75,6 +92,16 @@ The close handler prevents normal close, flushes pending edits, writes a final r
 - Native file writes use a sibling temporary file, file synchronization, and atomic rename.
 - Imported content is validated before it can replace the workbook.
 - Recovery never writes to the source path or saved workbook path.
+
+XLSX import produces a document containing the workbook plus sheet-aligned feature records. The desktop maps supported data-validation and conditional-formatting records into stable sheet-scoped state. Export consumes the same aligned records, rejects mapping mismatches and unsupported rule types, and emits validation elements, conditional rules, and differential styles. This is a bounded subset, not a general OOXML preservation layer.
+
+Before any export file is selected, the desktop asks the Rust backend for an `ExportPreflight` result. CSV, JSON, and PDF report the dense coordinate area they would process and remain subject to their 5,000,000-cell safety limits. XLSX reports stored cell and format coordinates because it stays sparse. A blocked preflight never starts the exporter.
+
+## Release workflow boundary
+
+The release workflow validates that a tag matches the workspace version, builds macOS and Windows artifacts, and records SHA-256 files and signing provenance. macOS Developer ID signing and notarization require Apple credentials. Without them, the workflow records ad hoc signing and no notarization, uploads an inspection artifact, and refuses GitHub Release publication. Publication requires Developer ID signing, accepted notarization, stapling, and verification. Windows Authenticode signing likewise requires configured credentials; an unsigned installer can proceed only with explicit unsigned provenance.
+
+Those branches describe workflow behavior. A successful signed, notarized, installed, or clean-machine-tested release is claimed only after the specific tag and artifacts have been verified.
 
 ## Other crates
 
@@ -90,6 +117,6 @@ The close handler prevents normal close, flushes pending edits, writes a final r
 2. Imports and formulas are bounded before expansion.
 3. A failed operation must not partially mutate live state.
 4. Sheet-scoped state follows stable sheet identity, not tab position.
-5. Recovery is separate from normal saves and source files.
+5. Recovery is separate from normal saves, rotating backups, and source files.
 6. No telemetry or account is required.
 7. Public compatibility claims must point to deterministic tests.

@@ -6,7 +6,9 @@
 2. Search existing GitHub issues for the same behavior.
 3. Confirm the problem on the latest tagged release or current `main` branch.
 4. Keep the original workbook private unless it contains no sensitive data.
-5. For recovery problems, note whether the prompt appeared at startup and whether Save Workbook offered a cleanup retry. Do not copy recovery files into a public issue if they contain real data.
+5. For recovery problems, note whether the startup prompt or **Recovery and Backups** panel showed the snapshot, which autosave interval was selected, and whether Save Workbook offered a cleanup retry.
+6. For rotating-backup problems, say whether the primary native save succeeded and whether the app showed a separate backup warning.
+7. Do not copy recovery files or backups into a public issue if they contain real data.
 
 ## Bug reports
 
@@ -18,6 +20,9 @@ Use the GitHub bug report form and include:
 - Exact steps that reproduce the problem
 - What you expected and what happened
 - A small test workbook with invented data, when possible
+- For distant-grid problems, the exact **Go To** address and zoom level
+- For export problems, the preflight message and selected format
+- For accessibility problems, the keyboard, screen reader, interface locale, and focus sequence used
 
 Do not post customer lists, financial records, access tokens, passwords, or other private material.
 

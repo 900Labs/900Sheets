@@ -2,57 +2,60 @@
 
 The roadmap is ordered by user risk and community value. It does not assign dates or promise delivery.
 
-## v0.4.0 baseline
+## v0.5.0 baseline
 
-The v0.4.0 baseline includes:
+The v0.5.0 baseline includes:
 
-- Local workbook editing and native `.900sheets` persistence
-- Cross-sheet formulas, quoted sheet references, workbook-wide dependencies, and cycle rejection
-- Candidate-state transactions with bounded undo and redo across cells, formats, sheets, structure, CSV import, and supported feature state
-- Autosaved recovery, final close recovery, multi-snapshot startup prompts, quarantine, and retryable cleanup
-- Stable sheet identities across dependency, metadata, native save, undo, and redo boundaries
-- Supported XLSX, CSV, and JSON exchange plus PDF output
-- Deterministic compatibility tests and a generated LibreOffice open/resave check
-- Linux and Windows desktop library gates for transaction and recovery behavior
+- The v0.4.0 workbook-safety foundation: cross-sheet formulas, stable sheet identities, bounded atomic undo and redo, and serialized crash recovery
+- A virtualized editor covering the engine bounds of 1,000,000 rows and 16,384 columns
+- Bounded cell and range navigation through **Go To**
+- Export preflight for XLSX, CSV, JSON, and PDF
+- A post-startup **Recovery and Backups** panel and configurable recovery timing
+- Private five-version native backup rotation, managed separately from crash recovery
+- XLSX import and export for the supported validation and conditional-formatting subset
+- Four starter templates with invented data and a local first-run guide
+- Persisted English, Swedish, and Spanish grid-navigation and accessibility labels
+- Keyboard-focus and screen-reader improvements for the virtualized grid and dialogs
+- A release workflow that can produce macOS and Windows artifacts, verify provenance, and publish only after the macOS app is Developer ID signed, notarized, stapled, and reverified
 
 The exact release boundary is documented in [COMPATIBILITY.md](COMPATIBILITY.md), with test evidence in [COMPATIBILITY_MATRIX.md](COMPATIBILITY_MATRIX.md).
 
 ## Next priorities
 
-### Data safety
+### Compatibility depth
 
-- Add user-facing recovery management after startup, including a way to inspect and remove retained snapshots later.
-- Add a configurable autosave interval without weakening flush ordering.
-- Add native backup rotation and document restore semantics separately from crash recovery.
-- Expand power-interruption and filesystem fault testing where platform runners allow it.
+- Build a repeatable, publishable Microsoft Excel desktop verification procedure using invented data.
+- Add Excel tables, native chart objects, and pivot metadata in separate, bounded increments.
+- Expand formula and feature fixtures across multiple LibreOffice and Excel versions.
+- Define explicit preservation or rejection behavior for images, shapes, embedded objects, and external links.
 
-### Spreadsheet compatibility
+### Distribution confidence
 
-- Add a publishable workbook saved by Microsoft Excel with invented data and an automated or repeatable Excel verification procedure.
-- Expand XLSX support for validation, conditional formatting, tables, native charts, and pivot metadata.
-- Extend structural formula rewriting to more complex reference forms.
-- Add more compatibility fixtures from multiple LibreOffice and Excel versions.
+- Complete clean-machine install, upgrade, launch, and uninstall checks for each published macOS and Windows artifact.
+- Add packaged GUI smoke coverage where hosted runners are reliable.
+- Define supported Linux distributions and create packages for that set.
+- Publish platform signing policy and certificate-rotation procedures.
 
-### Large workbooks
+### Large-workbook workflows
 
-- Virtualize columns as well as rows.
-- Expose more of the engine's row and column range through navigation controls.
-- Add repeatable sparse and dense workload benchmarks.
-- Make safe export limits visible before a long-running operation begins.
+- Add name-box history, named-range navigation, and recently visited locations.
+- Profile and tune large copy, paste, sort, filter, formula refresh, and export operations.
+- Add cancellation and progress reporting for operations that can take noticeable time.
+- Expand benchmark baselines across supported operating systems.
 
-### Desktop distribution
+### Accessibility and language
 
-- Sign and notarize macOS builds.
-- Produce and manually verify Windows packages before publishing them.
-- Define supported Linux distributions and produce packages for that set.
-- Add GUI smoke coverage on packaged applications where runners are reliable.
+- Complete translation coverage beyond grid navigation and core accessibility labels.
+- Add more screen-reader regression coverage and manual verification notes.
+- Test high contrast, reduced motion, zoom, and platform-specific keyboard conventions.
+- Invite reviewed community translations with a documented acceptance process.
 
 ### Community use
 
-- Add task-based examples and screenshots.
-- Expand keyboard and screen-reader testing.
-- Complete the locale settings interface and verify translated workflows.
-- Build public templates for schools, small businesses, and community organizations using invented data.
+- Add more task-based examples and release screenshots.
+- Expand the starter-template catalog through reviewed, contributor-sized changes.
+- Improve template formatting and accessible instructions without adding real personal or financial data.
+- Use the community milestone and issue plan to keep contributions small, testable, and nonduplicative.
 
 ## Historical records
 

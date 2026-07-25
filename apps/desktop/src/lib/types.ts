@@ -4,6 +4,42 @@ export interface SheetInfo {
   name: string
 }
 
+export interface RecoveryEntry {
+  id: string
+  modified_millis: number
+  size_bytes: number
+}
+
+export interface RecoveryInspection {
+  entry: RecoveryEntry
+  sheets: SheetInfo[]
+  metadata: Record<string, unknown>
+}
+
+export interface NativeBackupEntry {
+  id: string
+  document_id: string
+  document_name: string
+  created_millis: number
+  size_bytes: number
+}
+
+export interface NativeBackupInspection {
+  entry: NativeBackupEntry
+  sheets: SheetInfo[]
+  metadata: Record<string, unknown>
+}
+
+export interface NativeBackupWriteResult {
+  entry: NativeBackupEntry
+  rotation_warning?: string
+}
+
+export interface NativeSaveResult {
+  backup?: NativeBackupEntry
+  backup_warning?: string
+}
+
 export interface CellData {
   row: number
   col: number

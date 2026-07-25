@@ -53,10 +53,10 @@ The desktop toolbar exposes native-dialog flows backed by Rust commands:
 
 The backend validates absolute dialog paths and applies importer resource limits before replacing workbook state. XLSX and JSON replace the workbook and clear history. CSV import is one undoable active-sheet transaction.
 
-Dirty workbooks are written to a separate recovery store after a 750 millisecond debounce and again during a close request. Startup recovery preserves unselected snapshots. Recovery writes and cleanup are serialized and use platform-specific atomic replacement.
+Dirty workbooks are written to a separate recovery store after a configurable debounce and again during a close request. Startup recovery preserves unselected snapshots. The post-startup manager keeps crash recoveries separate from rotating native backups. Recovery writes, backup writes, and cleanup use private storage and platform-specific atomic replacement.
 
 ## Bundle
 
-On macOS, `npm run tauri:build --prefix apps/desktop` creates the `.app` bundle. The release workflow then ad hoc signs and strictly verifies the complete bundle. DMG packaging, Developer ID signing, and notarization are not configured.
+On macOS, `npm run tauri:build --prefix apps/desktop -- --bundles app` creates the `.app` bundle. The release workflow supports Developer ID signing and notarization when every documented Apple secret is configured. An artifact-only manual run can use an explicitly marked ad hoc fallback, but the publication job rejects a build that is not Developer ID signed, accepted by Apple, stapled, and reverified.
 
-On Windows or Linux, use `cargo build --release -p sheets-desktop` for a non-bundle source compile after building the frontend. This release does not publish or claim Windows or Linux packages.
+On Windows, `npm run tauri:build --prefix apps/desktop -- --bundles nsis` creates the NSIS installer. The release workflow performs a silent install, version check, and uninstall before upload. Authenticode signing is used only when both Windows signing secrets are configured; otherwise provenance identifies the installer as unsigned. Linux remains a source and backend validation target without a v0.5.0 distribution package.

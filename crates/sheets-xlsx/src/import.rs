@@ -1,8 +1,14 @@
+use crate::document::{XlsxDocument, XlsxSheetFeatures};
 use crate::error::XlsxError;
 use roxmltree::Document;
 use sheets_core::cell::CellValue;
 use sheets_core::format::CellFormat;
 use sheets_core::workbook::Workbook;
+use sheets_tables::{Table, TableColumn, TableStyleInfo, TotalsRowFunction};
+use sheets_validation::{
+    ConditionOperator, ConditionType, ConditionalFormat, DataValidation, ValidationErrorStyle,
+    ValidationOperator, ValidationRule, ValidationType,
+};
 use std::collections::HashMap;
 use std::io::Read;
 
@@ -11,8 +17,13 @@ const MAX_XML_ENTRY_SIZE: u64 = 25 * 1024 * 1024;
 const MAX_CELLS: usize = 10_000_000;
 const MAX_ROWS: u32 = 1_000_000;
 const MAX_COLS: u32 = 16_384;
+const MAX_FEATURE_RECORDS: usize = 100_000;
 
 pub fn import_workbook(data: &[u8]) -> Result<Workbook, XlsxError> {
+    Ok(import_document(data)?.workbook)
+}
+
+pub fn import_document(data: &[u8]) -> Result<XlsxDocument, XlsxError> {
     if data.len() as u64 > MAX_FILE_SIZE {
         return Err(XlsxError::FileTooLarge(data.len() as u64, MAX_FILE_SIZE));
     }
@@ -27,7 +38,7 @@ pub fn import_workbook(data: &[u8]) -> Result<Workbook, XlsxError> {
 
     let mut workbook = Workbook::new();
     if sheets.is_empty() {
-        return Ok(workbook);
+        return Ok(XlsxDocument::new(workbook));
     }
 
     workbook
@@ -41,6 +52,8 @@ pub fn import_workbook(data: &[u8]) -> Result<Workbook, XlsxError> {
     }
 
     let mut total_cells = 0usize;
+    let mut total_features = 0usize;
+    let mut sheet_features = Vec::with_capacity(sheets.len());
     for (i, (_, relationship_id)) in sheets.iter().enumerate() {
         let sheet_file = sheet_files.get(relationship_id).ok_or_else(|| {
             XlsxError::InvalidFormat(format!(
@@ -59,9 +72,25 @@ pub fn import_workbook(data: &[u8]) -> Result<Workbook, XlsxError> {
             }
             apply_styles(sheet, &xml, &styles);
         }
+        let mut features = parse_sheet_features(&xml, &styles)?;
+        features.tables = parse_sheet_tables(&mut archive, sheet_file, &xml)?;
+        total_features = total_features
+            .checked_add(features.validations.len())
+            .and_then(|count| count.checked_add(features.conditional_formats.len()))
+            .and_then(|count| count.checked_add(features.tables.len()))
+            .ok_or_else(|| XlsxError::InvalidFormat("Too many worksheet feature records".into()))?;
+        if total_features > MAX_FEATURE_RECORDS {
+            return Err(XlsxError::InvalidFormat(format!(
+                "Workbook contains {total_features} validation, conditional-format, and table records; the limit is {MAX_FEATURE_RECORDS}"
+            )));
+        }
+        sheet_features.push(features);
     }
 
-    Ok(workbook)
+    Ok(XlsxDocument {
+        workbook,
+        sheet_features,
+    })
 }
 
 fn read_zip_file<R: std::io::Read + std::io::Seek>(
@@ -95,9 +124,17 @@ fn read_zip_file_with_limit<R: std::io::Read + std::io::Seek>(
 fn read_shared_strings<R: std::io::Read + std::io::Seek>(
     archive: &mut zip::ZipArchive<R>,
 ) -> Result<Vec<String>, XlsxError> {
-    let xml = match read_zip_file(archive, "xl/sharedStrings.xml") {
+    read_shared_strings_with_limit(archive, MAX_XML_ENTRY_SIZE)
+}
+
+fn read_shared_strings_with_limit<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    max_entry_size: u64,
+) -> Result<Vec<String>, XlsxError> {
+    let xml = match read_zip_file_with_limit(archive, "xl/sharedStrings.xml", max_entry_size) {
         Ok(content) => content,
-        Err(_) => return Ok(Vec::new()),
+        Err(XlsxError::Zip(zip::result::ZipError::FileNotFound)) => return Ok(Vec::new()),
+        Err(error) => return Err(error),
     };
 
     let doc = Document::parse(&xml)?;
@@ -166,6 +203,196 @@ fn read_workbook_rels<R: std::io::Read + std::io::Seek>(
 
 type CellList = Vec<((u32, u32), CellValue)>;
 
+/// Path of a worksheet's relationship part: `xl/worksheets/sheet1.xml` becomes
+/// `xl/worksheets/_rels/sheet1.xml.rels`.
+fn worksheet_rels_path(sheet_file: &str) -> String {
+    match sheet_file.rsplit_once('/') {
+        Some((dir, file)) => format!("{dir}/_rels/{file}.rels"),
+        None => format!("_rels/{sheet_file}.rels"),
+    }
+}
+
+/// Parent directory of a worksheet file: `xl/worksheets/sheet1.xml` -> `xl/worksheets`.
+fn sheet_directory(sheet_file: &str) -> &str {
+    sheet_file.rsplit_once('/').map_or("", |(dir, _)| dir)
+}
+
+/// Resolve a relationship target that may be package-relative (starting with
+/// `/`), part-relative, or use `..` segments, to a normalized archive path.
+fn normalize_zip_path(dir: &str, target: &str) -> String {
+    if let Some(stripped) = target.strip_prefix('/') {
+        return stripped.to_string();
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    if !dir.is_empty() {
+        parts.extend(dir.split('/'));
+    }
+    for segment in target.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            s => parts.push(s),
+        }
+    }
+    parts.join("/")
+}
+
+/// Read a worksheet's relationship part and return the table relationships as
+/// a map of relationship id to archive path. Missing relationship parts are
+/// treated as an empty table set.
+fn read_table_relationship_targets<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    sheet_file: &str,
+) -> Result<HashMap<String, String>, XlsxError> {
+    let rels_path = worksheet_rels_path(sheet_file);
+    let xml = match read_zip_file(archive, &rels_path) {
+        Ok(content) => content,
+        Err(XlsxError::Zip(zip::result::ZipError::FileNotFound)) => return Ok(HashMap::new()),
+        Err(error) => return Err(error),
+    };
+    let doc = Document::parse(&xml)?;
+    let sheet_dir = sheet_directory(sheet_file);
+    let mut targets = HashMap::new();
+    for node in doc
+        .descendants()
+        .filter(|node| node.has_tag_name("Relationship"))
+    {
+        let relationship_type = node.attribute("Type").unwrap_or("");
+        if !relationship_type.ends_with("/table") {
+            continue;
+        }
+        if let (Some(id), Some(target)) = (node.attribute("Id"), node.attribute("Target")) {
+            targets.insert(id.to_string(), normalize_zip_path(sheet_dir, target));
+        }
+    }
+    Ok(targets)
+}
+
+/// Parse the `<tablePart r:id="..."/>` references embedded in a worksheet and
+/// load each referenced table part, returning the table definitions for the
+/// sheet. Malformed or out-of-bounds tables are skipped rather than failing
+/// the whole import, matching how unsupported validation types are handled.
+fn parse_sheet_tables<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    sheet_file: &str,
+    worksheet_xml: &str,
+) -> Result<Vec<Table>, XlsxError> {
+    let table_targets = read_table_relationship_targets(archive, sheet_file)?;
+    if table_targets.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let referenced_ids: Vec<String> = Document::parse(worksheet_xml)?
+        .descendants()
+        .filter(|node| node.has_tag_name("tablePart"))
+        .filter_map(|node| {
+            node.attributes()
+                .find(|attribute| attribute.name() == "id")
+                .map(|attribute| attribute.value().to_string())
+        })
+        .collect();
+    if referenced_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut tables = Vec::new();
+    for relationship_id in referenced_ids {
+        let Some(target) = table_targets.get(&relationship_id) else {
+            continue;
+        };
+        let xml = read_zip_file(archive, target)?;
+        if let Some(table) = parse_table_part(&xml)? {
+            tables.push(table);
+        }
+    }
+    Ok(tables)
+}
+
+/// Parse a single `xl/tables/tableN.xml` part. Returns `None` for a part that
+/// lacks a name or a parseable range so the importer can skip it.
+fn parse_table_part(xml: &str) -> Result<Option<Table>, XlsxError> {
+    let doc = Document::parse(xml)?;
+    let Some(root) = doc.descendants().find(|node| node.has_tag_name("table")) else {
+        return Ok(None);
+    };
+
+    let name = root.attribute("name").unwrap_or("").to_string();
+    let display_name = root
+        .attribute("displayName")
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&name)
+        .to_string();
+    let Some(range) = parse_range_ref(root.attribute("ref").unwrap_or("")) else {
+        return Ok(None);
+    };
+
+    let header_row_count = root
+        .attribute("headerRowCount")
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(1);
+    let totals_row_shown = match root.attribute("totalsRowShown") {
+        Some(value) => bool_attribute(Some(value), false),
+        None => root
+            .attribute("totalsRowCount")
+            .and_then(|value| value.parse::<u32>().ok())
+            .map(|count| count != 0)
+            .unwrap_or(false),
+    };
+    let auto_filter_range = root
+        .children()
+        .find(|child| child.has_tag_name("autoFilter"))
+        .and_then(|filter| filter.attribute("ref"))
+        .and_then(parse_range_ref);
+
+    let mut columns = Vec::new();
+    for column in doc
+        .descendants()
+        .filter(|node| node.has_tag_name("tableColumn"))
+    {
+        columns.push(TableColumn {
+            id: column
+                .attribute("id")
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or(0),
+            name: column.attribute("name").unwrap_or("").to_string(),
+            totals_row_function: column
+                .attribute("totalsRowFunction")
+                .and_then(TotalsRowFunction::from_xml),
+            totals_row_label: column.attribute("totalsRowLabel").map(str::to_string),
+        });
+    }
+
+    let style = doc
+        .descendants()
+        .find(|node| node.has_tag_name("tableStyleInfo"))
+        .map(|node| TableStyleInfo {
+            name: node.attribute("name").map(str::to_string),
+            show_first_column: bool_attribute(node.attribute("showFirstColumn"), false),
+            show_last_column: bool_attribute(node.attribute("showLastColumn"), false),
+            show_row_stripes: bool_attribute(node.attribute("showRowStripes"), true),
+            show_column_stripes: bool_attribute(node.attribute("showColumnStripes"), false),
+        })
+        .unwrap_or_default();
+
+    let table = Table {
+        name,
+        display_name,
+        range,
+        header_row_count,
+        totals_row_shown,
+        columns,
+        style,
+        auto_filter_range,
+    };
+    if table.validate(MAX_ROWS, MAX_COLS).is_ok() {
+        Ok(Some(table))
+    } else {
+        Ok(None)
+    }
+}
+
 #[derive(Default)]
 struct XlsxStyles {
     num_fmts: HashMap<usize, String>,
@@ -173,6 +400,7 @@ struct XlsxStyles {
     fills: Vec<String>,
     borders: Vec<CellFormat>,
     cell_xfs: Vec<CellXf>,
+    differential_formats: Vec<CellFormat>,
 }
 
 #[derive(Default)]
@@ -247,9 +475,19 @@ fn builtin_number_format(id: usize) -> Option<&'static str> {
 fn read_styles<R: std::io::Read + std::io::Seek>(
     archive: &mut zip::ZipArchive<R>,
 ) -> Result<XlsxStyles, XlsxError> {
-    let xml = match read_zip_file(archive, "xl/styles.xml") {
+    read_styles_with_limit(archive, MAX_XML_ENTRY_SIZE)
+}
+
+fn read_styles_with_limit<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    max_entry_size: u64,
+) -> Result<XlsxStyles, XlsxError> {
+    let xml = match read_zip_file_with_limit(archive, "xl/styles.xml", max_entry_size) {
         Ok(content) => content,
-        Err(_) => return Ok(XlsxStyles::default()),
+        Err(XlsxError::Zip(zip::result::ZipError::FileNotFound)) => {
+            return Ok(XlsxStyles::default())
+        }
+        Err(error) => return Err(error),
     };
     let doc = Document::parse(&xml)?;
 
@@ -270,13 +508,13 @@ fn read_styles<R: std::io::Read + std::io::Seek>(
             let mut fmt = CellFormat::default();
             for child in node.descendants() {
                 if child.has_tag_name("b") {
-                    fmt.bold = Some(child.attribute("val") != Some("0"));
+                    fmt.bold = Some(bool_attribute(child.attribute("val"), true));
                 } else if child.has_tag_name("i") {
-                    fmt.italic = Some(child.attribute("val") != Some("0"));
+                    fmt.italic = Some(bool_attribute(child.attribute("val"), true));
                 } else if child.has_tag_name("u") {
-                    fmt.underline = Some(child.attribute("val") != Some("0"));
+                    fmt.underline = Some(bool_attribute(child.attribute("val"), true));
                 } else if child.has_tag_name("strike") {
-                    fmt.strikethrough = Some(child.attribute("val") != Some("0"));
+                    fmt.strikethrough = Some(bool_attribute(child.attribute("val"), true));
                 } else if child.has_tag_name("sz") {
                     fmt.font_size = child.attribute("val").and_then(|value| value.parse().ok());
                 } else if child.has_tag_name("color") {
@@ -354,7 +592,275 @@ fn read_styles<R: std::io::Read + std::io::Seek>(
         }
     }
 
+    if let Some(dxfs) = doc.descendants().find(|node| node.has_tag_name("dxfs")) {
+        for dxf in dxfs.children().filter(|node| node.has_tag_name("dxf")) {
+            styles
+                .differential_formats
+                .push(parse_differential_format(dxf));
+        }
+    }
+
     Ok(styles)
+}
+
+fn parse_differential_format(node: roxmltree::Node<'_, '_>) -> CellFormat {
+    let mut format = CellFormat::default();
+    if let Some(font) = node.children().find(|child| child.has_tag_name("font")) {
+        for child in font.children().filter(|child| child.is_element()) {
+            match child.tag_name().name() {
+                "b" => format.bold = Some(bool_attribute(child.attribute("val"), true)),
+                "i" => format.italic = Some(bool_attribute(child.attribute("val"), true)),
+                "u" => format.underline = Some(bool_attribute(child.attribute("val"), true)),
+                "strike" => {
+                    format.strikethrough = Some(bool_attribute(child.attribute("val"), true))
+                }
+                "sz" => format.font_size = child.attribute("val").and_then(|v| v.parse().ok()),
+                "name" => format.font_name = child.attribute("val").map(str::to_string),
+                "color" => format.font_color = parse_rgb_color(child.attribute("rgb")),
+                _ => {}
+            }
+        }
+    }
+    if let Some(fill) = node.children().find(|child| child.has_tag_name("fill")) {
+        format.bg_color = fill
+            .descendants()
+            .find(|child| child.has_tag_name("fgColor"))
+            .and_then(|child| parse_rgb_color(child.attribute("rgb")));
+    }
+    if let Some(border) = node.children().find(|child| child.has_tag_name("border")) {
+        for child in border.children().filter(|child| child.is_element()) {
+            let parsed = parse_border(child);
+            match child.tag_name().name() {
+                "top" => format.border_top = parsed,
+                "bottom" => format.border_bottom = parsed,
+                "left" => format.border_left = parsed,
+                "right" => format.border_right = parsed,
+                _ => {}
+            }
+        }
+    }
+    if let Some(num_fmt) = node.children().find(|child| child.has_tag_name("numFmt")) {
+        format.number_format = num_fmt.attribute("formatCode").map(str::to_string);
+    }
+    format
+}
+
+fn parse_sheet_features(xml: &str, styles: &XlsxStyles) -> Result<XlsxSheetFeatures, XlsxError> {
+    let doc = Document::parse(xml)?;
+    let mut features = XlsxSheetFeatures::default();
+
+    for node in doc
+        .descendants()
+        .filter(|node| node.has_tag_name("dataValidation"))
+    {
+        let validation_type = match node.attribute("type").unwrap_or("none") {
+            "whole" => ValidationType::WholeNumber,
+            "decimal" => ValidationType::Decimal,
+            "list" => ValidationType::List,
+            "date" => ValidationType::Date,
+            "time" => ValidationType::Time,
+            "textLength" => ValidationType::TextLength,
+            "custom" => ValidationType::Custom,
+            _ => continue,
+        };
+        let formula1 = child_text(node, "formula1");
+        let formula2 = child_text(node, "formula2");
+        let source = if validation_type == ValidationType::List {
+            formula1.as_deref().map(parse_list_source)
+        } else {
+            None
+        };
+        let validation = DataValidation {
+            validation_type,
+            operator: parse_validation_operator(node.attribute("operator")),
+            formula1: if source.is_some() { None } else { formula1 },
+            formula2,
+            source,
+            allow_blank: bool_attribute(node.attribute("allowBlank"), false),
+            // OOXML showDropDown=true hides the list arrow.
+            show_dropdown: !bool_attribute(node.attribute("showDropDown"), false),
+            error_style: parse_validation_error_style(node.attribute("errorStyle")),
+            error_title: node.attribute("errorTitle").map(str::to_string),
+            error_message: node.attribute("error").map(str::to_string),
+            prompt_title: node.attribute("promptTitle").map(str::to_string),
+            prompt_message: node.attribute("prompt").map(str::to_string),
+        };
+        for range in parse_sqref(node.attribute("sqref").unwrap_or(""))? {
+            if features.validations.len() >= MAX_FEATURE_RECORDS {
+                return Err(XlsxError::InvalidFormat(format!(
+                    "Worksheet contains more than {MAX_FEATURE_RECORDS} validation ranges"
+                )));
+            }
+            features.validations.push(ValidationRule {
+                range,
+                validation: validation.clone(),
+            });
+        }
+    }
+
+    let mut rule_counter = 0usize;
+    for group in doc
+        .descendants()
+        .filter(|node| node.has_tag_name("conditionalFormatting"))
+    {
+        let ranges = parse_sqref(group.attribute("sqref").unwrap_or(""))?;
+        for node in group.children().filter(|node| node.has_tag_name("cfRule")) {
+            let condition_type = match node.attribute("type") {
+                Some("cellIs") => ConditionType::CellValue,
+                Some("expression") => ConditionType::Formula,
+                Some("containsText") => ConditionType::TextContains,
+                Some("notContainsText") => ConditionType::TextNotContains,
+                Some("beginsWith") => ConditionType::TextBeginsWith,
+                Some("endsWith") => ConditionType::TextEndsWith,
+                Some("containsBlanks") => ConditionType::Blanks,
+                Some("notContainsBlanks") => ConditionType::NoBlanks,
+                Some("duplicateValues") => ConditionType::Duplicate,
+                _ => continue,
+            };
+            let values: Vec<String> = node
+                .children()
+                .filter(|child| child.has_tag_name("formula"))
+                .filter_map(|child| child.text().map(str::to_string))
+                .collect();
+            let dxf_id = node
+                .attribute("dxfId")
+                .and_then(|value| value.parse::<usize>().ok());
+            let format = dxf_id
+                .and_then(|index| styles.differential_formats.get(index))
+                .cloned()
+                .unwrap_or_default();
+            for range in &ranges {
+                if features.conditional_formats.len() >= MAX_FEATURE_RECORDS {
+                    return Err(XlsxError::InvalidFormat(format!(
+                        "Worksheet contains more than {MAX_FEATURE_RECORDS} conditional-format ranges"
+                    )));
+                }
+                rule_counter += 1;
+                features.conditional_formats.push(ConditionalFormat {
+                    id: format!("xlsx-cf-{rule_counter}"),
+                    condition_type: condition_type.clone(),
+                    range: *range,
+                    operator: node
+                        .attribute("operator")
+                        .and_then(parse_condition_operator),
+                    value1: if matches!(
+                        condition_type,
+                        ConditionType::TextContains
+                            | ConditionType::TextNotContains
+                            | ConditionType::TextBeginsWith
+                            | ConditionType::TextEndsWith
+                    ) {
+                        node.attribute("text").map(str::to_string)
+                    } else {
+                        values.first().map(|value| {
+                            if condition_type == ConditionType::Formula {
+                                format!("={value}")
+                            } else {
+                                value.clone()
+                            }
+                        })
+                    },
+                    value2: values.get(1).cloned(),
+                    format: format.clone(),
+                    priority: node
+                        .attribute("priority")
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(rule_counter as u32),
+                    stop_if_true: bool_attribute(node.attribute("stopIfTrue"), false),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+
+    Ok(features)
+}
+
+fn child_text(node: roxmltree::Node<'_, '_>, name: &str) -> Option<String> {
+    node.children()
+        .find(|child| child.has_tag_name(name))
+        .and_then(|child| child.text())
+        .map(str::to_string)
+}
+
+fn parse_list_source(formula: &str) -> String {
+    if formula.starts_with('"') && formula.ends_with('"') && formula.len() >= 2 {
+        formula[1..formula.len() - 1].replace("\"\"", "\"")
+    } else if formula.starts_with('=') {
+        formula.to_string()
+    } else {
+        format!("={formula}")
+    }
+}
+
+fn parse_validation_operator(value: Option<&str>) -> ValidationOperator {
+    match value {
+        Some("notBetween") => ValidationOperator::NotBetween,
+        Some("equal") => ValidationOperator::Equal,
+        Some("notEqual") => ValidationOperator::NotEqual,
+        Some("greaterThan") => ValidationOperator::GreaterThan,
+        Some("lessThan") => ValidationOperator::LessThan,
+        Some("greaterThanOrEqual") => ValidationOperator::GreaterThanOrEqual,
+        Some("lessThanOrEqual") => ValidationOperator::LessThanOrEqual,
+        _ => ValidationOperator::Between,
+    }
+}
+
+fn parse_condition_operator(value: &str) -> Option<ConditionOperator> {
+    match value {
+        "between" => Some(ConditionOperator::Between),
+        "notBetween" => Some(ConditionOperator::NotBetween),
+        "equal" => Some(ConditionOperator::Equal),
+        "notEqual" => Some(ConditionOperator::NotEqual),
+        "greaterThan" => Some(ConditionOperator::GreaterThan),
+        "lessThan" => Some(ConditionOperator::LessThan),
+        "greaterThanOrEqual" => Some(ConditionOperator::GreaterThanOrEqual),
+        "lessThanOrEqual" => Some(ConditionOperator::LessThanOrEqual),
+        _ => None,
+    }
+}
+
+fn parse_validation_error_style(value: Option<&str>) -> ValidationErrorStyle {
+    match value {
+        Some("warning") => ValidationErrorStyle::Warning,
+        Some("information") => ValidationErrorStyle::Information,
+        _ => ValidationErrorStyle::Stop,
+    }
+}
+
+fn bool_attribute(value: Option<&str>, default: bool) -> bool {
+    value
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(default)
+}
+
+fn parse_sqref(value: &str) -> Result<Vec<(u32, u32, u32, u32)>, XlsxError> {
+    let mut ranges = Vec::new();
+    for reference in value.split_whitespace() {
+        if let Some(range) = parse_range_ref(reference) {
+            if ranges.len() >= MAX_FEATURE_RECORDS {
+                return Err(XlsxError::InvalidFormat(format!(
+                    "Worksheet feature range list exceeds the limit of {MAX_FEATURE_RECORDS}"
+                )));
+            }
+            ranges.push(range);
+        }
+    }
+    Ok(ranges)
+}
+
+fn parse_range_ref(value: &str) -> Option<(u32, u32, u32, u32)> {
+    let value = value.replace('$', "");
+    let mut parts = value.split(':');
+    let start = parse_cell_ref(parts.next()?)?;
+    let end = match parts.next() {
+        Some(end) => parse_cell_ref(end)?,
+        None => start,
+    };
+    if parts.next().is_some() || start.0 > end.0 || start.1 > end.1 {
+        return None;
+    }
+    Some((start.0, start.1, end.0, end.1))
 }
 
 fn apply_styles(sheet: &mut sheets_core::sheet::Sheet, xml: &str, styles: &XlsxStyles) {
@@ -461,15 +967,22 @@ fn parse_sheet_xml(xml: &str, shared_strings: &[String]) -> Result<CellList, Xls
             } else {
                 match type_attr {
                     "s" => {
-                        let idx: usize = value_node
-                            .and_then(|n| n.text())
-                            .and_then(|t| t.parse().ok())
-                            .unwrap_or(0);
-                        if idx < shared_strings.len() {
-                            CellValue::text(&shared_strings[idx])
-                        } else {
-                            CellValue::empty()
-                        }
+                        let index_text = value_node.and_then(|n| n.text()).ok_or_else(|| {
+                            XlsxError::InvalidFormat(format!(
+                                "Shared-string cell {ref_attr} contains no index"
+                            ))
+                        })?;
+                        let idx: usize = index_text.parse().map_err(|_| {
+                            XlsxError::InvalidFormat(format!(
+                                "Shared-string cell {ref_attr} has invalid index {index_text}"
+                            ))
+                        })?;
+                        let value = shared_strings.get(idx).ok_or_else(|| {
+                            XlsxError::InvalidFormat(format!(
+                                "Shared-string cell {ref_attr} refers to missing index {idx}"
+                            ))
+                        })?;
+                        CellValue::text(value)
                     }
                     "str" | "inlineStr" => {
                         let text: String = if let Some(is) = is_node {
@@ -674,14 +1187,15 @@ fn col_label_to_index(label: &str) -> Option<u32> {
     let mut col: u32 = 0;
     for ch in label.chars() {
         let val = (ch as u32) - 64;
-        col = col * 26 + val;
+        col = col.checked_mul(26)?.checked_add(val)?;
     }
-    Some(col - 1)
+    col.checked_sub(1)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn test_parse_cell_ref() {
@@ -699,6 +1213,7 @@ mod tests {
         assert_eq!(col_label_to_index("A"), Some(0));
         assert_eq!(col_label_to_index("Z"), Some(25));
         assert_eq!(col_label_to_index("AA"), Some(26));
+        assert_eq!(col_label_to_index(&"Z".repeat(32)), None);
     }
 
     #[test]
@@ -731,6 +1246,71 @@ mod tests {
         let mut archive = zip::ZipArchive::new(std::io::Cursor::new(result)).unwrap();
         let result = read_zip_file_with_limit(&mut archive, "xl/workbook.xml", 5);
         assert!(matches!(result, Err(XlsxError::FileTooLarge(6, 5))));
+    }
+
+    fn archive_with(path: &str, contents: &[u8]) -> zip::ZipArchive<std::io::Cursor<Vec<u8>>> {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        zip.start_file(path, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(contents).unwrap();
+        zip::ZipArchive::new(std::io::Cursor::new(zip.finish().unwrap().into_inner())).unwrap()
+    }
+
+    #[test]
+    fn malformed_and_oversized_shared_strings_are_errors() {
+        let mut malformed = archive_with("xl/sharedStrings.xml", b"<sst><si>");
+        assert!(matches!(
+            read_shared_strings(&mut malformed),
+            Err(XlsxError::Xml(_))
+        ));
+
+        let mut oversized = archive_with("xl/sharedStrings.xml", b"123456");
+        assert!(matches!(
+            read_shared_strings_with_limit(&mut oversized, 5),
+            Err(XlsxError::FileTooLarge(6, 5))
+        ));
+    }
+
+    #[test]
+    fn malformed_and_oversized_styles_are_errors() {
+        let mut malformed = archive_with("xl/styles.xml", b"<styleSheet><fonts>");
+        assert!(matches!(
+            read_styles(&mut malformed),
+            Err(XlsxError::Xml(_))
+        ));
+
+        let mut oversized = archive_with("xl/styles.xml", b"123456");
+        assert!(matches!(
+            read_styles_with_limit(&mut oversized, 5),
+            Err(XlsxError::FileTooLarge(6, 5))
+        ));
+    }
+
+    #[test]
+    fn invalid_and_missing_shared_string_indexes_are_errors() {
+        let invalid = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="s"><v>not-a-number</v></c></row></sheetData></worksheet>"#;
+        assert!(matches!(
+            parse_sheet_xml(invalid, &["only".into()]),
+            Err(XlsxError::InvalidFormat(message)) if message.contains("invalid index")
+        ));
+
+        let missing = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="s"><v>4</v></c></row></sheetData></worksheet>"#;
+        assert!(matches!(
+            parse_sheet_xml(missing, &["only".into()]),
+            Err(XlsxError::InvalidFormat(message)) if message.contains("missing index")
+        ));
+    }
+
+    #[test]
+    fn direct_font_boolean_false_values_remain_false() {
+        let xml = r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="1"><font><b val="false"/><i val="0"/><u val="false"/><strike val="0"/></font></fonts></styleSheet>"#;
+        let mut archive = archive_with("xl/styles.xml", xml.as_bytes());
+        let styles = read_styles(&mut archive).unwrap();
+        let format = &styles.fonts[0];
+        assert_eq!(format.bold, Some(false));
+        assert_eq!(format.italic, Some(false));
+        assert_eq!(format.underline, Some(false));
+        assert_eq!(format.strikethrough, Some(false));
     }
 
     #[test]
@@ -813,13 +1393,15 @@ mod tests {
         zip.start_file("xl/sharedStrings.xml", opts).unwrap();
         zip.write_all(SHARED_STRINGS).unwrap();
         zip.start_file("xl/worksheets/sheet1.xml", opts).unwrap();
-        zip.write_all(SHEET_XML).unwrap();
+        zip.write_all(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData><row r=\"1\"><c r=\"A1\" t=\"s\"><v>0</v></c></row></sheetData><dataValidations count=\"1\"><dataValidation type=\"list\" sqref=\"A1\"><formula1>&quot;Hello,World&quot;</formula1></dataValidation></dataValidations></worksheet>").unwrap();
         zip.start_file("xl/worksheets/sheet2.xml", opts).unwrap();
         zip.write_all(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>
 <worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData><row r=\"1\"><c r=\"A1\" t=\"n\"><v>99</v></c></row></sheetData></worksheet>").unwrap();
         let data = zip.finish().unwrap().into_inner();
 
-        let workbook = import_workbook(&data).unwrap();
+        let document = import_document(&data).unwrap();
+        let workbook = &document.workbook;
         assert_eq!(workbook.sheet(0).unwrap().name(), "First");
         assert_eq!(
             workbook.sheet(0).unwrap().cell_value(0, 0),
@@ -830,6 +1412,62 @@ mod tests {
             workbook.sheet(1).unwrap().cell_value(0, 0),
             Some("99".into())
         );
+        assert_eq!(document.sheet_features[0].validations.len(), 1);
+        assert!(document.sheet_features[1].validations.is_empty());
+        assert_eq!(
+            document.sheet_features[0].validations[0]
+                .validation
+                .source
+                .as_deref(),
+            Some("Hello,World")
+        );
+    }
+
+    #[test]
+    fn feature_range_lists_are_bounded_before_unbounded_collection() {
+        let sqref = std::iter::repeat_n("A1", MAX_FEATURE_RECORDS + 1)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let xml = format!(
+            "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData/><dataValidations count=\"1\"><dataValidation type=\"list\" sqref=\"{sqref}\"><formula1>&quot;Yes,No&quot;</formula1></dataValidation></dataValidations></worksheet>"
+        );
+        assert!(matches!(
+            parse_sheet_features(&xml, &XlsxStyles::default()),
+            Err(XlsxError::InvalidFormat(message)) if message.contains("range list exceeds")
+        ));
+    }
+
+    #[test]
+    fn multiple_sqref_ranges_become_separate_sheet_scoped_rules() {
+        let xml = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<sheetData/>
+<dataValidations count="1"><dataValidation type="list" allowBlank="1" showDropDown="0" sqref="$A$1:$A$3 C2"><formula1>"Yes,No"</formula1></dataValidation></dataValidations>
+<conditionalFormatting sqref="D2:D4 F1"><cfRule type="cellIs" operator="greaterThan" priority="1"><formula>10</formula></cfRule></conditionalFormatting>
+</worksheet>"#;
+        let features = parse_sheet_features(xml, &XlsxStyles::default()).unwrap();
+        assert_eq!(features.validations.len(), 2);
+        assert_eq!(features.validations[0].range, (0, 0, 2, 0));
+        assert_eq!(features.validations[1].range, (1, 2, 1, 2));
+        assert_eq!(features.conditional_formats.len(), 2);
+        assert_eq!(features.conditional_formats[0].range, (1, 3, 3, 3));
+        assert_eq!(features.conditional_formats[1].range, (0, 5, 0, 5));
+    }
+
+    #[test]
+    fn differential_format_boolean_false_values_remain_false() {
+        let xml = r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dxfs count="1"><dxf><font><b val="false"/><i val="0"/><u val="true"/><strike val="1"/></font></dxf></dxfs></styleSheet>"#;
+        let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        archive.start_file("xl/styles.xml", options).unwrap();
+        archive.write_all(xml.as_bytes()).unwrap();
+        let data = archive.finish().unwrap().into_inner();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(data)).unwrap();
+        let styles = read_styles(&mut archive).unwrap();
+        let format = &styles.differential_formats[0];
+        assert_eq!(format.bold, Some(false));
+        assert_eq!(format.italic, Some(false));
+        assert_eq!(format.underline, Some(true));
+        assert_eq!(format.strikethrough, Some(true));
     }
 
     #[test]
@@ -918,4 +1556,112 @@ mod tests {
 </row>
 </sheetData>
 </worksheet>";
+
+    #[test]
+    fn worksheet_relationship_resolves_excel_table_parts() {
+        use std::io::Write;
+
+        let buf: Vec<u8> = Vec::new();
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(buf));
+        let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default();
+
+        zip.start_file("[Content_Types].xml", opts).unwrap();
+        zip.write_all(BRACKET_CONTENT_TYPES).unwrap();
+        zip.start_file("_rels/.rels", opts).unwrap();
+        zip.write_all(RELS).unwrap();
+        zip.start_file("xl/workbook.xml", opts).unwrap();
+        zip.write_all(WORKBOOK_XML).unwrap();
+        zip.start_file("xl/_rels/workbook.xml.rels", opts).unwrap();
+        zip.write_all(WORKBOOK_RELS).unwrap();
+        zip.start_file("xl/sharedStrings.xml", opts).unwrap();
+        zip.write_all(SHARED_STRINGS).unwrap();
+
+        // Worksheet with a <tableParts> reference and the relationships namespace.
+        zip.start_file("xl/worksheets/sheet1.xml", opts).unwrap();
+        zip.write_all(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">
+<sheetData><row r=\"1\"><c r=\"A1\" t=\"s\"><v>0</v></c></row></sheetData>
+<tableParts count=\"1\"><tablePart r:id=\"rId1\"/></tableParts>
+</worksheet>").unwrap();
+
+        // Worksheet relationship part pointing at a table via the ../tables
+        // relative target that Excel emits.
+        zip.start_file("xl/worksheets/_rels/sheet1.xml.rels", opts)
+            .unwrap();
+        zip.write_all(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">
+<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/table\" Target=\"../tables/table1.xml\"/>
+</Relationships>").unwrap();
+
+        zip.start_file("xl/tables/table1.xml", opts).unwrap();
+        zip.write_all(b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>
+<table xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" id=\"1\" name=\"Inventory\" displayName=\"Inventory\" ref=\"A1:C4\" headerRowCount=\"1\" totalsRowCount=\"1\">
+<autoFilter ref=\"A1:C4\"/>
+<tableColumns count=\"3\">
+<tableColumn id=\"1\" name=\"SKU\"/>
+<tableColumn id=\"2\" name=\"Name\"/>
+<tableColumn id=\"3\" name=\"Qty\" totalsRowFunction=\"sum\"/>
+</tableColumns>
+<tableStyleInfo name=\"TableStyleMedium2\" showFirstColumn=\"0\" showLastColumn=\"0\" showRowStripes=\"1\" showColumnStripes=\"0\"/>
+</table>").unwrap();
+
+        let data = zip.finish().unwrap().into_inner();
+        let document = import_document(&data).unwrap();
+
+        assert_eq!(document.sheet_features[0].tables.len(), 1);
+        let table = &document.sheet_features[0].tables[0];
+        assert_eq!(table.name, "Inventory");
+        assert_eq!(table.range, (0, 0, 3, 2));
+        assert!(table.totals_row_shown);
+        assert_eq!(table.columns.len(), 3);
+        assert_eq!(table.columns[0].name, "SKU");
+        assert_eq!(
+            table.columns[2].totals_row_function,
+            Some(sheets_tables::TotalsRowFunction::Sum)
+        );
+        assert_eq!(table.auto_filter_range, Some((0, 0, 3, 2)));
+        assert!(table.style.show_row_stripes);
+    }
+
+    #[test]
+    fn out_of_bounds_table_parts_are_skipped_not_fatal() {
+        use std::io::Write;
+
+        let buf: Vec<u8> = Vec::new();
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(buf));
+        let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default();
+
+        zip.start_file("[Content_Types].xml", opts).unwrap();
+        zip.write_all(BRACKET_CONTENT_TYPES).unwrap();
+        zip.start_file("_rels/.rels", opts).unwrap();
+        zip.write_all(RELS).unwrap();
+        zip.start_file("xl/workbook.xml", opts).unwrap();
+        zip.write_all(WORKBOOK_XML).unwrap();
+        zip.start_file("xl/_rels/workbook.xml.rels", opts).unwrap();
+        zip.write_all(WORKBOOK_RELS).unwrap();
+        zip.start_file("xl/sharedStrings.xml", opts).unwrap();
+        zip.write_all(SHARED_STRINGS).unwrap();
+        zip.start_file("xl/worksheets/sheet1.xml", opts).unwrap();
+        zip.write_all(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">
+<sheetData/>
+<tableParts count=\"1\"><tablePart r:id=\"rId1\"/></tableParts>
+</worksheet>").unwrap();
+        zip.start_file("xl/worksheets/_rels/sheet1.xml.rels", opts)
+            .unwrap();
+        zip.write_all(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">
+<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/table\" Target=\"../tables/table1.xml\"/>
+</Relationships>").unwrap();
+        // Range extends past the column limit; importer must skip, not error.
+        zip.start_file("xl/tables/table1.xml", opts).unwrap();
+        zip.write_all(b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>
+<table xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" id=\"1\" name=\"Wide\" displayName=\"Wide\" ref=\"A1:ZZZ1\">
+<tableColumns count=\"1\"><tableColumn id=\"1\" name=\"X\"/></tableColumns>
+</table>").unwrap();
+
+        let data = zip.finish().unwrap().into_inner();
+        let document = import_document(&data).unwrap();
+        assert!(document.sheet_features[0].tables.is_empty());
+    }
 }

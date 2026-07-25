@@ -2879,7 +2879,7 @@ dependencies = [
 
 [[package]]
 name = "sheets-advanced"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2890,7 +2890,7 @@ dependencies = [
 
 [[package]]
 name = "sheets-chart"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "serde",
  "sheets-core",
@@ -2899,7 +2899,7 @@ dependencies = [
 
 [[package]]
 name = "sheets-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "chrono",
  "serde",
@@ -2909,7 +2909,7 @@ dependencies = [
 
 [[package]]
 name = "sheets-csv"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "sheets-core",
  "thiserror 2.0.18",
@@ -2917,7 +2917,7 @@ dependencies = [
 
 [[package]]
 name = "sheets-desktop"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "libc",
  "serde",
@@ -2931,6 +2931,7 @@ dependencies = [
  "sheets-json",
  "sheets-pivot",
  "sheets-print",
+ "sheets-tables",
  "sheets-validation",
  "sheets-xlsx",
  "tauri",
@@ -2940,15 +2941,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "sheets-fixtures"
+version = "0.5.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sheets-core",
+ "sheets-validation",
+]
+
+[[package]]
 name = "sheets-formula"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "sheets-core",
 ]
 
 [[package]]
 name = "sheets-i18n"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2958,7 +2969,7 @@ dependencies = [
 
 [[package]]
 name = "sheets-json"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2968,7 +2979,7 @@ dependencies = [
 
 [[package]]
 name = "sheets-pivot"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "serde",
  "sheets-core",
@@ -2977,7 +2988,7 @@ dependencies = [
 
 [[package]]
 name = "sheets-print"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "serde",
  "sheets-core",
@@ -2985,8 +2996,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sheets-tables"
+version = "0.5.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "sheets-validation"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "serde",
  "sheets-core",
@@ -2995,12 +3014,15 @@ dependencies = [
 
 [[package]]
 name = "sheets-xlsx"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "roxmltree",
  "serde",
  "serde_json",
  "sheets-core",
+ "sheets-fixtures",
+ "sheets-tables",
+ "sheets-validation",
  "thiserror 2.0.18",
  "zip",
 ]
