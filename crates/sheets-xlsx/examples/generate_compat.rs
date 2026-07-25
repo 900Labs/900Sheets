@@ -14,6 +14,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             validations,
             conditional_formats,
             tables: Vec::new(),
+            charts: Vec::new(),
         })
         .collect();
     let document = XlsxDocument {

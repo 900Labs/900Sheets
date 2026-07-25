@@ -1,5 +1,6 @@
 use crate::document::{XlsxDocument, XlsxSheetFeatures};
 use crate::error::XlsxError;
+use sheets_chart::{ChartObject, ChartType, LegendPosition};
 use sheets_core::cell::CellType;
 use sheets_core::format::CellFormat;
 use sheets_core::workbook::Workbook;
@@ -28,9 +29,21 @@ pub fn export_document(document: &XlsxDocument) -> Result<Vec<u8>, XlsxError> {
         !style_table.formats.is_empty() || !style_table.differential_formats.is_empty();
     let table_plan = plan_tables(document);
     let table_count = table_plan.len();
+    let chart_plan = plan_charts(document, &table_plan);
+    let chart_count = chart_plan.len();
+    let drawing_count = drawing_part_count(&chart_plan);
 
     zip.start_file("[Content_Types].xml", opts)?;
-    zip.write_all(generate_content_types_xml(workbook, has_styles, table_count).as_bytes())?;
+    zip.write_all(
+        generate_content_types_xml(
+            workbook,
+            has_styles,
+            table_count,
+            drawing_count,
+            chart_count,
+        )
+        .as_bytes(),
+    )?;
 
     zip.start_file("_rels/.rels", opts)?;
     zip.write_all(ROOT_RELS_XML.as_bytes())?;
@@ -78,6 +91,10 @@ pub fn export_document(document: &XlsxDocument) -> Result<Vec<u8>, XlsxError> {
             .filter(|assignment| assignment.sheet_idx == sheet_idx)
             .map(|assignment| assignment.relationship_id.clone())
             .collect();
+        let sheet_drawing_id = chart_plan
+            .iter()
+            .find(|assignment| assignment.sheet_idx == sheet_idx)
+            .map(|assignment| assignment.worksheet_relationship_id.clone());
         let xml = generate_sheet_xml(
             workbook,
             sheet_idx,
@@ -85,27 +102,64 @@ pub fn export_document(document: &XlsxDocument) -> Result<Vec<u8>, XlsxError> {
             &style_table,
             features,
             &sheet_table_ids,
+            sheet_drawing_id.as_deref(),
         );
         zip.write_all(xml.as_bytes())?;
     }
 
     for sheet_idx in 0..workbook.sheet_count() {
-        let sheet_assignments: Vec<&TablePartAssignment<'_>> = table_plan
+        let sheet_table_assignments: Vec<&TablePartAssignment<'_>> = table_plan
             .iter()
             .filter(|assignment| assignment.sheet_idx == sheet_idx)
             .collect();
-        if sheet_assignments.is_empty() {
+        let sheet_drawing = chart_plan
+            .iter()
+            .find(|assignment| assignment.sheet_idx == sheet_idx)
+            .map(|assignment| {
+                (
+                    assignment.worksheet_relationship_id.as_str(),
+                    assignment.drawing_part_number,
+                )
+            });
+        if sheet_table_assignments.is_empty() && sheet_drawing.is_none() {
             continue;
         }
         let rels_path = format!("xl/worksheets/_rels/sheet{}.xml.rels", sheet_idx + 1);
         zip.start_file(&rels_path, opts)?;
-        zip.write_all(generate_worksheet_rels_xml(&sheet_assignments).as_bytes())?;
+        zip.write_all(
+            generate_worksheet_rels_xml(&sheet_table_assignments, sheet_drawing).as_bytes(),
+        )?;
     }
 
     for assignment in &table_plan {
         let path = format!("xl/tables/table{}.xml", assignment.part_number);
         zip.start_file(&path, opts)?;
         zip.write_all(generate_table_xml(assignment).as_bytes())?;
+    }
+
+    for sheet_idx in 0..workbook.sheet_count() {
+        let sheet_chart_assignments: Vec<&ChartPartAssignment<'_>> = chart_plan
+            .iter()
+            .filter(|assignment| assignment.sheet_idx == sheet_idx)
+            .collect();
+        if sheet_chart_assignments.is_empty() {
+            continue;
+        }
+        let drawing_part_number = sheet_chart_assignments[0].drawing_part_number;
+        let drawing_path = format!("xl/drawings/drawing{}.xml", drawing_part_number);
+        zip.start_file(&drawing_path, opts)?;
+        zip.write_all(generate_drawing_xml(&sheet_chart_assignments).as_bytes())?;
+
+        let drawing_rels_path =
+            format!("xl/drawings/_rels/drawing{}.xml.rels", drawing_part_number);
+        zip.start_file(&drawing_rels_path, opts)?;
+        zip.write_all(generate_drawing_rels_xml(&sheet_chart_assignments).as_bytes())?;
+    }
+
+    for assignment in &chart_plan {
+        let path = format!("xl/charts/chart{}.xml", assignment.chart_part_number);
+        zip.start_file(&path, opts)?;
+        zip.write_all(generate_chart_xml(assignment).as_bytes())?;
     }
 
     let result = zip.finish()?;
@@ -173,6 +227,7 @@ fn generate_sheet_xml(
     style_table: &StyleTable,
     features: &XlsxSheetFeatures,
     table_relationship_ids: &[String],
+    drawing_relationship_id: Option<&str>,
 ) -> String {
     let mut xml = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\n<sheetData>\n",
@@ -278,6 +333,7 @@ fn generate_sheet_xml(
     xml.push_str("</sheetData>\n");
     write_conditional_formats(&mut xml, &features.conditional_formats, style_table);
     write_data_validations(&mut xml, &features.validations);
+    write_drawing_ref(&mut xml, drawing_relationship_id);
     write_table_parts(&mut xml, table_relationship_ids);
     xml.push_str("</worksheet>");
     xml
@@ -350,14 +406,31 @@ fn write_table_parts(xml: &mut String, relationship_ids: &[String]) {
     xml.push_str("</tableParts>\n");
 }
 
-fn generate_worksheet_rels_xml(assignments: &[&TablePartAssignment<'_>]) -> String {
+/// Emit the worksheet `<drawing r:id="..."/>` reference. OOXML schema places the
+/// drawing element before `tableParts`, so this is written first.
+fn write_drawing_ref(xml: &mut String, relationship_id: Option<&str>) {
+    if let Some(id) = relationship_id {
+        xml.push_str(&format!("<drawing r:id=\"{id}\"/>\n"));
+    }
+}
+
+fn generate_worksheet_rels_xml(
+    table_assignments: &[&TablePartAssignment<'_>],
+    drawing: Option<(&str, u32)>,
+) -> String {
     let mut xml = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\n",
     );
-    for assignment in assignments {
+    for assignment in table_assignments {
         xml.push_str(&format!(
             "<Relationship Id=\"{}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/table\" Target=\"../tables/table{}.xml\"/>\n",
             assignment.relationship_id, assignment.part_number
+        ));
+    }
+    if let Some((relationship_id, part_number)) = drawing {
+        xml.push_str(&format!(
+            "<Relationship Id=\"{}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing\" Target=\"../drawings/drawing{}.xml\"/>\n",
+            relationship_id, part_number
         ));
     }
     xml.push_str("</Relationships>");
@@ -430,6 +503,217 @@ fn generate_table_xml(assignment: &TablePartAssignment<'_>) -> String {
     ));
     xml.push_str("</table>");
     xml
+}
+
+/// A chart assigned part numbers and relationship ids during export. Charts on
+/// a worksheet share a single drawing part; each chart gets its own chart part.
+struct ChartPartAssignment<'a> {
+    sheet_idx: usize,
+    /// Relationship id of the drawing within the worksheet relationship part.
+    worksheet_relationship_id: String,
+    /// Workbook-global part number of the shared drawing part (`drawingN.xml`).
+    drawing_part_number: u32,
+    /// Workbook-global part number of this chart (`chartN.xml`).
+    chart_part_number: u32,
+    /// Relationship id of the chart within the drawing relationship part.
+    drawing_relationship_id: String,
+    chart: &'a ChartObject,
+}
+
+/// Assign part numbers and relationship ids to every chart in the document.
+/// Worksheet relationship ids continue after the ones already consumed by
+/// tables so the same relationship part stays collision-free. Each worksheet
+/// with charts gets exactly one drawing part, shared by all its charts.
+fn plan_charts<'a>(
+    document: &'a XlsxDocument,
+    table_plan: &[TablePartAssignment<'_>],
+) -> Vec<ChartPartAssignment<'a>> {
+    let mut rel_ids_used_by_sheet = std::collections::HashMap::new();
+    for assignment in table_plan {
+        *rel_ids_used_by_sheet
+            .entry(assignment.sheet_idx)
+            .or_insert(0u32) += 1;
+    }
+
+    let mut plan = Vec::new();
+    let mut next_drawing_part = 1u32;
+    let mut next_chart_part = 1u32;
+    for (sheet_idx, features) in document.sheet_features.iter().enumerate() {
+        if features.charts.is_empty() {
+            continue;
+        }
+        // Each worksheet contributes exactly one drawing relationship, whose
+        // id follows the ids already consumed by that sheet's tables.
+        let rel_id = rel_ids_used_by_sheet.get(&sheet_idx).copied().unwrap_or(0) + 1;
+        let worksheet_relationship_id = format!("rId{rel_id}");
+        let drawing_part_number = next_drawing_part;
+        next_drawing_part += 1;
+        for chart in &features.charts {
+            let chart_part_number = next_chart_part;
+            next_chart_part += 1;
+            plan.push(ChartPartAssignment {
+                sheet_idx,
+                worksheet_relationship_id: worksheet_relationship_id.clone(),
+                drawing_part_number,
+                chart_part_number,
+                drawing_relationship_id: format!("rId{chart_part_number}"),
+                chart,
+            });
+        }
+    }
+    plan
+}
+
+/// Number of distinct drawing parts the chart plan will emit: one per
+/// worksheet that has at least one chart.
+fn drawing_part_count(chart_plan: &[ChartPartAssignment<'_>]) -> usize {
+    let mut seen = std::collections::HashSet::new();
+    for assignment in chart_plan {
+        seen.insert(assignment.drawing_part_number);
+    }
+    seen.len()
+}
+
+fn generate_drawing_rels_xml(assignments: &[&ChartPartAssignment<'_>]) -> String {
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\n",
+    );
+    for assignment in assignments {
+        xml.push_str(&format!(
+            "<Relationship Id=\"{}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart\" Target=\"../charts/chart{}.xml\"/>\n",
+            assignment.drawing_relationship_id, assignment.chart_part_number
+        ));
+    }
+    xml.push_str("</Relationships>");
+    xml
+}
+
+fn generate_drawing_xml(assignments: &[&ChartPartAssignment<'_>]) -> String {
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<xdr:wsDr xmlns:xdr=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\n",
+    );
+    for assignment in assignments {
+        let anchor = &assignment.chart.anchor;
+        let frame_id = assignment.chart_part_number;
+        xml.push_str(&format!(
+            "<xdr:twoCellAnchor editAs=\"oneCell\">\n<xdr:from><xdr:col>{from_col}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{from_row}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>\n<xdr:to><xdr:col>{to_col}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{to_row}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>\n<xdr:graphicFrame macro=\"\">\n<xdr:nvGraphicFramePr><xdr:cNvPr id=\"{frame_id}\" name=\"Chart {frame_id}\"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr>\n<xdr:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"0\" cy=\"0\"/></xdr:xfrm>\n<a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><c:chart xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" r:id=\"{rid}\"/></a:graphicData></a:graphic>\n</xdr:graphicFrame>\n<xdr:clientData/>\n</xdr:twoCellAnchor>\n",
+            from_col = anchor.from_col,
+            from_row = anchor.from_row,
+            to_col = anchor.to_col,
+            to_row = anchor.to_row,
+            frame_id = frame_id,
+            rid = assignment.drawing_relationship_id
+        ));
+    }
+    xml.push_str("</xdr:wsDr>");
+    xml
+}
+
+/// Stable axis identifiers shared between a chart-type element and its axis
+/// declarations so Excel accepts the plot area as well-formed.
+const CATEGORY_AXIS_ID: &str = "111111111";
+const VALUE_AXIS_ID: &str = "222222222";
+
+fn generate_chart_xml(assignment: &ChartPartAssignment<'_>) -> String {
+    let chart = assignment.chart;
+    let title_xml = match &chart.title {
+        Some(title) => format!(
+            "<c:title><c:tx><c:rich><a:bodyPr/><a:lstStyle/><a:p><a:r><a:rPr lang=\"en-US\"/><a:t>{}</a:t></a:r></a:p></c:rich></c:tx><c:overlay val=\"0\"/></c:title>",
+            escape_xml(title)
+        ),
+        None => String::new(),
+    };
+    let legend_xml = if chart.legend_position == LegendPosition::None {
+        String::new()
+    } else {
+        format!(
+            "<c:legend><c:legendPos val=\"{}\"/><c:overlay val=\"0\"/></c:legend>",
+            legend_position_xml(&chart.legend_position)
+        )
+    };
+    let plot_area_xml = build_plot_area_xml(chart);
+
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<c:chartSpace xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><c:chart>{title_xml}<c:plotArea>{plot_area_xml}</c:plotArea>{legend_xml}<c:plotVisOnly val=\"1\"/><c:dispBlanksAs val=\"gap\"/></c:chart></c:chartSpace>"
+    )
+}
+
+/// Build the contents of `<c:plotArea>`: layout, the chart-type element with its
+/// series, and (for cartesian families) the category and value axes that Excel
+/// requires. Pie and doughnut charts omit the axes.
+fn build_plot_area_xml(chart: &ChartObject) -> String {
+    let chart_type_xml = build_chart_type_xml(chart);
+    let axes_xml = match chart.chart_type {
+        ChartType::Pie | ChartType::Doughnut => String::new(),
+        _ => format!(
+            "<c:catAx><c:axId val=\"{CATEGORY_AXIS_ID}\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"0\"/><c:axPos val=\"b\"/><c:crossAx val=\"{VALUE_AXIS_ID}\"/></c:catAx><c:valAx><c:axId val=\"{VALUE_AXIS_ID}\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"0\"/><c:axPos val=\"l\"/><c:crossAx val=\"{CATEGORY_AXIS_ID}\"/></c:valAx>"
+        ),
+    };
+    format!("<c:layout/>{chart_type_xml}{axes_xml}")
+}
+
+fn build_chart_type_xml(chart: &ChartObject) -> String {
+    let series_xml = build_chart_series_xml(chart);
+    match chart.chart_type {
+        ChartType::Bar => format!(
+            "<c:barChart><c:barDir val=\"bar\"/><c:grouping val=\"clustered\"/><c:varyColors val=\"0\"/>{series_xml}<c:axId val=\"{CATEGORY_AXIS_ID}\"/><c:axId val=\"{VALUE_AXIS_ID}\"/></c:barChart>"
+        ),
+        ChartType::Column => format!(
+            "<c:barChart><c:barDir val=\"col\"/><c:grouping val=\"clustered\"/><c:varyColors val=\"0\"/>{series_xml}<c:axId val=\"{CATEGORY_AXIS_ID}\"/><c:axId val=\"{VALUE_AXIS_ID}\"/></c:barChart>"
+        ),
+        ChartType::Line => format!(
+            "<c:lineChart><c:grouping val=\"clustered\"/><c:marker val=\"1\"/><c:varyColors val=\"0\"/>{series_xml}<c:axId val=\"{CATEGORY_AXIS_ID}\"/><c:axId val=\"{VALUE_AXIS_ID}\"/></c:lineChart>"
+        ),
+        ChartType::Area => format!(
+            "<c:areaChart><c:grouping val=\"standard\"/><c:varyColors val=\"0\"/>{series_xml}<c:axId val=\"{CATEGORY_AXIS_ID}\"/><c:axId val=\"{VALUE_AXIS_ID}\"/></c:areaChart>"
+        ),
+        ChartType::Pie => format!(
+            "<c:pieChart><c:varyColors val=\"1\"/>{series_xml}</c:pieChart>"
+        ),
+        ChartType::Doughnut => format!(
+            "<c:doughnutChart><c:varyColors val=\"1\"/>{series_xml}</c:doughnutChart>"
+        ),
+        ChartType::Scatter => String::new(),
+    }
+}
+
+fn build_chart_series_xml(chart: &ChartObject) -> String {
+    let mut xml = String::new();
+    for (index, series) in chart.series.iter().enumerate() {
+        xml.push_str(&format!(
+            "<c:ser><c:idx val=\"{index}\"/><c:order val=\"{index}\"/>"
+        ));
+        if let Some(name_ref) = &series.name_ref {
+            xml.push_str(&format!(
+                "<c:tx><c:strRef><c:f>{}</c:f></c:strRef></c:tx>",
+                escape_xml(name_ref)
+            ));
+        }
+        if let Some(category_ref) = &series.category_ref {
+            xml.push_str(&format!(
+                "<c:cat><c:strRef><c:f>{}</c:f></c:strRef></c:cat>",
+                escape_xml(category_ref)
+            ));
+        }
+        if let Some(value_ref) = &series.value_ref {
+            xml.push_str(&format!(
+                "<c:val><c:numRef><c:f>{}</c:f></c:numRef></c:val>",
+                escape_xml(value_ref)
+            ));
+        }
+        xml.push_str("</c:ser>");
+    }
+    xml
+}
+
+fn legend_position_xml(position: &LegendPosition) -> &'static str {
+    match position {
+        LegendPosition::None => "r",
+        LegendPosition::Top => "t",
+        LegendPosition::Bottom => "b",
+        LegendPosition::Left => "l",
+        LegendPosition::Right => "r",
+    }
 }
 
 struct StyleTable {
@@ -855,6 +1139,7 @@ fn validate_document(document: &XlsxDocument) -> Result<(), XlsxError> {
             .checked_add(features.validations.len())
             .and_then(|count| count.checked_add(features.conditional_formats.len()))
             .and_then(|count| count.checked_add(features.tables.len()))
+            .and_then(|count| count.checked_add(features.charts.len()))
             .ok_or_else(|| XlsxError::InvalidFormat("Too many worksheet feature records".into()))?;
         if total > MAX_FEATURE_RECORDS {
             return Err(XlsxError::InvalidFormat(format!(
@@ -878,6 +1163,14 @@ fn validate_document(document: &XlsxDocument) -> Result<(), XlsxError> {
             if table.validate(1_000_000, 16_384).is_err() {
                 return Err(XlsxError::InvalidFormat(format!(
                     "Sheet {} contains an invalid table definition",
+                    sheet_index + 1
+                )));
+            }
+        }
+        for chart in &features.charts {
+            if chart.validate(1_000_000, 16_384).is_err() {
+                return Err(XlsxError::InvalidFormat(format!(
+                    "Sheet {} contains a chart definition that XLSX export does not support",
                     sheet_index + 1
                 )));
             }
@@ -1053,7 +1346,13 @@ fn escape_xml(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-fn generate_content_types_xml(workbook: &Workbook, has_styles: bool, table_count: usize) -> String {
+fn generate_content_types_xml(
+    workbook: &Workbook,
+    has_styles: bool,
+    table_count: usize,
+    drawing_count: usize,
+    chart_count: usize,
+) -> String {
     let mut xml = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\n<Default Extension=\"xml\" ContentType=\"application/xml\"/>\n<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\n<Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>\n<Override PartName=\"/xl/sharedStrings.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml\"/>\n",
     );
@@ -1069,6 +1368,18 @@ fn generate_content_types_xml(workbook: &Workbook, has_styles: bool, table_count
     for part_number in 1..=table_count {
         xml.push_str(&format!(
             "<Override PartName=\"/xl/tables/table{}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml\"/>\n",
+            part_number
+        ));
+    }
+    for part_number in 1..=drawing_count {
+        xml.push_str(&format!(
+            "<Override PartName=\"/xl/drawings/drawing{}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.drawing+xml\"/>\n",
+            part_number
+        ));
+    }
+    for part_number in 1..=chart_count {
+        xml.push_str(&format!(
+            "<Override PartName=\"/xl/charts/chart{}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.drawingml.chart+xml\"/>\n",
             part_number
         ));
     }
@@ -1238,6 +1549,7 @@ mod tests {
                     validations,
                     conditional_formats,
                     tables: Vec::new(),
+                    charts: Vec::new(),
                 })
                 .collect(),
         };
@@ -1284,6 +1596,7 @@ mod tests {
                 }],
                 conditional_formats: Vec::new(),
                 tables: Vec::new(),
+                charts: Vec::new(),
             }],
         };
 
@@ -1317,6 +1630,7 @@ mod tests {
                 validations,
                 conditional_formats: Vec::new(),
                 tables: Vec::new(),
+                charts: Vec::new(),
             }],
         };
 
@@ -1362,6 +1676,7 @@ mod tests {
                 validations: Vec::new(),
                 conditional_formats: rules,
                 tables: Vec::new(),
+                charts: Vec::new(),
             }],
         };
 
@@ -1428,6 +1743,7 @@ mod tests {
                 validations: Vec::new(),
                 conditional_formats: rules,
                 tables: Vec::new(),
+                charts: Vec::new(),
             }],
         };
 
@@ -1464,6 +1780,7 @@ mod tests {
                 }],
                 conditional_formats: Vec::new(),
                 tables: Vec::new(),
+                charts: Vec::new(),
             }],
         };
         assert!(matches!(
@@ -1480,6 +1797,7 @@ mod tests {
                     ..Default::default()
                 }],
                 tables: Vec::new(),
+                charts: Vec::new(),
             }],
         };
         assert!(matches!(
@@ -1583,6 +1901,7 @@ mod tests {
                 validations: Vec::new(),
                 conditional_formats: Vec::new(),
                 tables: vec![table],
+                charts: Vec::new(),
             }],
         };
 
@@ -1631,11 +1950,13 @@ mod tests {
                         Table::new("FirstA", (0, 0, 2, 1)),
                         Table::new("FirstB", (0, 3, 2, 4)),
                     ],
+                    charts: Vec::new(),
                 },
                 XlsxSheetFeatures {
                     validations: Vec::new(),
                     conditional_formats: Vec::new(),
                     tables: vec![Table::new("SecondA", (0, 0, 1, 0))],
+                    charts: Vec::new(),
                 },
             ],
         };
@@ -1663,6 +1984,7 @@ mod tests {
                 validations: Vec::new(),
                 conditional_formats: Vec::new(),
                 tables: vec![Table::new("Sales", (0, 0, 2, 1))],
+                charts: Vec::new(),
             }],
         };
         let data = export_document(&document).unwrap();
@@ -1691,5 +2013,286 @@ mod tests {
             .unwrap();
         assert!(sheet.contains("xmlns:r="));
         assert!(sheet.contains("<tableParts count=\"1\">"));
+    }
+
+    use sheets_chart::{ChartAnchor, ChartObject, ChartObjectSeries};
+
+    fn column_chart() -> ChartObject {
+        ChartObject {
+            title: Some("Sales by Month".into()),
+            chart_type: ChartType::Column,
+            anchor: ChartAnchor::new(0, 4, 18, 12),
+            series: vec![ChartObjectSeries {
+                name_ref: Some("Sheet1!$B$1".into()),
+                category_ref: Some("Sheet1!$A$2:$A$4".into()),
+                value_ref: Some("Sheet1!$B$2:$B$4".into()),
+            }],
+            legend_position: LegendPosition::Right,
+        }
+    }
+
+    #[test]
+    fn exported_archive_includes_chart_drawing_and_content_types() {
+        use std::io::Read;
+
+        let document = XlsxDocument {
+            workbook: Workbook::new(),
+            sheet_features: vec![XlsxSheetFeatures {
+                validations: Vec::new(),
+                conditional_formats: Vec::new(),
+                tables: Vec::new(),
+                charts: vec![column_chart()],
+            }],
+        };
+        let data = export_document(&document).unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(data)).unwrap();
+
+        // Drawing part, drawing rels, chart part, and worksheet rels that
+        // carry the drawing relationship must all be present.
+        assert!(archive.by_name("xl/drawings/drawing1.xml").is_ok());
+        assert!(archive
+            .by_name("xl/drawings/_rels/drawing1.xml.rels")
+            .is_ok());
+        assert!(archive.by_name("xl/charts/chart1.xml").is_ok());
+        assert!(archive
+            .by_name("xl/worksheets/_rels/sheet1.xml.rels")
+            .is_ok());
+
+        let mut content_types = String::new();
+        archive
+            .by_name("[Content_Types].xml")
+            .unwrap()
+            .read_to_string(&mut content_types)
+            .unwrap();
+        assert!(content_types.contains("/xl/drawings/drawing1.xml"));
+        assert!(content_types.contains("/xl/charts/chart1.xml"));
+
+        let mut worksheet = String::new();
+        archive
+            .by_name("xl/worksheets/sheet1.xml")
+            .unwrap()
+            .read_to_string(&mut worksheet)
+            .unwrap();
+        assert!(worksheet.contains("<drawing r:id=\"rId1\"/>"));
+    }
+
+    #[test]
+    fn chart_round_trips_through_export_and_import() {
+        let document = XlsxDocument {
+            workbook: Workbook::new(),
+            sheet_features: vec![XlsxSheetFeatures {
+                validations: Vec::new(),
+                conditional_formats: Vec::new(),
+                tables: Vec::new(),
+                charts: vec![column_chart()],
+            }],
+        };
+        let bytes = export_document(&document).unwrap();
+        let reimported = crate::import::import_document(&bytes).unwrap();
+
+        assert_eq!(reimported.sheet_features[0].charts.len(), 1);
+        let chart = &reimported.sheet_features[0].charts[0];
+        assert_eq!(chart.chart_type, ChartType::Column);
+        assert_eq!(chart.title.as_deref(), Some("Sales by Month"));
+        assert_eq!(chart.anchor, ChartAnchor::new(0, 4, 18, 12));
+        assert_eq!(chart.legend_position, LegendPosition::Right);
+        assert_eq!(chart.series.len(), 1);
+        assert_eq!(chart.series[0].name_ref.as_deref(), Some("Sheet1!$B$1"));
+        assert_eq!(
+            chart.series[0].category_ref.as_deref(),
+            Some("Sheet1!$A$2:$A$4")
+        );
+        assert_eq!(
+            chart.series[0].value_ref.as_deref(),
+            Some("Sheet1!$B$2:$B$4")
+        );
+    }
+
+    #[test]
+    fn every_round_trip_chart_family_round_trips_its_type_and_anchor() {
+        for (chart_type, bar_dir) in [
+            (ChartType::Bar, "bar"),
+            (ChartType::Column, "col"),
+            (ChartType::Line, ""),
+            (ChartType::Area, ""),
+            (ChartType::Pie, ""),
+            (ChartType::Doughnut, ""),
+        ] {
+            let document = XlsxDocument {
+                workbook: Workbook::new(),
+                sheet_features: vec![XlsxSheetFeatures {
+                    validations: Vec::new(),
+                    conditional_formats: Vec::new(),
+                    tables: Vec::new(),
+                    charts: vec![ChartObject {
+                        title: None,
+                        chart_type: chart_type.clone(),
+                        anchor: ChartAnchor::new(2, 2, 12, 9),
+                        series: vec![ChartObjectSeries {
+                            name_ref: Some("Sheet1!$B$1".into()),
+                            category_ref: Some("Sheet1!$A$2:$A$4".into()),
+                            value_ref: Some("Sheet1!$B$2:$B$4".into()),
+                        }],
+                        legend_position: LegendPosition::Bottom,
+                    }],
+                }],
+            };
+            let bytes = export_document(&document).unwrap();
+            // A barChart must carry the expected barDir; other families emit
+            // no barDir element.
+            let chart_xml = {
+                use std::io::Read;
+                let mut archive =
+                    zip::ZipArchive::new(std::io::Cursor::new(bytes.clone())).unwrap();
+                let mut text = String::new();
+                archive
+                    .by_name("xl/charts/chart1.xml")
+                    .unwrap()
+                    .read_to_string(&mut text)
+                    .unwrap();
+                text
+            };
+            if bar_dir.is_empty() {
+                assert!(
+                    !chart_xml.contains("barDir"),
+                    "unexpected barDir for {chart_type:?}"
+                );
+            } else {
+                assert!(
+                    chart_xml.contains(&format!("barDir val=\"{bar_dir}\"")),
+                    "missing barDir={bar_dir} for {chart_type:?}"
+                );
+            }
+
+            let reimported = crate::import::import_document(&bytes).unwrap();
+            assert_eq!(
+                reimported.sheet_features[0].charts.len(),
+                1,
+                "{chart_type:?} did not round-trip"
+            );
+            assert_eq!(
+                reimported.sheet_features[0].charts[0].chart_type, chart_type,
+                "{chart_type:?} type changed on round trip"
+            );
+            assert_eq!(
+                reimported.sheet_features[0].charts[0].anchor,
+                ChartAnchor::new(2, 2, 12, 9),
+                "{chart_type:?} anchor changed on round trip"
+            );
+        }
+    }
+
+    #[test]
+    fn multiple_charts_on_one_sheet_share_a_single_drawing_part() {
+        use std::io::Read;
+
+        let document = XlsxDocument {
+            workbook: Workbook::new(),
+            sheet_features: vec![XlsxSheetFeatures {
+                validations: Vec::new(),
+                conditional_formats: Vec::new(),
+                tables: Vec::new(),
+                charts: vec![column_chart(), column_chart()],
+            }],
+        };
+        let data = export_document(&document).unwrap();
+        let reimported = {
+            let mut archive = zip::ZipArchive::new(std::io::Cursor::new(data.clone())).unwrap();
+
+            assert!(archive.by_name("xl/drawings/drawing1.xml").is_ok());
+            assert!(
+                archive.by_name("xl/drawings/drawing2.xml").is_err(),
+                "two charts on one sheet must share one drawing part"
+            );
+            assert!(archive.by_name("xl/charts/chart1.xml").is_ok());
+            assert!(archive.by_name("xl/charts/chart2.xml").is_ok());
+
+            let mut drawing = String::new();
+            archive
+                .by_name("xl/drawings/drawing1.xml")
+                .unwrap()
+                .read_to_string(&mut drawing)
+                .unwrap();
+            assert_eq!(
+                drawing.matches("twoCellAnchor editAs").count(),
+                2,
+                "both charts must be anchored in the shared drawing"
+            );
+
+            crate::import::import_document(&data).unwrap()
+        };
+        assert_eq!(reimported.sheet_features[0].charts.len(), 2);
+    }
+
+    #[test]
+    fn tables_and_charts_on_one_sheet_do_not_collide_relationship_ids() {
+        use std::io::Read;
+
+        let document = XlsxDocument {
+            workbook: Workbook::new(),
+            sheet_features: vec![XlsxSheetFeatures {
+                validations: Vec::new(),
+                conditional_formats: Vec::new(),
+                tables: vec![
+                    sheets_tables::Table::new("Sales", (0, 0, 2, 1)),
+                    sheets_tables::Table::new("Costs", (5, 0, 7, 1)),
+                ],
+                charts: vec![column_chart()],
+            }],
+        };
+        let data = export_document(&document).unwrap();
+        let reimported = {
+            let mut archive = zip::ZipArchive::new(std::io::Cursor::new(data.clone())).unwrap();
+
+            // Tables take rId1 and rId2; the drawing must take rId3.
+            let mut rels = String::new();
+            archive
+                .by_name("xl/worksheets/_rels/sheet1.xml.rels")
+                .unwrap()
+                .read_to_string(&mut rels)
+                .unwrap();
+            assert!(rels.contains("Id=\"rId1\""));
+            assert!(rels.contains("Id=\"rId2\""));
+            assert!(rels.contains("Id=\"rId3\""));
+            assert_eq!(rels.matches("relationships/drawing\"").count(), 1);
+
+            let mut worksheet = String::new();
+            archive
+                .by_name("xl/worksheets/sheet1.xml")
+                .unwrap()
+                .read_to_string(&mut worksheet)
+                .unwrap();
+            assert!(worksheet.contains("<drawing r:id=\"rId3\"/>"));
+            assert!(worksheet.contains("<tableParts count=\"2\">"));
+
+            crate::import::import_document(&data).unwrap()
+        };
+        // The whole bundle still reimports cleanly.
+        assert_eq!(reimported.sheet_features[0].tables.len(), 2);
+        assert_eq!(reimported.sheet_features[0].charts.len(), 1);
+    }
+
+    #[test]
+    fn unsupported_chart_type_is_rejected_by_export_validation() {
+        let document = XlsxDocument {
+            workbook: Workbook::new(),
+            sheet_features: vec![XlsxSheetFeatures {
+                validations: Vec::new(),
+                conditional_formats: Vec::new(),
+                tables: Vec::new(),
+                charts: vec![ChartObject {
+                    title: None,
+                    chart_type: ChartType::Scatter,
+                    anchor: ChartAnchor::new(0, 0, 8, 4),
+                    series: vec![ChartObjectSeries {
+                        name_ref: None,
+                        category_ref: None,
+                        value_ref: None,
+                    }],
+                    legend_position: LegendPosition::None,
+                }],
+            }],
+        };
+        assert!(export_document(&document).is_err());
     }
 }

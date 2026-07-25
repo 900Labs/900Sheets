@@ -2893,6 +2893,7 @@ name = "sheets-chart"
 version = "0.5.0"
 dependencies = [
  "serde",
+ "serde_json",
  "sheets-core",
  "thiserror 2.0.18",
 ]
@@ -3019,6 +3020,7 @@ dependencies = [
  "roxmltree",
  "serde",
  "serde_json",
+ "sheets-chart",
  "sheets-core",
  "sheets-fixtures",
  "sheets-tables",

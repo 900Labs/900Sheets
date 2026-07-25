@@ -72,6 +72,114 @@ pub enum ChartError {
     NoNumericData(String),
 }
 
+/// A chart object persisted on a worksheet and round-tripped through XLSX.
+///
+/// `ChartConfig` is oriented to rendering chart previews from sheet data by
+/// column index. `ChartObject` captures the persisted, on-sheet chart: the
+/// OOXML chart subset that 900Sheets preserves on import and re-emits on
+/// export. It records worksheet range references rather than extracted data so
+/// the chart travels with the workbook instead of a point-in-time snapshot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChartObject {
+    /// Chart title text. `None` round-trips a chart with no `<c:title>`.
+    pub title: Option<String>,
+    /// Chart family. `Bar` selects horizontal bars, `Column` vertical; both map
+    /// to an OOXML `barChart` distinguished by the `barDir` attribute.
+    pub chart_type: ChartType,
+    /// On-sheet anchor of the chart frame, in 0-based row/column. Maps to the
+    /// OOXML `twoCellAnchor` from/to markers. `anchor` is filled in during
+    /// XLSX import from the drawing part.
+    pub anchor: ChartAnchor,
+    /// One or more data series, each with optional worksheet range references
+    /// for its title, category axis, and values.
+    pub series: Vec<ChartObjectSeries>,
+    /// Legend placement.
+    pub legend_position: LegendPosition,
+}
+
+impl ChartObject {
+    /// Validate that the persisted chart is internally consistent and within
+    /// workbook bounds. Used by the XLSX exporter to reject records that
+    /// cannot round-trip, matching how `sheets_tables::Table::validate` gates
+    /// table export.
+    pub fn validate(&self, max_rows: u32, max_cols: u32) -> Result<(), ChartObjectError> {
+        if self.series.is_empty() {
+            return Err(ChartObjectError::NoSeries);
+        }
+        if !is_round_trip_chart_type(&self.chart_type) {
+            return Err(ChartObjectError::UnsupportedType);
+        }
+        let anchor = &self.anchor;
+        if anchor.from_row >= max_rows
+            || anchor.to_row >= max_rows
+            || anchor.from_col >= max_cols
+            || anchor.to_col >= max_cols
+        {
+            return Err(ChartObjectError::AnchorOutOfRange);
+        }
+        Ok(())
+    }
+}
+
+/// On-sheet anchor of a chart frame in 0-based row/column coordinates. `Copy`
+/// so it can be moved out of a borrowed `ChartObject` during export planning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChartAnchor {
+    pub from_row: u32,
+    pub from_col: u32,
+    pub to_row: u32,
+    pub to_col: u32,
+}
+
+impl ChartAnchor {
+    /// Create an anchor from `(from_row, from_col)` to `(to_row, to_col)`.
+    pub fn new(from_row: u32, from_col: u32, to_row: u32, to_col: u32) -> Self {
+        Self {
+            from_row,
+            from_col,
+            to_row,
+            to_col,
+        }
+    }
+}
+
+/// A single persisted chart series. Each reference is a worksheet range
+/// string in the form Excel stores, for example `Sheet1!$A$2:$A$4`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChartObjectSeries {
+    /// Worksheet reference for the series title, e.g. `Sheet1!$B$1`.
+    pub name_ref: Option<String>,
+    /// Worksheet range reference for the category axis.
+    pub category_ref: Option<String>,
+    /// Worksheet range reference for the numeric values.
+    pub value_ref: Option<String>,
+}
+
+/// The chart families that 900Sheets preserves through XLSX round trips.
+/// `Scatter` is a valid render type but is not yet part of the persisted
+/// subset because its `xVal`/`yVal` pair model is not yet modeled.
+fn is_round_trip_chart_type(chart_type: &ChartType) -> bool {
+    matches!(
+        chart_type,
+        ChartType::Bar
+            | ChartType::Column
+            | ChartType::Line
+            | ChartType::Pie
+            | ChartType::Area
+            | ChartType::Doughnut
+    )
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum ChartObjectError {
+    #[error("chart has no series")]
+    NoSeries,
+    #[error("chart type is not part of the XLSX round-trip subset")]
+    UnsupportedType,
+    #[error("chart anchor is outside workbook bounds")]
+    AnchorOutOfRange,
+}
+
 fn extract_cell_number(sheet: &Sheet, row: u32, col: u32) -> Option<f64> {
     sheet.cell(row, col).and_then(|c| c.as_number())
 }
@@ -1041,5 +1149,76 @@ mod tests {
 
         let result = build_chart(&sheet, &config);
         assert!(result.is_err());
+    }
+
+    fn sample_chart_object(chart_type: ChartType) -> ChartObject {
+        ChartObject {
+            title: Some("Sales".into()),
+            chart_type,
+            anchor: ChartAnchor::new(0, 0, 14, 7),
+            series: vec![ChartObjectSeries {
+                name_ref: Some("Sheet1!$B$1".into()),
+                category_ref: Some("Sheet1!$A$2:$A$4".into()),
+                value_ref: Some("Sheet1!$B$2:$B$4".into()),
+            }],
+            legend_position: LegendPosition::Right,
+        }
+    }
+
+    #[test]
+    fn validate_accepts_a_supported_chart_with_a_series() {
+        for chart_type in [
+            ChartType::Bar,
+            ChartType::Column,
+            ChartType::Line,
+            ChartType::Pie,
+            ChartType::Area,
+            ChartType::Doughnut,
+        ] {
+            let label = format!("{chart_type:?}");
+            assert!(
+                sample_chart_object(chart_type)
+                    .validate(1_000_000, 16_384)
+                    .is_ok(),
+                "{label} should validate"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_a_chart_without_series() {
+        let mut chart = sample_chart_object(ChartType::Line);
+        chart.series.clear();
+        assert_eq!(
+            chart.validate(1_000_000, 16_384),
+            Err(ChartObjectError::NoSeries)
+        );
+    }
+
+    #[test]
+    fn validate_rejects_unsupported_scatter_type() {
+        let chart = sample_chart_object(ChartType::Scatter);
+        assert_eq!(
+            chart.validate(1_000_000, 16_384),
+            Err(ChartObjectError::UnsupportedType)
+        );
+    }
+
+    #[test]
+    fn validate_rejects_an_anchor_outside_workbook_bounds() {
+        let mut chart = sample_chart_object(ChartType::Column);
+        chart.anchor.to_col = 16_384;
+        assert_eq!(
+            chart.validate(1_000_000, 16_384),
+            Err(ChartObjectError::AnchorOutOfRange)
+        );
+    }
+
+    #[test]
+    fn chart_object_round_trips_through_json() {
+        let chart = sample_chart_object(ChartType::Column);
+        let json = serde_json::to_string(&chart).unwrap();
+        let restored: ChartObject = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, chart);
     }
 }
