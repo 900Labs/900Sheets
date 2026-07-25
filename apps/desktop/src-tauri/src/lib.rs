@@ -2256,6 +2256,11 @@ struct FrontendConditionalRule {
     rule: ConditionalFormat,
 }
 
+#[derive(serde::Deserialize)]
+struct FrontendTable {
+    table: sheets_tables::Table,
+}
+
 fn xlsx_features_from_metadata(
     workbook: &Workbook,
     metadata: &serde_json::Value,
@@ -2296,10 +2301,18 @@ fn xlsx_features_from_metadata(
                         .collect()
                 }
             };
+            let tables = match state.get("tables") {
+                None => Vec::new(),
+                Some(value) => serde_json::from_value::<Vec<FrontendTable>>(value.clone())
+                    .map_err(|error| format!("Invalid table metadata for XLSX export: {error}"))?
+                    .into_iter()
+                    .map(|stored| stored.table)
+                    .collect(),
+            };
             Ok(sheets_xlsx::XlsxSheetFeatures {
                 validations,
                 conditional_formats,
-                tables: Vec::new(),
+                tables,
             })
         })
         .collect()
@@ -2308,7 +2321,10 @@ fn xlsx_features_from_metadata(
 fn xlsx_metadata_from_document(document: &sheets_xlsx::XlsxDocument) -> serde_json::Value {
     let mut states = serde_json::Map::new();
     for (sheet_index, features) in document.sheet_features.iter().enumerate() {
-        if features.validations.is_empty() && features.conditional_formats.is_empty() {
+        if features.validations.is_empty()
+            && features.conditional_formats.is_empty()
+            && features.tables.is_empty()
+        {
             continue;
         }
         let Some(sheet) = document.workbook.sheet(sheet_index) else {
@@ -2345,11 +2361,23 @@ fn xlsx_metadata_from_document(document: &sheets_xlsx::XlsxDocument) -> serde_js
                 })
             })
             .collect();
+        let tables: Vec<_> = features
+            .tables
+            .iter()
+            .map(|table| {
+                serde_json::json!({
+                    "id": format!("xlsx-table-{}", table.name),
+                    "label": "Imported XLSX table",
+                    "table": table,
+                })
+            })
+            .collect();
         states.insert(
             sheet.stable_id().to_string(),
             serde_json::json!({
                 "validationRules": validation_rules,
                 "conditionalRules": conditional_rules,
+                "tables": tables,
             }),
         );
     }
@@ -4005,6 +4033,84 @@ mod tests {
         assert!(imported_metadata["sheet_states"]
             .get(imported.workbook.sheet(0).unwrap().stable_id().to_string())
             .is_none());
+    }
+
+    #[test]
+    fn table_metadata_roundtrips_through_xlsx_import_export_and_native_format() {
+        use sheets_tables::{Table, TableColumn, TotalsRowFunction};
+
+        // Simulate an XLSX document with one table, the way import_document
+        // returns it.
+        let workbook = Workbook::new();
+        let stable_id = workbook.sheet(0).unwrap().stable_id();
+        let table = Table {
+            name: "Inventory".into(),
+            display_name: "Inventory".into(),
+            range: (0, 0, 3, 2),
+            header_row_count: 1,
+            totals_row_shown: true,
+            columns: vec![
+                TableColumn {
+                    id: 1,
+                    name: "SKU".into(),
+                    totals_row_function: None,
+                    totals_row_label: None,
+                },
+                TableColumn {
+                    id: 2,
+                    name: "Name".into(),
+                    totals_row_function: None,
+                    totals_row_label: None,
+                },
+                TableColumn {
+                    id: 3,
+                    name: "Qty".into(),
+                    totals_row_function: Some(TotalsRowFunction::Sum),
+                    totals_row_label: None,
+                },
+            ],
+            style: sheets_tables::TableStyleInfo::default(),
+            auto_filter_range: Some((0, 0, 3, 2)),
+        };
+        let document = sheets_xlsx::XlsxDocument {
+            workbook: workbook.clone(),
+            sheet_features: vec![sheets_xlsx::XlsxSheetFeatures {
+                validations: Vec::new(),
+                conditional_formats: Vec::new(),
+                tables: vec![table.clone()],
+            }],
+        };
+
+        // xlsx_metadata_from_document: tables appear in sheet_states metadata.
+        let metadata = xlsx_metadata_from_document(&document);
+        let state = &metadata["sheet_states"][stable_id.to_string()];
+        assert_eq!(state["tables"].as_array().unwrap().len(), 1);
+        assert_eq!(state["tables"][0]["table"]["name"], "Inventory");
+
+        // xlsx_features_from_metadata: tables are reconstructed for XLSX export.
+        let features = xlsx_features_from_metadata(&workbook, &metadata).unwrap();
+        assert_eq!(features[0].tables.len(), 1);
+        assert_eq!(features[0].tables[0], table);
+
+        // Full XLSX round-trip through the desktop metadata bridge.
+        let bytes = sheets_xlsx::export_document(&sheets_xlsx::XlsxDocument {
+            workbook: workbook.clone(),
+            sheet_features: features,
+        })
+        .unwrap();
+        let reimported = sheets_xlsx::import_document(&bytes).unwrap();
+        assert_eq!(reimported.sheet_features[0].tables.len(), 1);
+        assert_eq!(reimported.sheet_features[0].tables[0].name, "Inventory");
+        assert_eq!(reimported.sheet_features[0].tables[0].range, (0, 0, 3, 2));
+        assert!(reimported.sheet_features[0].tables[0].totals_row_shown);
+
+        // Native-format round-trip: metadata (including tables) is an opaque
+        // blob that survives .900sheets save and reopen unchanged.
+        let native_json =
+            sheets_json::export_native_workbook_with_metadata(&workbook, metadata.clone()).unwrap();
+        let (_, restored_metadata) =
+            sheets_json::import_native_workbook_with_metadata(&native_json).unwrap();
+        assert_eq!(restored_metadata, metadata);
     }
 
     #[test]

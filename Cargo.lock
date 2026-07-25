@@ -2931,6 +2931,7 @@ dependencies = [
  "sheets-json",
  "sheets-pivot",
  "sheets-print",
+ "sheets-tables",
  "sheets-validation",
  "sheets-xlsx",
  "tauri",
