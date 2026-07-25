@@ -86,9 +86,10 @@ pub struct ChartObject {
     /// Chart family. `Bar` selects horizontal bars, `Column` vertical; both map
     /// to an OOXML `barChart` distinguished by the `barDir` attribute.
     pub chart_type: ChartType,
-    /// On-sheet anchor of the chart frame, in 0-based row/column. Maps to the
-    /// OOXML `twoCellAnchor` from/to markers. `anchor` is filled in during
-    /// XLSX import from the drawing part.
+    /// On-sheet anchor of the chart frame. Maps to one of the OOXML drawing
+    /// anchor elements (`twoCellAnchor`, `oneCellAnchor`, `absoluteAnchor`).
+    /// The kind is preserved so charts imported under a one-cell or absolute
+    /// anchor are not collapsed into a degenerate two-cell frame on re-export.
     pub anchor: ChartAnchor,
     /// One or more data series, each with optional worksheet range references
     /// for its title, category axis, and values.
@@ -109,37 +110,115 @@ impl ChartObject {
         if !is_round_trip_chart_type(&self.chart_type) {
             return Err(ChartObjectError::UnsupportedType);
         }
-        let anchor = &self.anchor;
-        if anchor.from_row >= max_rows
-            || anchor.to_row >= max_rows
-            || anchor.from_col >= max_cols
-            || anchor.to_col >= max_cols
-        {
-            return Err(ChartObjectError::AnchorOutOfRange);
-        }
+        self.anchor.validate(max_rows, max_cols)?;
         Ok(())
     }
 }
 
-/// On-sheet anchor of a chart frame in 0-based row/column coordinates. `Copy`
-/// so it can be moved out of a borrowed `ChartObject` during export planning.
+/// The OOXML drawing anchor element a chart frame uses. Preserving the kind
+/// avoids collapsing a `oneCellAnchor` (which has only a `from` marker plus an
+/// EMU extent) or an `absoluteAnchor` (EMU position plus extent) into a
+/// degenerate `twoCellAnchor` on re-export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ChartAnchorKind {
+    #[default]
+    TwoCell,
+    OneCell,
+    Absolute,
+}
+
+/// On-sheet anchor of a chart frame. Cell markers are 0-based row/column.
+/// Extent and position are English Metric Units (914400 per inch), used by
+/// `oneCell` and `absolute` anchors. `Copy` so it can be moved out of a
+/// borrowed `ChartObject` during export planning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChartAnchor {
+    pub kind: ChartAnchorKind,
+    /// First cell marker for `twoCell` and `oneCell` anchors.
+    #[serde(default)]
     pub from_row: u32,
+    #[serde(default)]
     pub from_col: u32,
+    /// Second cell marker for `twoCell` anchors.
+    #[serde(default)]
     pub to_row: u32,
+    #[serde(default)]
     pub to_col: u32,
+    /// Frame extent in EMU, used by `oneCell` and `absolute` anchors.
+    #[serde(default)]
+    pub ext_cx: u32,
+    #[serde(default)]
+    pub ext_cy: u32,
+    /// Absolute position in EMU, used by `absolute` anchors.
+    #[serde(default)]
+    pub pos_x: u32,
+    #[serde(default)]
+    pub pos_y: u32,
 }
 
 impl ChartAnchor {
-    /// Create an anchor from `(from_row, from_col)` to `(to_row, to_col)`.
+    /// Create a `twoCell` anchor spanning `(from_row, from_col)` to
+    /// `(to_row, to_col)`.
     pub fn new(from_row: u32, from_col: u32, to_row: u32, to_col: u32) -> Self {
         Self {
+            kind: ChartAnchorKind::TwoCell,
             from_row,
             from_col,
             to_row,
             to_col,
+            ext_cx: 0,
+            ext_cy: 0,
+            pos_x: 0,
+            pos_y: 0,
         }
+    }
+
+    /// Create a `oneCell` anchor pinned at `(from_row, from_col)` with an EMU
+    /// extent of `(ext_cx, ext_cy)`.
+    pub fn one_cell(from_row: u32, from_col: u32, ext_cx: u32, ext_cy: u32) -> Self {
+        Self {
+            kind: ChartAnchorKind::OneCell,
+            from_row,
+            from_col,
+            to_row: from_row,
+            to_col: from_col,
+            ext_cx,
+            ext_cy,
+            pos_x: 0,
+            pos_y: 0,
+        }
+    }
+
+    /// Create an `absolute` anchor at EMU position `(pos_x, pos_y)` with an
+    /// frame extent of `(ext_cx, ext_cy)`.
+    pub fn absolute(pos_x: u32, pos_y: u32, ext_cx: u32, ext_cy: u32) -> Self {
+        Self {
+            kind: ChartAnchorKind::Absolute,
+            from_row: 0,
+            from_col: 0,
+            to_row: 0,
+            to_col: 0,
+            ext_cx,
+            ext_cy,
+            pos_x,
+            pos_y,
+        }
+    }
+
+    /// Validate that cell markers are within workbook bounds. Absolute anchors
+    /// are pinned by EMU coordinates, not cells, so they always pass.
+    fn validate(&self, max_rows: u32, max_cols: u32) -> Result<(), ChartObjectError> {
+        if self.kind == ChartAnchorKind::Absolute {
+            return Ok(());
+        }
+        if self.from_row >= max_rows
+            || self.from_col >= max_cols
+            || self.to_row >= max_rows
+            || self.to_col >= max_cols
+        {
+            return Err(ChartObjectError::AnchorOutOfRange);
+        }
+        Ok(())
     }
 }
 
@@ -195,6 +274,73 @@ fn default_colors() -> Vec<&'static str> {
     ]
 }
 
+/// Validate a caller-supplied chart series color before it is interpolated
+/// into SVG `fill`/`stroke` attributes and rendered. The color reaches the
+/// renderer through the `create_chart` IPC from the frontend, so it is treated
+/// as untrusted: a value like `red" onload="alert(1)` would otherwise break out
+/// of the attribute and inject markup into the SVG that is shown via `@html`.
+///
+/// Accepts `#RGB`, `#RGBA`, `#RRGGBB`, `#RRGGBBAA` hex, `rgb()/rgba()` with
+/// digits and separators only, and the CSS named colors 900Sheets uses.
+/// Anything else falls back to `fallback` so a bad value can never reach the SVG.
+fn sanitize_chart_color(color: &str, fallback: &str) -> String {
+    let trimmed = color.trim();
+    if is_safe_hex_color(trimmed) || is_safe_rgb_color(trimmed) || is_named_color(trimmed) {
+        trimmed.to_string()
+    } else {
+        fallback.to_string()
+    }
+}
+
+fn is_safe_hex_color(value: &str) -> bool {
+    let Some(hex) = value.strip_prefix('#') else {
+        return false;
+    };
+    matches!(hex.len(), 3 | 4 | 6 | 8) && hex.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn is_safe_rgb_color(value: &str) -> bool {
+    let inner = value
+        .strip_prefix("rgba(")
+        .or_else(|| value.strip_prefix("rgb("))
+        .and_then(|v| v.strip_suffix(')'));
+    let Some(inner) = inner else {
+        return false;
+    };
+    !inner.is_empty()
+        && inner
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b == b' ' || b == b',' || b == b'.' || b == b'%')
+}
+
+fn is_named_color(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "red"
+            | "green"
+            | "blue"
+            | "yellow"
+            | "orange"
+            | "purple"
+            | "pink"
+            | "brown"
+            | "black"
+            | "white"
+            | "gray"
+            | "grey"
+            | "cyan"
+            | "magenta"
+            | "lime"
+            | "teal"
+            | "navy"
+            | "maroon"
+            | "olive"
+            | "silver"
+            | "aqua"
+            | "fuchsia"
+    )
+}
+
 pub fn extract_chart_data(
     sheet: &Sheet,
     config: &ChartConfig,
@@ -226,10 +372,8 @@ pub fn extract_chart_data(
             return Err(ChartError::NoData);
         }
 
-        let color = s
-            .color
-            .clone()
-            .unwrap_or_else(|| colors[si % colors.len()].to_string());
+        let fallback = colors[si % colors.len()];
+        let color = sanitize_chart_color(s.color.as_deref().unwrap_or(fallback), fallback);
 
         all_data.push(ChartData {
             series_name: s.name.clone(),
@@ -1220,5 +1364,68 @@ mod tests {
         let json = serde_json::to_string(&chart).unwrap();
         let restored: ChartObject = serde_json::from_str(&json).unwrap();
         assert_eq!(restored, chart);
+    }
+
+    #[test]
+    fn one_cell_and_absolute_anchor_constructors_record_their_kind() {
+        let one = ChartAnchor::one_cell(3, 2, 1_828_800, 1_371_600);
+        assert_eq!(one.kind, ChartAnchorKind::OneCell);
+        assert_eq!((one.from_row, one.from_col), (3, 2));
+        assert_eq!((one.ext_cx, one.ext_cy), (1_828_800, 1_371_600));
+
+        let abs = ChartAnchor::absolute(0, 0, 914_400, 914_400);
+        assert_eq!(abs.kind, ChartAnchorKind::Absolute);
+        // Absolute anchors are pinned by EMU coordinates, not cells, so they
+        // validate regardless of the marker fields.
+        assert!(abs.validate(1_000_000, 16_384).is_ok());
+    }
+
+    #[test]
+    fn sanitize_chart_color_accepts_safe_values_and_rejects_breakout() {
+        assert_eq!(sanitize_chart_color("#4285F4", "#000000"), "#4285F4");
+        assert_eq!(sanitize_chart_color("#fff", "#000000"), "#fff");
+        assert_eq!(
+            sanitize_chart_color("rgb(1, 2, 3)", "#000000"),
+            "rgb(1, 2, 3)"
+        );
+        assert_eq!(
+            sanitize_chart_color("rgba(1,2,3,0.5)", "#000000"),
+            "rgba(1,2,3,0.5)"
+        );
+        assert_eq!(sanitize_chart_color("red", "#000000"), "red");
+
+        // Attribute breakout attempts must fall back, never reach the SVG.
+        let breakout = "red\" onload=\"alert(1)";
+        assert_eq!(sanitize_chart_color(breakout, "#000000"), "#000000");
+        assert_eq!(
+            sanitize_chart_color("<script>alert(1)</script>", "#000000"),
+            "#000000"
+        );
+        assert_eq!(sanitize_chart_color("", "#EA4335"), "#EA4335");
+    }
+
+    #[test]
+    fn build_chart_falls_back_when_a_series_color_is_unsafe() {
+        let sheet = make_test_sheet();
+        let config = ChartConfig {
+            title: "Tainted".into(),
+            chart_type: ChartType::Bar,
+            series: vec![ChartSeries {
+                name: "Sales".into(),
+                x_column: 0,
+                y_column: 1,
+                color: Some("blue\" onclick=\"x".into()),
+            }],
+            header_row: 0,
+            data_start_row: 1,
+            data_end_row: 3,
+            x_axis_label: None,
+            y_axis_label: None,
+            legend_position: LegendPosition::None,
+        };
+
+        let result = build_chart(&sheet, &config).unwrap();
+        assert!(!result.svg.contains("onclick"));
+        assert!(result.svg.contains("#4285F4"));
     }
 }

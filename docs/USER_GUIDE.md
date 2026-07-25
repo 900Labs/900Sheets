@@ -130,7 +130,7 @@ Recovery follows dirty session state. Rotating backups are attempted after succe
 - Filters hide nonmatching rows and are stored in native metadata.
 - Remove Duplicates operates on the selected range.
 - Named ranges are saved bookmarks. Formula name evaluation is not implemented.
-- Charts are SVG previews. They are not exported as native Excel charts.
+- Charts built in the panel are SVG previews and are not exported as native Excel chart objects. Imported native Excel charts (bar, column, line, area, pie, doughnut) are preserved through XLSX round trips.
 - Pivot output can be created in a generated sheet and is undoable.
 - Validation and conditional formatting use the 900Sheets model, are saved in native metadata, and round-trip through XLSX for the documented subset.
 - Comments, protection, and cell locks are scoped to stable sheet identities.

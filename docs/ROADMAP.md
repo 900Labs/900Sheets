@@ -25,7 +25,7 @@ The exact release boundary is documented in [COMPATIBILITY.md](COMPATIBILITY.md)
 ### Compatibility depth
 
 - Build a repeatable, publishable Microsoft Excel desktop verification procedure using invented data.
-- Add Excel tables, native chart objects, and pivot metadata in separate, bounded increments.
+- Add Excel tables, native chart objects, and pivot metadata in separate, bounded increments. (Tables and native charts are preserved through XLSX round trips; pivot metadata is the remaining increment.)
 - Expand formula and feature fixtures across multiple LibreOffice and Excel versions.
 - Define explicit preservation or rejection behavior for images, shapes, embedded objects, and external links.
 
