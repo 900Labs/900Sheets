@@ -12,7 +12,9 @@ interface MockOptions {
   sheetDataDelayMsById?: Record<string, number>
   setActiveSheetDelayMs?: number
   recoveryWriteDelayMs?: number
+  recoveryRestoreFails?: boolean
   showFirstRun?: boolean
+  cellEvaluations?: Record<string, { numeric_value: number | null; display: string }>
 }
 
 async function installTauriMock(page: Page, options: MockOptions = {}) {
@@ -163,6 +165,7 @@ async function installTauriMock(page: Page, options: MockOptions = {}) {
             return null
           case 'restore_recovery_snapshot':
             recoveryEvents.restored.push(String(args.recoveryId))
+            if (options.recoveryRestoreFails) throw new Error('injected recovery restore failure')
             return {
               sheets: cloneJson(sheets),
               metadata: { sheet_states: {} },
@@ -266,7 +269,10 @@ async function installTauriMock(page: Page, options: MockOptions = {}) {
             const sheetId = String(args.sheetId ?? 0)
             const delay = options.sheetDataDelayMsById?.[sheetId] ?? 0
             if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay))
-            const source = sheetCells.get(sheetId) ?? cells
+            const source = new Map(sheetCells.get(sheetId) ?? cells)
+            for (const key of formats.keys()) {
+              if (!source.has(key)) source.set(key, { value: '', display: '' })
+            }
             return Array.from(source.entries()).map(([key, cell]) => {
               const [row, col] = key.split(':').map(Number)
               return {
@@ -276,6 +282,7 @@ async function installTauriMock(page: Page, options: MockOptions = {}) {
                 display: cell.display,
                 cell_type: cell.value.startsWith('=') ? 'formula' : 'text',
                 format: formats.get(key) ?? null,
+                ...(options.cellEvaluations?.[key] ?? {}),
               }
             })
           }
@@ -285,7 +292,17 @@ async function installTauriMock(page: Page, options: MockOptions = {}) {
             source.set(keyFor(args.row, args.col), { value, display: value })
             return null
           }
+          case 'move_cells':
           case 'batch_set_cells': {
+            if (cmd === 'move_cells') {
+              if ([cells, ...sheetCells.values()].some((source) => Array.from(source.values()).some((cell) => cell.value.startsWith('=')))) {
+                throw new Error('Cut cannot preserve formula dependencies yet; use Copy instead')
+              }
+              const source = args.source as Array<{ row: number; col: number; value: string }>
+              if (source.some((cell) => (cells.get(keyFor(cell.row, cell.col))?.value ?? '') !== cell.value)) {
+                throw new Error('The cut source changed; source cells have been kept')
+              }
+            }
             const changes = (args.changes as Array<{ row: number; col: number; value: string }>) ?? []
             for (const change of changes) {
               const key = keyFor(change.row, change.col)
@@ -297,6 +314,8 @@ async function installTauriMock(page: Page, options: MockOptions = {}) {
             }
             return null
           }
+          case 'workbook_has_formulas':
+            return [cells, ...sheetCells.values()].some((source) => Array.from(source.values()).some((cell) => cell.value.startsWith('=')))
           case 'clear_cell':
             cells.delete(keyFor(args.row, args.col))
             formats.delete(keyFor(args.row, args.col))
@@ -315,6 +334,8 @@ async function installTauriMock(page: Page, options: MockOptions = {}) {
           }
           case 'get_cell_comment':
             return comments.get(commentKeyFor(args.sheetId, args.row, args.col)) ?? null
+          case 'find_conditional_format_matches':
+            return []
           case 'list_comments':
             return Array.from(comments.entries())
               .filter(([key]) => key.startsWith(`${Number(args.sheetId)}:`))
@@ -609,7 +630,7 @@ test('Go To reaches the maximum grid address with a bounded DOM', async ({ page 
 
   for (let step = 0; step < 5; step++) {
     await page.locator('.menu-bar button').filter({ hasText: /^View$/ }).click()
-    await page.getByRole('button', { name: 'Zoom In' }).click()
+    await page.locator('.app-menu').getByRole('button', { name: 'Zoom In', exact: true }).click()
   }
   await expect(page.locator('.status-bar')).toContainText('150%')
 
@@ -660,9 +681,9 @@ test('grid uses one keyboard focus target across virtualized navigation and zoom
   await expect(page.locator('button.cell[tabindex="0"]')).toHaveCount(0)
 
   await page.locator('.menu-bar button').filter({ hasText: /^View$/ }).click()
-  await page.getByRole('button', { name: 'Zoom In' }).click()
+  await page.locator('.app-menu').getByRole('button', { name: 'Zoom In', exact: true }).click()
   await page.locator('.menu-bar button').filter({ hasText: /^View$/ }).click()
-  await page.getByRole('button', { name: 'Zoom In' }).click()
+  await page.locator('.app-menu').getByRole('button', { name: 'Zoom In', exact: true }).click()
   await grid.focus()
   await page.keyboard.press('PageDown')
   await expect(grid).toBeFocused()
@@ -951,10 +972,10 @@ test('restoring one recovery preserves every unselected snapshot', async ({ page
   expect(events?.discardAttempts).toEqual([])
 })
 
-test('explicit recovery discard removes only the selected snapshot', async ({ page }) => {
+test('deferring a startup recovery preserves it while restoring another', async ({ page }) => {
   await installTauriMock(page, {
     recoveries: [
-      { id: 'discard-me', modified_millis: 2_000 },
+      { id: 'keep-for-later', modified_millis: 2_000 },
       { id: 'restore-me', modified_millis: 1_000 },
     ],
   })
@@ -972,7 +993,7 @@ test('explicit recovery discard removes only the selected snapshot', async ({ pa
     (window as Window & { __RECOVERY_TEST__?: { discardAttempts: string[]; restored: string[] } })
       .__RECOVERY_TEST__
   )
-  expect(events?.discardAttempts).toEqual(['discard-me'])
+  expect(events?.discardAttempts).toEqual([])
   expect(events?.restored).toEqual(['restore-me'])
 })
 
@@ -1088,4 +1109,388 @@ test('comment drafts cannot follow cell or sheet selection changes', async ({ pa
   await page.locator('.menu-bar button').filter({ hasText: /^Insert$/ }).click()
   await page.getByRole('button', { name: 'Comment...' }).click()
   await expect(page.locator('textarea.panel-input')).toHaveValue('')
+})
+
+for (const viewport of [{ width: 800, height: 500 }, { width: 1024, height: 768 }, { width: 1280, height: 720 }]) {
+  test(`workbook controls remain usable at ${viewport.width}x${viewport.height}`, async ({ page }, testInfo) => {
+    await page.setViewportSize(viewport)
+    await openWorkbook(page)
+    for (const locator of [page.locator('.workbook-header'), page.locator('.sheet-tabs'), page.locator('.status-bar'), page.getByRole('button', { name: 'Open', exact: true }), page.getByRole('button', { name: 'Save', exact: true })]) {
+      const box = await locator.boundingBox()
+      expect(box).not.toBeNull()
+      expect(box!.x).toBeGreaterThanOrEqual(0)
+      expect(box!.y).toBeGreaterThanOrEqual(0)
+      expect(box!.x + box!.width).toBeLessThanOrEqual(viewport.width)
+      expect(box!.y + box!.height).toBeLessThanOrEqual(viewport.height)
+    }
+    expect(await page.locator('.grid-container').evaluate((grid) => grid.clientHeight)).toBeGreaterThan(viewport.height - 240)
+    if (viewport.width >= 1024) {
+      expect(await page.locator('.format-toolbar').evaluate((toolbar) => toolbar.scrollWidth <= toolbar.clientWidth)).toBe(true)
+    }
+    await page.getByRole('button', { name: 'Zoom in', exact: true }).click()
+    await expect(page.locator('.zoom-value')).toHaveText('110%')
+    await page.getByTitle('Reset zoom to 100%').click()
+    await expect(page.locator('.zoom-value')).toHaveText('100%')
+    await page.locator('button[title="Data tools"]').click()
+    await page.locator('.toolbar-menu-item').filter({ hasText: /^Find$/ }).click()
+    const panel = await page.getByRole('dialog').boundingBox()
+    expect(panel!.x + panel!.width).toBeLessThanOrEqual(viewport.width)
+    expect(panel!.y + panel!.height).toBeLessThanOrEqual(viewport.height)
+    await page.getByRole('button', { name: 'Close', exact: true }).click()
+    await page.screenshot({ path: testInfo.outputPath(`900sheets-ui-${viewport.width}.png`) })
+  })
+}
+
+test('format controls follow selection and undo instead of retaining the last chosen value', async ({ page }) => {
+  await openWorkbook(page)
+  await enterCellText(page, 'A1', '123.45')
+  await cell(page, 'A1').click()
+  const numberFormat = page.getByRole('combobox', { name: 'Number format', exact: true })
+  await numberFormat.selectOption('#,##0.00')
+  await page.getByRole('button', { name: 'Bold', exact: true }).click()
+  await expect(page.getByRole('button', { name: 'Bold', exact: true })).toHaveAttribute('aria-pressed', 'true')
+  await page.getByRole('spinbutton', { name: 'Font size', exact: true }).fill('18')
+  await page.getByRole('spinbutton', { name: 'Font size', exact: true }).press('Tab')
+  await expect(cell(page, 'A1')).toHaveCSS('font-size', '18px')
+  await cell(page, 'B1').click()
+  await expect(numberFormat).toHaveValue('')
+  await expect(page.getByRole('button', { name: 'Bold', exact: true })).toHaveAttribute('aria-pressed', 'false')
+  await expect(page.getByRole('spinbutton', { name: 'Font size', exact: true })).toHaveValue('13')
+  await cell(page, 'A1').click()
+  await expect(numberFormat).toHaveValue('#,##0.00')
+  await expect(page.getByRole('spinbutton', { name: 'Font size', exact: true })).toHaveValue('18')
+  await page.keyboard.press('Control+Z')
+  await expect(page.getByRole('spinbutton', { name: 'Font size', exact: true })).toHaveValue('13')
+  await expect(page.getByRole('button', { name: 'Bold', exact: true })).toHaveAttribute('aria-pressed', 'true')
+})
+
+test('local first-run template editing and save state work with browser networking offline', async ({ page, context }) => {
+  await installTauriMock(page, { showFirstRun: true })
+  const externalRequests: string[] = []
+  page.on('request', (request) => {
+    if (!request.url().startsWith('http://127.0.0.1:1422/') && !request.url().startsWith('data:')) externalRequests.push(request.url())
+  })
+  await page.goto('/')
+  await expect(page.getByRole('dialog')).toBeVisible()
+  await context.setOffline(true)
+  await page.locator('.template-card').first().click()
+  await expect(page.locator('.save-state')).toHaveText('Unsaved changes')
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(page.locator('.workbook-name')).toHaveText('mock-workbook.900sheets')
+  await expect(page.locator('.save-state')).toHaveText('Saved to this computer')
+  const formula = page.getByRole('textbox', { name: 'Formula bar', exact: true })
+  await formula.fill('An offline draft')
+  await expect(page.locator('.save-state')).toHaveText('Unsaved changes')
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(page.locator('.save-state')).toHaveText('Saved to this computer')
+  await expect(cell(page, 'A1')).toHaveText('An offline draft')
+  expect(externalRequests).toEqual([])
+})
+
+async function useClipboardReadback(page: Page) {
+  await page.evaluate(() => {
+    let text = ''
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
+      writeText: async (value: string) => { text = value },
+      readText: async () => text,
+    } })
+  })
+}
+
+test('formula copy rebases mixed references even when system clipboard reads succeed', async ({ page }) => {
+  await openWorkbook(page)
+  await useClipboardReadback(page)
+  await cell(page, 'B2').click()
+  const formula = page.getByRole('textbox', { name: 'Formula bar', exact: true })
+  await formula.fill('=A1+$B2+C$3+$D$4+LOG10(A1)+"A1"')
+  await formula.press('Enter')
+  await cell(page, 'B2').click()
+  await page.keyboard.press('Control+C')
+  await expect(page.locator('.toolbar-status')).toContainText('Copied B2')
+  await cell(page, 'C3').click()
+  await page.keyboard.press('Control+V')
+  await expect(cell(page, 'C3')).toHaveText('=B2+$B3+D$3+$D$4+LOG10(B2)+"A1"')
+  await expect(cell(page, 'B2')).toHaveText('=A1+$B2+C$3+$D$4+LOG10(A1)+"A1"')
+})
+
+test('cut keeps the source until paste succeeds and the complete move undoes together', async ({ page }) => {
+  await openWorkbook(page)
+  await useClipboardReadback(page)
+  await enterCellText(page, 'A1', 'move-me')
+  await cell(page, 'A1').click()
+  await page.keyboard.press('Control+X')
+  await expect(page.locator('.toolbar-status')).toContainText('Cut ready')
+  await expect(cell(page, 'A1')).toHaveText('move-me')
+  await cell(page, 'B1').click()
+  await page.keyboard.press('Control+V')
+  await expect(cell(page, 'B1')).toHaveText('move-me')
+  await expect(cell(page, 'A1')).toHaveText('')
+  await page.keyboard.press('Control+Z')
+  await expect(cell(page, 'A1')).toHaveText('move-me')
+  await expect(cell(page, 'B1')).toHaveText('')
+})
+
+test('a cut paste backend failure restores source and destination and allows retry', async ({ page }) => {
+  await openWorkbook(page)
+  await useClipboardReadback(page)
+  await enterCellText(page, 'A1', 'keep-me')
+  await enterCellText(page, 'B1', 'existing')
+  await cell(page, 'A1').click()
+  await page.keyboard.press('Control+X')
+  await expect(page.locator('.toolbar-status')).toContainText('Cut ready')
+  await page.evaluate(() => {
+    const runtime = (window as any).__TAURI_INTERNALS__
+    const original = runtime.invoke
+    let failNextBatch = true
+    runtime.invoke = async (command: string, args: Record<string, unknown>) => {
+      const result = await original(command, args)
+      if (command === 'move_cells' && failNextBatch) {
+        failNextBatch = false
+        throw new Error('injected paste failure after applying cells')
+      }
+      return result
+    }
+  })
+  await cell(page, 'B1').click()
+  await page.keyboard.press('Control+V')
+  await expect(page.locator('.toolbar-status')).toContainText('Unable to paste cells')
+  await expect(cell(page, 'A1')).toHaveText('keep-me')
+  await expect(cell(page, 'B1')).toHaveText('existing')
+  await page.keyboard.press('Control+V')
+  await expect(cell(page, 'B1')).toHaveText('keep-me')
+  await expect(cell(page, 'A1')).toHaveText('')
+})
+
+test('overlapping cut ranges preserve all destination values in order', async ({ page }) => {
+  await openWorkbook(page)
+  await useClipboardReadback(page)
+  await enterCellText(page, 'A1', 'first')
+  await enterCellText(page, 'A2', 'second')
+  const goTo = page.getByRole('textbox', { name: 'Go to cell or range' })
+  await goTo.fill('A1:A2')
+  await goTo.press('Enter')
+  await page.keyboard.press('Control+X')
+  await expect(page.locator('.toolbar-status')).toContainText('Cut ready')
+  await cell(page, 'A2').click()
+  await page.keyboard.press('Control+V')
+  await expect(cell(page, 'A1')).toHaveText('')
+  await expect(cell(page, 'A2')).toHaveText('first')
+  await expect(cell(page, 'A3')).toHaveText('second')
+})
+
+test('cut rejects formula dependencies on another sheet without clearing the source', async ({ page }) => {
+  await installTauriMock(page, { sheetDataById: { '1': { '0:0': '=Sheet1!A1' } } })
+  await page.goto('/')
+  await expect(cell(page, 'A1')).toBeVisible()
+  await useClipboardReadback(page)
+  await enterCellText(page, 'A1', 'source')
+  await cell(page, 'A1').click()
+  await page.keyboard.press('Control+X')
+  await expect(page.locator('.toolbar-status')).toContainText('Cut ready')
+  await cell(page, 'B1').click()
+  await page.keyboard.press('Control+V')
+  await expect(page.locator('.toolbar-status')).toContainText('contains formulas; use Copy instead')
+  await expect(cell(page, 'A1')).toHaveText('source')
+  await expect(cell(page, 'B1')).toHaveText('')
+})
+
+test('cut rejects a changed source without erasing the newer edit', async ({ page }) => {
+  await openWorkbook(page)
+  await useClipboardReadback(page)
+  await enterCellText(page, 'A1', 'original')
+  await cell(page, 'A1').click()
+  await page.keyboard.press('Control+X')
+  await expect(page.locator('.toolbar-status')).toContainText('Cut ready')
+  await enterCellText(page, 'A1', 'newer')
+  await cell(page, 'B1').click()
+  await page.keyboard.press('Control+V')
+  await expect(page.locator('.toolbar-status')).toContainText('cut source changed')
+  await expect(cell(page, 'A1')).toHaveText('newer')
+  await expect(cell(page, 'B1')).toHaveText('')
+})
+
+test('structural edits reject named range metadata before dispatch and preserve it', async ({ page }) => {
+  await openWorkbook(page)
+  await enterCellText(page, 'A1', 'retained')
+  await page.locator('.menu-bar button').filter({ hasText: /^Data$/ }).click()
+  await page.getByRole('button', { name: 'Named Ranges...' }).click()
+  await page.getByLabel('Name', { exact: true }).fill('Revenue')
+  await page.getByRole('button', { name: 'Add Named Range' }).click()
+  await expect(page.getByText('Revenue', { exact: true })).toBeVisible()
+  await page.getByRole('button', { name: 'Close', exact: true }).click()
+  await page.evaluate(() => {
+    const runtime = (window as any).__TAURI_INTERNALS__
+    const original = runtime.invoke
+    ;(window as any).__STRUCTURE_CALLS__ = []
+    runtime.invoke = async (command: string, args: Record<string, unknown>) => {
+      if (command === 'edit_sheet_structure') (window as any).__STRUCTURE_CALLS__.push(args)
+      return original(command, args)
+    }
+  })
+  for (const action of ['Insert Row Above', 'Delete Row', 'Insert Column Left', 'Delete Column']) {
+    await page.locator('.menu-bar button').filter({ hasText: /^Insert$/ }).click()
+    await page.getByRole('button', { name: action, exact: true }).click()
+    await expect(page.locator('.toolbar-status')).toContainText('cannot preserve these features yet')
+  }
+  expect(await page.evaluate(() => (window as any).__STRUCTURE_CALLS__)).toEqual([])
+  await expect(cell(page, 'A1')).toHaveText('retained')
+  await page.locator('.menu-bar button').filter({ hasText: /^Data$/ }).click()
+  await page.getByRole('button', { name: 'Named Ranges...' }).click()
+  await expect(page.getByText('Revenue', { exact: true })).toBeVisible()
+})
+
+test('structural commands flush the formula bar draft before changing coordinates', async ({ page }) => {
+  await openWorkbook(page)
+  await page.evaluate(() => {
+    const runtime = (window as any).__TAURI_INTERNALS__
+    const original = runtime.invoke
+    ;(window as any).__EDIT_ORDER__ = []
+    runtime.invoke = async (command: string, args: Record<string, unknown>) => {
+      if (command === 'batch_set_cells' || command === 'edit_sheet_structure') {
+        ;(window as any).__EDIT_ORDER__.push({ command, args })
+      }
+      if (command === 'edit_sheet_structure') return null
+      return original(command, args)
+    }
+  })
+  await page.getByRole('textbox', { name: 'Formula bar', exact: true }).fill('draft before insertion')
+  await page.locator('.menu-bar button').filter({ hasText: /^Insert$/ }).click()
+  await page.getByRole('button', { name: 'Insert Row Above', exact: true }).click()
+  await expect(page.locator('.toolbar-status')).toContainText('Inserted row above')
+  const edits = await page.evaluate(() => (window as any).__EDIT_ORDER__)
+  expect(edits.map((entry: { command: string }) => entry.command)).toEqual(['batch_set_cells', 'edit_sheet_structure'])
+  expect(edits[0].args.changes).toEqual([{ row: 0, col: 0, value: 'draft before insertion' }])
+})
+
+test('a failed startup recovery remains available after opening a blank workbook', async ({ page }) => {
+  await installTauriMock(page, { recoveries: [{ id: 'failed-restore', modified_millis: 2_000 }], recoveryRestoreFails: true })
+  page.on('dialog', async (dialog) => dialog.accept())
+  await page.goto('/')
+  await expect(cell(page, 'A1')).toBeVisible()
+  const events = await page.evaluate(() => (window as any).__RECOVERY_TEST__)
+  expect(events.restored).toEqual(['failed-restore'])
+  expect(events.discardAttempts).not.toContain('failed-restore')
+})
+
+test('cut revalidates dependencies inside the move when the preflight becomes stale', async ({ page }) => {
+  await openWorkbook(page)
+  await useClipboardReadback(page)
+  await enterCellText(page, 'A1', 'retained')
+  await cell(page, 'A1').click()
+  await page.keyboard.press('Control+X')
+  await expect(page.locator('.toolbar-status')).toContainText('Cut ready')
+  await page.evaluate(() => {
+    const runtime = (window as any).__TAURI_INTERNALS__
+    const original = runtime.invoke
+    runtime.invoke = async (command: string, args: Record<string, unknown>) => {
+      const result = await original(command, args)
+      if (command === 'workbook_has_formulas') {
+        // A different edit lands after the advisory preflight, before move begins.
+        await new Promise((resolve) => setTimeout(resolve, 25))
+        await original('set_cell', { sheetId: 0, row: 0, col: 2, value: '=A1' })
+      }
+      return result
+    }
+  })
+  await cell(page, 'B1').click()
+  await page.keyboard.press('Control+V')
+  await expect(page.locator('.toolbar-status')).toContainText('formula dependencies')
+  await expect(cell(page, 'A1')).toHaveText('retained')
+  await expect(cell(page, 'B1')).toHaveText('')
+  await expect(cell(page, 'C1')).toHaveText('=A1')
+})
+
+test('deleting the active sheet commits its draft before sheet indexes change', async ({ page }) => {
+  await openWorkbook(page)
+  await page.evaluate(() => {
+    const runtime = (window as any).__TAURI_INTERNALS__
+    const original = runtime.invoke
+    ;(window as any).__DELETE_ORDER__ = []
+    runtime.invoke = async (command: string, args: Record<string, unknown>) => {
+      if (command === 'batch_set_cells' || command === 'delete_sheet') {
+        ;(window as any).__DELETE_ORDER__.push({ command, args })
+      }
+      return original(command, args)
+    }
+  })
+  await page.getByRole('textbox', { name: 'Formula bar', exact: true }).fill('draft belongs to deleted sheet')
+  await page.locator('button.sheet-tab-delete[title="Delete sheet"]').click()
+  await expect(page.getByRole('button', { name: 'Sheet1', exact: true })).toHaveCount(0)
+  const edits = await page.evaluate(() => (window as any).__DELETE_ORDER__)
+  expect(edits.map((entry: { command: string }) => entry.command)).toEqual(['batch_set_cells', 'delete_sheet'])
+  expect(edits[0].args).toEqual({ sheetId: 0, changes: [{ row: 0, col: 0, value: 'draft belongs to deleted sheet' }] })
+})
+
+test('selection statistics and numeric conditional rules use evaluated values before display formatting', async ({ page }) => {
+  await installTauriMock(page, {
+    sheetDataById: { '0': { '0:0': '=SUM(B1:C1)', '0:1': '10', '0:2': '20', '0:3': 'text', '0:4': '0012', '0:5': '=1/0' } },
+    cellEvaluations: {
+      '0:0': { numeric_value: 30, display: '$30.00' },
+      '0:1': { numeric_value: 10, display: '1,000%' },
+      '0:2': { numeric_value: 20, display: '20.00' },
+      '0:3': { numeric_value: null, display: 'text' },
+      '0:4': { numeric_value: null, display: '0012' },
+      '0:5': { numeric_value: null, display: '#DIV/0!' },
+    },
+  })
+  await page.goto('/')
+  await expect(cell(page, 'A1')).toHaveText('$30.00')
+  await expect(cell(page, 'A1')).toHaveCSS('text-align', 'right')
+  await expect(cell(page, 'E1')).toHaveCSS('text-align', 'left')
+  await expect(page.locator('.status-bar')).toContainText('Sum 30')
+  await page.getByRole('textbox', { name: 'Go to cell or range' }).fill('A1:F1')
+  await page.getByRole('textbox', { name: 'Go to cell or range' }).press('Enter')
+  await expect(page.locator('.status-bar')).toContainText('Count 6')
+  await expect(page.locator('.status-bar')).toContainText('Sum 60')
+  await expect(page.locator('.status-bar')).toContainText('Avg 20')
+  await page.locator('.menu-bar button').filter({ hasText: /^Format$/ }).click()
+  await page.getByRole('button', { name: 'Conditional Formatting...' }).click()
+  await page.getByRole('textbox', { name: 'Value', exact: true }).fill('25')
+  await page.getByRole('button', { name: 'Save Live Rule' }).click()
+  await expect(page.locator('.toolbar-status')).toContainText('Saved conditional rule')
+  await page.getByRole('button', { name: 'Close', exact: true }).click()
+  await expect(cell(page, 'A1')).toHaveCSS('background-color', 'rgb(254, 243, 199)')
+  await expect(cell(page, 'B1')).not.toHaveCSS('background-color', 'rgb(254, 243, 199)')
+  await expect(cell(page, 'E1')).not.toHaveCSS('background-color', 'rgb(254, 243, 199)')
+  await expect(cell(page, 'F1')).not.toHaveCSS('background-color', 'rgb(254, 243, 199)')
+})
+
+test('successful workbook replacements clear undo and redo controls', async ({ page }) => {
+  await openWorkbook(page)
+  const undo = page.getByTitle('Undo (Ctrl+Z)', { exact: true })
+  const redo = page.getByTitle('Redo (Ctrl+Y)', { exact: true })
+  await enterCellText(page, 'A1', 'first')
+  await enterCellText(page, 'A1', 'second')
+  await undo.click()
+  await expect(redo).toBeEnabled()
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(page.locator('.save-state')).toHaveText('Saved to this computer')
+  await page.getByRole('button', { name: 'Open', exact: true }).click()
+  await expect(page.locator('.toolbar-status')).toContainText('Opened')
+  await expect(undo).toBeDisabled()
+  await expect(redo).toBeDisabled()
+  await enterCellText(page, 'B1', 'new session')
+  await expect(undo).toBeEnabled()
+  page.once('dialog', (dialog) => dialog.accept())
+  await page.locator('.menu-bar button').filter({ hasText: /^File$/ }).click()
+  await page.locator('.app-menu').getByRole('button', { name: 'New Workbook' }).click()
+  await expect(page.locator('.toolbar-status')).toContainText('New workbook')
+  await expect(undo).toBeDisabled()
+  await expect(redo).toBeDisabled()
+})
+
+test('formatting an empty cell remains visible in controls before entering data', async ({ page }) => {
+  await openWorkbook(page)
+  const bold = page.getByRole('button', { name: 'Bold', exact: true })
+  await bold.click()
+  await expect(bold).toHaveAttribute('aria-pressed', 'true')
+  await cell(page, 'B1').click()
+  await expect(bold).toHaveAttribute('aria-pressed', 'false')
+  await cell(page, 'A1').click()
+  await expect(bold).toHaveAttribute('aria-pressed', 'true')
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(page.locator('.save-state')).toHaveText('Saved to this computer')
+  await page.getByRole('button', { name: 'Open', exact: true }).click()
+  await expect(bold).toHaveAttribute('aria-pressed', 'true')
+  await expect(cell(page, 'A1')).toHaveText('')
 })

@@ -48,7 +48,6 @@ impl Token {
                 | Token::Minus
                 | Token::Asterisk
                 | Token::Slash
-                | Token::Percent
                 | Token::Caret
                 | Token::Ampersand
                 | Token::Concat

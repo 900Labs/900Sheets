@@ -14,10 +14,11 @@ It runs:
 4. `npm ci --prefix apps/desktop`
 5. `npm run check --prefix apps/desktop`
 6. `npm run build --prefix apps/desktop`
+   - `node scripts/check-resource-budgets.mjs` verifies asset budgets and offline WebView2 installer configuration.
 7. `npm run test:unit --prefix apps/desktop`
 8. `npm run test:e2e --prefix apps/desktop`
 
-The current v0.5.0 tree has 501 verified Rust tests, 21 verified frontend unit tests, and 0 Svelte or TypeScript diagnostics. The browser suite contains 32 Playwright tests and must pass as part of the final release gate before tagging. A higher count is expected when new tests are added. The gate must remain free of Rust warnings and Svelte or TypeScript diagnostics.
+The current verification record is in the [product audit](audits/2026-09-07-product-readiness.md). Test counts change as regressions are added. The gate must remain free of Rust compiler/clippy warnings and Svelte or TypeScript diagnostics. Dependency advisory warnings are tracked separately from compiler warnings; the audit records any inherited advisory debt.
 
 The XLSX compatibility test opens and re-saves a generated workbook with LibreOffice. CI installs LibreOffice and fails if `soffice` is unavailable. Local runs report a skip when LibreOffice is not installed.
 

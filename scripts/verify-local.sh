@@ -23,6 +23,7 @@ run_check "3. cargo test" cargo test --workspace
 run_check "4. npm ci" npm ci --prefix apps/desktop --silent
 run_check "5. npm run check" npm run check --prefix apps/desktop
 run_check "6. npm run build" npm run build --prefix apps/desktop
+run_check "6a. frontend resource budgets" node scripts/check-resource-budgets.mjs
 run_check "7. npm run test:unit" npm run test:unit --prefix apps/desktop
 run_check "8. npm run test:e2e" npm run test:e2e --prefix apps/desktop
 

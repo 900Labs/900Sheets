@@ -3,6 +3,13 @@ use crate::error::FormulaError;
 use crate::evaluator::{CellProvider, SimpleProvider, Value};
 use std::collections::HashSet;
 
+// Per-function bounds keep a small formula from exhausting a low-memory computer.
+pub(crate) const MAX_FUNCTION_TEXT_BYTES: usize = 1024 * 1024;
+const MAX_FUNCTION_ITERATIONS: u64 = 10_000;
+const MAX_FIXED_DECIMALS: i32 = 1_000;
+// The current date model uses the Gregorian calendar without Excel's fictitious leap day.
+const MAX_DATE_SERIAL: f64 = 2_958_464.0; // 9999-12-31
+
 type FnHandler = fn(&[Value], &dyn CellProvider, &mut HashSet<(u32, u32)>, &[&Expr]) -> Value;
 
 pub struct FunctionRegistry {
@@ -147,6 +154,7 @@ impl FunctionRegistry {
         self.register("MULTINOMIAL", multinomial_fn);
         self.register("COMBINA", combina_fn);
         self.register("PERMUTA", permuta_fn);
+        self.register("PERMUTATIONA", permuta_fn);
         self.register("SERIESSUM", seriessum_fn);
 
         // Statistical functions
@@ -251,6 +259,9 @@ fn ensure_finite_value(value: Value, context: &str) -> Value {
             "{} produced a non-finite number",
             context
         ))),
+        Value::String(text) if text.len() > MAX_FUNCTION_TEXT_BYTES => {
+            Value::Error(text_limit_error())
+        }
         Value::Array(values) => {
             let mut checked = Vec::with_capacity(values.len());
             for value in values {
@@ -264,6 +275,68 @@ fn ensure_finite_value(value: Value, context: &str) -> Value {
         }
         other => other,
     }
+}
+
+fn text_limit_error() -> FormulaError {
+    FormulaError::ValueError(format!(
+        "function text exceeds the {MAX_FUNCTION_TEXT_BYTES}-byte limit"
+    ))
+}
+
+fn checked_text_size(bytes: Option<usize>) -> Result<usize, FormulaError> {
+    bytes
+        .filter(|&size| size <= MAX_FUNCTION_TEXT_BYTES)
+        .ok_or_else(text_limit_error)
+}
+
+fn push_bounded_text(result: &mut String, text: &str) -> Result<(), FormulaError> {
+    checked_text_size(result.len().checked_add(text.len()))?;
+    result.push_str(text);
+    Ok(())
+}
+
+fn nonnegative_integer(number: f64, context: &str) -> Result<u64, FormulaError> {
+    // The strict upper bound avoids a saturating float-to-integer conversion.
+    if !number.is_finite() || number < 0.0 || number >= u64::MAX as f64 {
+        return Err(FormulaError::NumError(format!(
+            "{context} requires a finite nonnegative integer below 2^64"
+        )));
+    }
+    Ok(number.trunc() as u64)
+}
+
+fn check_iterations(iterations: u64, context: &str) -> Result<(), FormulaError> {
+    if iterations > MAX_FUNCTION_ITERATIONS {
+        return Err(FormulaError::NumError(format!(
+            "{context} exceeds the {MAX_FUNCTION_ITERATIONS}-iteration limit"
+        )));
+    }
+    Ok(())
+}
+
+fn combination(n: u64, k: u64, context: &str) -> Result<f64, FormulaError> {
+    if k > n {
+        return Ok(0.0);
+    }
+    let k = k.min(n - k);
+    check_iterations(k, context)?;
+    let mut result = 1.0_f64;
+    for i in 0..k {
+        result *= (n - i) as f64 / (i + 1) as f64;
+        if !result.is_finite() {
+            return Err(FormulaError::NumError(format!("{context} overflow")));
+        }
+    }
+    Ok(result)
+}
+
+macro_rules! function_try {
+    ($result:expr) => {
+        match $result {
+            Ok(value) => value,
+            Err(error) => return Value::Error(error),
+        }
+    };
 }
 
 macro_rules! collect_numbers_or_error {
@@ -785,10 +858,10 @@ fn fact_fn(
     }
     match args[0].as_number() {
         Ok(n) => {
-            if n < 0.0 {
-                return Value::Error(FormulaError::NumError("FACT of negative number".into()));
+            let n_int = function_try!(nonnegative_integer(n, "FACT"));
+            if n_int > 170 {
+                return Value::Error(FormulaError::NumError("FACT overflow above 170".into()));
             }
-            let n_int = n as u64;
             let mut result: f64 = 1.0;
             for i in 1..=n_int {
                 result *= i as f64;
@@ -1120,7 +1193,7 @@ fn mid_fn(args: &[Value], _: &dyn CellProvider, _: &mut HashSet<(u32, u32)>, _: 
     }
     let chars: Vec<char> = s.chars().collect();
     let start_idx = start - 1;
-    let end_idx = (start_idx + len).min(chars.len());
+    let end_idx = start_idx.saturating_add(len).min(chars.len());
     if start_idx >= chars.len() {
         return Value::String(String::new());
     }
@@ -1136,7 +1209,7 @@ fn concatenate_fn(
     let mut result = String::new();
     for v in args {
         match v.as_string() {
-            Ok(s) => result.push_str(&s),
+            Ok(s) => function_try!(push_bounded_text(&mut result, &s)),
             Err(e) => return Value::Error(e),
         }
     }
@@ -1169,31 +1242,36 @@ fn substitute_fn(
     if old.is_empty() {
         return Value::String(text);
     }
-    if args.len() >= 4 {
-        let instance = match args[3].as_number() {
-            Ok(n) => n as usize,
-            Err(e) => return Value::Error(e),
-        };
-        let mut count = 0;
-        let mut result = String::new();
-        let mut remaining = text.as_str();
-        while let Some(pos) = remaining.find(&old) {
-            count += 1;
-            if count == instance {
-                result.push_str(&remaining[..pos]);
-                result.push_str(&new);
-                remaining = &remaining[pos + old.len()..];
-                result.push_str(remaining);
-                return Value::String(result);
-            }
-            result.push_str(&remaining[..pos + old.len()]);
-            remaining = &remaining[pos + old.len()..];
-        }
-        result.push_str(remaining);
-        Value::String(result)
+    let instance = if args.len() >= 4 {
+        Some(function_try!(args[3].as_number()) as usize)
     } else {
-        Value::String(text.replace(&old, &new))
+        None
+    };
+    // Count matches before allocating: replacement text may be much larger than the input.
+    let matches = text.matches(&old).count();
+    let replacements = match instance {
+        Some(index) => usize::from(index > 0 && index <= matches),
+        None => matches,
+    };
+    let retained = text.len() - replacements * old.len();
+    let size = function_try!(checked_text_size(
+        replacements
+            .checked_mul(new.len())
+            .and_then(|bytes| retained.checked_add(bytes))
+    ));
+    let mut result = String::with_capacity(size);
+    let mut previous = 0;
+    for (index, (position, matched)) in text.match_indices(&old).enumerate() {
+        result.push_str(&text[previous..position]);
+        if instance.is_none() || instance == Some(index + 1) {
+            result.push_str(&new);
+        } else {
+            result.push_str(matched);
+        }
+        previous = position + old.len();
     }
+    result.push_str(&text[previous..]);
+    Value::String(result)
 }
 
 fn rept_fn(
@@ -1211,10 +1289,18 @@ fn rept_fn(
         Ok(s) => s,
         Err(e) => return Value::Error(e),
     };
-    let n = match args[1].as_number() {
-        Ok(n) => n as usize,
-        Err(e) => return Value::Error(e),
+    let n = function_try!(nonnegative_integer(
+        function_try!(args[1].as_number()),
+        "REPT"
+    ));
+    if s.is_empty() || n == 0 {
+        return Value::String(String::new());
+    }
+    let n = match usize::try_from(n) {
+        Ok(n) => n,
+        Err(_) => return Value::Error(text_limit_error()),
     };
+    function_try!(checked_text_size(s.len().checked_mul(n)));
     Value::String(s.repeat(n))
 }
 
@@ -1344,14 +1430,22 @@ fn replace_fn(
             "REPLACE start must be >= 1".into(),
         ));
     }
-    let chars: Vec<char> = text.chars().collect();
     let start_idx = start - 1;
-    let end_idx = (start_idx + len).min(chars.len());
-    let mut result: String = chars[..start_idx.min(chars.len())].iter().collect();
+    let end_idx = start_idx.saturating_add(len);
+    let start_byte = text
+        .char_indices()
+        .nth(start_idx)
+        .map_or(text.len(), |(i, _)| i);
+    let end_byte = text
+        .char_indices()
+        .nth(end_idx)
+        .map_or(text.len(), |(i, _)| i);
+    let retained = text.len() - (end_byte - start_byte);
+    let size = function_try!(checked_text_size(retained.checked_add(replacement.len())));
+    let mut result = String::with_capacity(size);
+    result.push_str(&text[..start_byte]);
     result.push_str(&replacement);
-    if end_idx < chars.len() {
-        result.extend(chars[end_idx..].iter());
-    }
+    result.push_str(&text[end_byte..]);
     Value::String(result)
 }
 
@@ -1372,7 +1466,16 @@ fn text_fn(
     };
     let number_format = sheets_core::number_format::NumberFormat::from_pattern(&format_str);
     match args[0] {
-        Value::Number(n) => Value::String(number_format.format(n)),
+        Value::Number(n) => {
+            if matches!(
+                number_format,
+                sheets_core::number_format::NumberFormat::Date
+                    | sheets_core::number_format::NumberFormat::DateTime
+            ) {
+                function_try!(serial_to_date(n));
+            }
+            Value::String(number_format.format(n))
+        }
         _ => match args[0].as_string() {
             Ok(s) => Value::String(s),
             Err(e) => Value::Error(e),
@@ -1663,22 +1766,19 @@ fn quotient_fn(
 
 fn gcd_fn(args: &[Value], _: &dyn CellProvider, _: &mut HashSet<(u32, u32)>, _: &[&Expr]) -> Value {
     let nums = collect_numbers_or_error!(args);
-    if nums.is_empty() {
-        return Value::Number(0.0);
+    let mut result = 0_u64;
+    for number in nums {
+        let number = function_try!(nonnegative_integer(number, "GCD"));
+        result = gcd_u64(result, number);
     }
-    let mut result = nums[0] as i64;
-    for &n in &nums[1..] {
-        result = gcd_i64(result, n as i64);
-    }
-    Value::Number(result.abs() as f64)
+    Value::Number(result as f64)
 }
 
-fn gcd_i64(a: i64, b: i64) -> i64 {
-    let (mut a, mut b) = (a.abs(), b.abs());
+fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
     while b != 0 {
-        let t = b;
-        b = a % b;
-        a = t;
+        let remainder = a % b;
+        a = b;
+        b = remainder;
     }
     a
 }
@@ -1688,14 +1788,19 @@ fn lcm_fn(args: &[Value], _: &dyn CellProvider, _: &mut HashSet<(u32, u32)>, _: 
     if nums.is_empty() {
         return Value::Number(0.0);
     }
-    let mut result = nums[0] as i64;
-    for &n in &nums[1..] {
-        if n as i64 == 0 {
-            return Value::Number(0.0);
+    let mut result = 1_u64;
+    for number in nums {
+        let number = function_try!(nonnegative_integer(number, "LCM"));
+        if number == 0 || result == 0 {
+            result = 0;
+            continue;
         }
-        result = (result / gcd_i64(result, n as i64)) * (n as i64);
+        result = match (result / gcd_u64(result, number)).checked_mul(number) {
+            Some(result) => result,
+            None => return Value::Error(FormulaError::NumError("LCM integer overflow".into())),
+        };
     }
-    Value::Number(result.abs() as f64)
+    Value::Number(result as f64)
 }
 
 fn combin_fn(
@@ -1709,22 +1814,15 @@ fn combin_fn(
             "COMBIN requires 2 arguments".into(),
         ));
     }
-    let n = match args[0].as_number() {
-        Ok(n) => n as u64,
-        Err(e) => return Value::Error(e),
-    };
-    let k = match args[1].as_number() {
-        Ok(k) => k as u64,
-        Err(e) => return Value::Error(e),
-    };
-    if k > n {
-        return Value::Number(0.0);
-    }
-    let mut result: f64 = 1.0;
-    for i in 0..k {
-        result *= (n - i) as f64 / (i + 1) as f64;
-    }
-    Value::Number(result)
+    let n = function_try!(nonnegative_integer(
+        function_try!(args[0].as_number()),
+        "COMBIN"
+    ));
+    let k = function_try!(nonnegative_integer(
+        function_try!(args[1].as_number()),
+        "COMBIN"
+    ));
+    Value::Number(function_try!(combination(n, k, "COMBIN")))
 }
 
 fn permut_fn(
@@ -1738,20 +1836,24 @@ fn permut_fn(
             "PERMUT requires 2 arguments".into(),
         ));
     }
-    let n = match args[0].as_number() {
-        Ok(n) => n as u64,
-        Err(e) => return Value::Error(e),
-    };
-    let k = match args[1].as_number() {
-        Ok(k) => k as u64,
-        Err(e) => return Value::Error(e),
-    };
+    let n = function_try!(nonnegative_integer(
+        function_try!(args[0].as_number()),
+        "PERMUT"
+    ));
+    let k = function_try!(nonnegative_integer(
+        function_try!(args[1].as_number()),
+        "PERMUT"
+    ));
     if k > n {
         return Value::Number(0.0);
     }
-    let mut result: f64 = 1.0;
+    function_try!(check_iterations(k, "PERMUT"));
+    let mut result = 1.0_f64;
     for i in 0..k {
         result *= (n - i) as f64;
+        if !result.is_finite() {
+            return Value::Error(FormulaError::NumError("PERMUT overflow".into()));
+        }
     }
     Value::Number(result)
 }
@@ -1768,18 +1870,29 @@ fn randbetween_fn(
         ));
     }
     let lo = match args[0].as_number() {
-        Ok(n) => n as i64,
+        Ok(n) if n.is_finite() && n >= i64::MIN as f64 && n < i64::MAX as f64 => n as i64,
+        Ok(_) => {
+            return Value::Error(FormulaError::NumError(
+                "RANDBETWEEN requires finite bounds in the signed 64-bit range".into(),
+            ))
+        }
         Err(e) => return Value::Error(e),
     };
     let hi = match args[1].as_number() {
-        Ok(n) => n as i64,
+        Ok(n) if n.is_finite() && n >= i64::MIN as f64 && n < i64::MAX as f64 => n as i64,
+        Ok(_) => {
+            return Value::Error(FormulaError::NumError(
+                "RANDBETWEEN requires finite bounds in the signed 64-bit range".into(),
+            ))
+        }
         Err(e) => return Value::Error(e),
     };
     if lo > hi {
         return Value::Error(FormulaError::NumError("RANDBETWEEN: bottom > top".into()));
     }
-    let range = (hi - lo + 1) as f64;
-    Value::Number(lo as f64 + rand_value() * range)
+    // Subtract as floats so even the full signed range cannot overflow an integer.
+    let range = hi as f64 - lo as f64 + 1.0;
+    Value::Number((lo as f64 + (rand_value() * range).floor()).min(hi as f64))
 }
 
 fn log_fn(args: &[Value], _: &dyn CellProvider, _: &mut HashSet<(u32, u32)>, _: &[&Expr]) -> Value {
@@ -1954,10 +2067,12 @@ fn factdouble_fn(
     }
     match args[0].as_number() {
         Ok(n) => {
-            if n < 0.0 {
-                return Value::Error(FormulaError::NumError("FACTDOUBLE of negative".into()));
+            let n_int = function_try!(nonnegative_integer(n, "FACTDOUBLE"));
+            if n_int > 300 {
+                return Value::Error(FormulaError::NumError(
+                    "FACTDOUBLE overflow above 300".into(),
+                ));
             }
-            let n_int = n as u64;
             let mut result: f64 = 1.0;
             let mut i = if n_int.is_multiple_of(2) { 2 } else { 1 };
             while i <= n_int {
@@ -2055,14 +2170,29 @@ fn multinomial_fn(
     if nums.is_empty() {
         return Value::Number(1.0);
     }
-    let sum: f64 = nums.iter().sum();
+    let mut total = 0_u64;
     let mut result = 1.0_f64;
-    let mut remaining = sum;
-    for &n in &nums {
-        for i in 1..=n as u64 {
-            result *= (remaining - (n - i as f64)) / i as f64;
+    let mut work = 0_u64;
+    for n in nums {
+        let n = function_try!(nonnegative_integer(n, "MULTINOMIAL"));
+        // Sequential binomial coefficients avoid looping over a huge single category.
+        work = match work.checked_add(n.min(total)) {
+            Some(work) => work,
+            None => {
+                return Value::Error(FormulaError::NumError("MULTINOMIAL input overflow".into()))
+            }
+        };
+        function_try!(check_iterations(work, "MULTINOMIAL"));
+        total = match total.checked_add(n) {
+            Some(total) => total,
+            None => {
+                return Value::Error(FormulaError::NumError("MULTINOMIAL input overflow".into()))
+            }
+        };
+        result *= function_try!(combination(total, n, "MULTINOMIAL"));
+        if !result.is_finite() {
+            return Value::Error(FormulaError::NumError("MULTINOMIAL overflow".into()));
         }
-        remaining -= n;
     }
     Value::Number(result)
 }
@@ -2078,23 +2208,25 @@ fn combina_fn(
             "COMBINA requires 2 arguments".into(),
         ));
     }
-    let n = match args[0].as_number() {
-        Ok(n) => n,
-        Err(e) => return Value::Error(e),
-    };
-    let k = match args[1].as_number() {
-        Ok(k) => k,
-        Err(e) => return Value::Error(e),
-    };
-    let n = n + k - 1.0;
-    if k > n {
+    let n = function_try!(nonnegative_integer(
+        function_try!(args[0].as_number()),
+        "COMBINA"
+    ));
+    let k = function_try!(nonnegative_integer(
+        function_try!(args[1].as_number()),
+        "COMBINA"
+    ));
+    if k == 0 {
+        return Value::Number(1.0);
+    }
+    if n == 0 {
         return Value::Number(0.0);
     }
-    let mut result: f64 = 1.0;
-    for i in 0..k as u64 {
-        result *= (n as u64 - i) as f64 / (i + 1) as f64;
-    }
-    Value::Number(result)
+    let total = match n.checked_add(k - 1) {
+        Some(total) => total,
+        None => return Value::Error(FormulaError::NumError("COMBINA input overflow".into())),
+    };
+    Value::Number(function_try!(combination(total, k, "COMBINA")))
 }
 
 fn permuta_fn(
@@ -2116,11 +2248,17 @@ fn permuta_fn(
         Ok(k) => k,
         Err(e) => return Value::Error(e),
     };
-    let mut result: f64 = 1.0;
-    for i in 0..k as u64 {
-        result *= n + k - 1.0 - i as f64;
+    let n = function_try!(nonnegative_integer(n, "PERMUTA")) as f64;
+    let k = function_try!(nonnegative_integer(k, "PERMUTA"));
+    function_try!(check_iterations(k, "PERMUTA"));
+    if n == 0.0 && k > 0 {
+        return Value::Error(FormulaError::NumError(
+            "PERMUTATIONA requires objects when selecting any".into(),
+        ));
     }
-    Value::Number(result)
+    // Permutations with repetition are n^k, with both arguments truncated.
+    // https://support.microsoft.com/en-us/excel/permutationa-function
+    Value::Number(n.powi(k as i32))
 }
 
 fn seriessum_fn(
@@ -2735,12 +2873,22 @@ fn fixed_fn(
     };
     let decimals = if args.len() >= 2 {
         match args[1].as_number() {
-            Ok(d) => d as i32,
+            Ok(d) if d.is_finite() => d as i32,
+            Ok(_) => {
+                return Value::Error(FormulaError::NumError(
+                    "FIXED requires finite decimals".into(),
+                ))
+            }
             Err(e) => return Value::Error(e),
         }
     } else {
         2
     };
+    if decimals > MAX_FIXED_DECIMALS {
+        return Value::Error(FormulaError::NumError(format!(
+            "FIXED exceeds the {MAX_FIXED_DECIMALS}-decimal limit"
+        )));
+    }
     Value::String(format!("{:.*}", decimals.max(0) as usize, n))
 }
 
@@ -2763,28 +2911,32 @@ fn textjoin_fn(
         Ok(b) => b,
         Err(e) => return Value::Error(e),
     };
-    let mut parts = Vec::new();
-    for v in &args[2..] {
-        match v {
-            Value::Array(arr) => {
-                for item in arr {
-                    if item.is_empty() && ignore_empty {
-                        continue;
-                    }
-                    if let Ok(s) = item.as_string() {
-                        parts.push(s);
-                    }
+    let mut result = String::new();
+    let mut first = true;
+    let mut append = |value: &Value| -> Result<(), FormulaError> {
+        if value.is_empty() && ignore_empty {
+            return Ok(());
+        }
+        if let Ok(text) = value.as_string() {
+            if !first {
+                push_bounded_text(&mut result, &delim)?;
+            }
+            push_bounded_text(&mut result, &text)?;
+            first = false;
+        }
+        Ok(())
+    };
+    for value in &args[2..] {
+        match value {
+            Value::Array(values) => {
+                for value in values {
+                    function_try!(append(value));
                 }
             }
-            Value::Empty if ignore_empty => {}
-            v => {
-                if let Ok(s) = v.as_string() {
-                    parts.push(s);
-                }
-            }
+            value => function_try!(append(value)),
         }
     }
-    Value::String(parts.join(&delim))
+    Value::String(result)
 }
 
 fn concat_fn(
@@ -2799,13 +2951,13 @@ fn concat_fn(
             Value::Array(arr) => {
                 for item in arr {
                     if let Ok(s) = item.as_string() {
-                        result.push_str(&s);
+                        function_try!(push_bounded_text(&mut result, &s));
                     }
                 }
             }
             v => {
                 if let Ok(s) = v.as_string() {
-                    result.push_str(&s);
+                    function_try!(push_bounded_text(&mut result, &s));
                 }
             }
         }
@@ -2946,10 +3098,10 @@ fn textafter_fn(
 // --- Date/time functions ---
 // Excel epoch: Jan 1, 1900 = 1. We use a simplified model.
 
-fn date_to_serial(year: i32, month: u32, day: u32) -> f64 {
+fn date_to_serial(year: i32, month: u32, day: u32) -> Result<f64, FormulaError> {
     // Days from 1900-01-01 (Excel epoch, day 1)
-    let mut y = year;
-    let mut m = month as i32;
+    let mut y = i64::from(year);
+    let mut m = i64::from(month);
     if m < 1 {
         m = 1;
     }
@@ -2957,7 +3109,13 @@ fn date_to_serial(year: i32, month: u32, day: u32) -> f64 {
         y += (m - 1) / 12;
         m = ((m - 1) % 12) + 1;
     }
-    // Count days from 1900-01-01 to (year, month, day)
+    if !(1900..=9999).contains(&y) {
+        return Err(FormulaError::NumError(
+            "date year must be between 1900 and 9999".into(),
+        ));
+    }
+    let y = y as i32;
+    // At most 8,099 iterations after validating the normalized year.
     let mut days: f64 = 0.0;
     for yr in 1900..y {
         days += if is_leap_year(yr) { 366.0 } else { 365.0 };
@@ -2980,14 +3138,22 @@ fn date_to_serial(year: i32, month: u32, day: u32) -> f64 {
         days += dim as f64;
     }
     days += day as f64;
-    days
+    if !(0.0..=MAX_DATE_SERIAL).contains(&days) {
+        return Err(FormulaError::NumError("date exceeds year 9999".into()));
+    }
+    Ok(days)
 }
 
 fn is_leap_year(y: i32) -> bool {
     (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
 }
 
-fn serial_to_date(serial: f64) -> (i32, u32, u32) {
+fn serial_to_date(serial: f64) -> Result<(i32, u32, u32), FormulaError> {
+    if !serial.is_finite() || !(0.0..MAX_DATE_SERIAL + 1.0).contains(&serial) {
+        return Err(FormulaError::NumError(
+            "date serial must be between 0 and year 9999".into(),
+        ));
+    }
     let serial = serial.floor() as i64;
     let mut remaining = serial;
     let mut year = 1900;
@@ -3021,7 +3187,7 @@ fn serial_to_date(serial: f64) -> (i32, u32, u32) {
         remaining -= dim;
         month += 1;
     }
-    (year, month, remaining as u32)
+    Ok((year, month, remaining as u32))
 }
 
 fn date_fn(
@@ -3047,7 +3213,7 @@ fn date_fn(
         Ok(n) => n as u32,
         Err(e) => return Value::Error(e),
     };
-    Value::Number(date_to_serial(y, m, d))
+    Value::Number(function_try!(date_to_serial(y, m, d)))
 }
 
 fn time_fn(
@@ -3109,7 +3275,7 @@ fn year_fn(
     }
     match args[0].as_number() {
         Ok(serial) => {
-            let (y, _, _) = serial_to_date(serial);
+            let (y, _, _) = function_try!(serial_to_date(serial));
             Value::Number(y as f64)
         }
         Err(e) => Value::Error(e),
@@ -3128,7 +3294,7 @@ fn month_fn(
     }
     match args[0].as_number() {
         Ok(serial) => {
-            let (_, m, _) = serial_to_date(serial);
+            let (_, m, _) = function_try!(serial_to_date(serial));
             Value::Number(m as f64)
         }
         Err(e) => Value::Error(e),
@@ -3142,7 +3308,7 @@ fn day_fn(args: &[Value], _: &dyn CellProvider, _: &mut HashSet<(u32, u32)>, _: 
     }
     match args[0].as_number() {
         Ok(serial) => {
-            let (_, _, d) = serial_to_date(serial);
+            let (_, _, d) = function_try!(serial_to_date(serial));
             Value::Number(d as f64)
         }
         Err(e) => Value::Error(e),
@@ -3270,8 +3436,8 @@ fn weeknum_fn(
         Ok(n) => n,
         Err(e) => return Value::Error(e),
     };
-    let (year, _, _) = serial_to_date(serial);
-    let jan1_serial = date_to_serial(year, 1, 1);
+    let (year, _, _) = function_try!(serial_to_date(serial));
+    let jan1_serial = function_try!(date_to_serial(year, 1, 1));
     let diff = serial - jan1_serial;
     Value::Number((diff / 7.0).ceil() + 1.0)
 }
@@ -3299,7 +3465,7 @@ fn datevalue_fn(
             parts[1].parse::<u32>(),
             parts[2].parse::<u32>(),
         ) {
-            return Value::Number(date_to_serial(y, m, d));
+            return Value::Number(function_try!(date_to_serial(y, m, d)));
         }
     }
     Value::Error(FormulaError::ValueError(
@@ -3357,8 +3523,11 @@ fn edate_fn(
         Ok(n) => n as i32,
         Err(e) => return Value::Error(e),
     };
-    let (y, m, d) = serial_to_date(serial);
-    let total_months = (y * 12 + m as i32 - 1) + months;
+    let (y, m, d) = function_try!(serial_to_date(serial));
+    let total_months = match (y * 12 + m as i32 - 1).checked_add(months) {
+        Some(total) => total,
+        None => return Value::Error(FormulaError::NumError("month offset overflow".into())),
+    };
     let new_year = total_months.div_euclid(12);
     let new_month = total_months.rem_euclid(12) as u32 + 1;
     let month_days = [
@@ -3376,7 +3545,7 @@ fn edate_fn(
         31,
     ];
     let new_day = d.min(month_days[new_month as usize - 1]);
-    Value::Number(date_to_serial(new_year, new_month, new_day))
+    Value::Number(function_try!(date_to_serial(new_year, new_month, new_day)))
 }
 
 fn eomonth_fn(
@@ -3398,8 +3567,11 @@ fn eomonth_fn(
         Ok(n) => n as i32,
         Err(e) => return Value::Error(e),
     };
-    let (y, m, _) = serial_to_date(serial);
-    let total_months = (y * 12 + m as i32 - 1) + months;
+    let (y, m, _) = function_try!(serial_to_date(serial));
+    let total_months = match (y * 12 + m as i32 - 1).checked_add(months) {
+        Some(total) => total,
+        None => return Value::Error(FormulaError::NumError("month offset overflow".into())),
+    };
     let new_year = total_months.div_euclid(12);
     let new_month = total_months.rem_euclid(12) as u32 + 1;
     let month_days = [
@@ -3416,11 +3588,11 @@ fn eomonth_fn(
         30,
         31,
     ];
-    Value::Number(date_to_serial(
+    Value::Number(function_try!(date_to_serial(
         new_year,
         new_month,
         month_days[new_month as usize - 1],
-    ))
+    )))
 }
 
 fn datedif_fn(
@@ -3446,8 +3618,8 @@ fn datedif_fn(
         Ok(s) => s.to_uppercase(),
         Err(e) => return Value::Error(e),
     };
-    let (sy, sm, sd) = serial_to_date(start);
-    let (ey, em, ed) = serial_to_date(end);
+    let (sy, sm, sd) = function_try!(serial_to_date(start));
+    let (ey, em, ed) = function_try!(serial_to_date(end));
     match unit.as_str() {
         "D" => Value::Number(end - start),
         "M" => {
@@ -3516,8 +3688,8 @@ fn isoweeknum_fn(
         Ok(n) => n,
         Err(e) => return Value::Error(e),
     };
-    let (year, _, _) = serial_to_date(serial);
-    let jan1_serial = date_to_serial(year, 1, 1);
+    let (year, _, _) = function_try!(serial_to_date(serial));
+    let jan1_serial = function_try!(date_to_serial(year, 1, 1));
     let diff = serial - jan1_serial;
     Value::Number((diff / 7.0).ceil() + 1.0)
 }
@@ -4021,6 +4193,11 @@ fn ddb_fn(args: &[Value], _: &dyn CellProvider, _: &mut HashSet<(u32, u32)>, _: 
     } else {
         2.0
     };
+    if !period.is_finite() || period < 0.0 || period > MAX_FUNCTION_ITERATIONS as f64 {
+        return Value::Error(FormulaError::NumError(format!(
+            "DDB period must be between 0 and {MAX_FUNCTION_ITERATIONS}"
+        )));
+    }
     let rate = factor / life;
     let mut book = cost;
     for _ in 1..period as i32 {
@@ -4277,6 +4454,225 @@ mod tests {
         let evaluator = Evaluator::new();
         let expr = Parser::parse_formula(formula).unwrap();
         evaluator.evaluate(&expr, provider)
+    }
+
+    #[test]
+    fn integer_function_extremes_return_errors_without_panics() {
+        let provider = SimpleProvider::new();
+        for formula in [
+            "GCD(-1e20,1)",
+            "GCD(1e20,1)",
+            "LCM(-1e20,1)",
+            "LCM(1000000000000,1000000000001)",
+            "RANDBETWEEN(-1e20,1e20)",
+        ] {
+            assert!(
+                matches!(
+                    eval(formula, &provider),
+                    Value::Error(FormulaError::NumError(_))
+                ),
+                "{formula}"
+            );
+        }
+        assert_eq!(eval("GCD(0,12,18)", &provider), Value::Number(6.0));
+        assert_eq!(eval("LCM(0,12,18)", &provider), Value::Number(0.0));
+        assert_eq!(eval("LCM(12,18)", &provider), Value::Number(36.0));
+        assert_eq!(eval("RANDBETWEEN(2,2)", &provider), Value::Number(2.0));
+        assert!(
+            matches!(eval("RANDBETWEEN(-9000000000000000000,9000000000000000000)", &provider), Value::Number(n) if n.is_finite() && (-9e18..=9e18).contains(&n))
+        );
+    }
+
+    #[test]
+    fn oversized_text_functions_reject_before_allocating_output() {
+        let provider = SimpleProvider::new();
+        for formula in [
+            "REPT(\"x\",1e12)",
+            "REPT(\"xx\",9e18)",
+            "REPT(\"é\",524289)",
+            "SUBSTITUTE(REPT(\"x\",1024),\"x\",REPT(\"y\",2048))",
+            "CONCAT(REPT(\"x\",1048576),\"y\")",
+            "CONCATENATE(REPT(\"x\",1048576),\"y\")",
+            "TEXTJOIN(\"--\",FALSE,REPT(\"x\",1048575),\"y\")",
+            "REPLACE(REPT(\"x\",1048576),1,0,\"y\")",
+        ] {
+            assert!(
+                matches!(
+                    eval(formula, &provider),
+                    Value::Error(FormulaError::ValueError(_))
+                ),
+                "{formula}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_function_boundaries_preserve_unicode_and_empty_results() {
+        let provider = SimpleProvider::new();
+        assert_eq!(
+            eval("LEN(REPT(\"é\",524288))", &provider),
+            Value::Number(524288.0)
+        );
+        assert_eq!(
+            eval("REPT(\"\",1e12)", &provider),
+            Value::String(String::new())
+        );
+        assert_eq!(
+            eval("REPT(\"x\",0)", &provider),
+            Value::String(String::new())
+        );
+        assert_eq!(
+            eval("REPT(\"x\",2.9)", &provider),
+            Value::String("xx".into())
+        );
+        assert_eq!(
+            eval("SUBSTITUTE(\"ééé\",\"é\",\"猫\",2)", &provider),
+            Value::String("é猫é".into())
+        );
+        assert_eq!(
+            eval("SUBSTITUTE(\"aaa\",\"a\",\"xx\",4)", &provider),
+            Value::String("aaa".into())
+        );
+        assert_eq!(
+            eval("REPLACE(\"a猫c\",2,1,\"é\")", &provider),
+            Value::String("aéc".into())
+        );
+        assert_eq!(
+            eval("MID(\"abc\",2,1e308)", &provider),
+            Value::String("bc".into())
+        );
+        assert_eq!(
+            eval("MID(\"abc\",1e308,1e308)", &provider),
+            Value::String(String::new())
+        );
+        assert_eq!(
+            eval("REPLACE(\"abc\",1e308,1e308,\"z\")", &provider),
+            Value::String("abcz".into())
+        );
+    }
+
+    #[test]
+    fn numeric_work_limits_reject_huge_inputs() {
+        let provider = SimpleProvider::new();
+        for formula in [
+            "FACT(1e12)",
+            "FACTDOUBLE(1e12)",
+            "COMBIN(1e12,5e11)",
+            "PERMUT(1e12,1e12)",
+            "MULTINOMIAL(1e12,1e12)",
+            "COMBINA(1e12,1e12)",
+            "PERMUTA(1,1e12)",
+            "PERMUTATIONA(1,10001)",
+            "DDB(100,0,1e12,1e12)",
+            "FIXED(1,1e12)",
+            "FIXED(1,1001)",
+            "FACT(-1)",
+            "COMBIN(-1,1)",
+            "MULTINOMIAL(-1,2)",
+            "PERMUTA(0,1)",
+            "COMBINA(1e308,1)",
+        ] {
+            assert!(
+                matches!(
+                    eval(formula, &provider),
+                    Value::Error(FormulaError::NumError(_))
+                ),
+                "{formula}"
+            );
+        }
+    }
+
+    #[test]
+    fn factorial_and_fixed_normal_boundaries_remain_supported() {
+        let provider = SimpleProvider::new();
+        assert!(
+            matches!(eval("FACT(170.9)", &provider), Value::Number(n) if n.is_finite() && n > 7e306)
+        );
+        assert!(matches!(
+            eval("FACT(171)", &provider),
+            Value::Error(FormulaError::NumError(_))
+        ));
+        assert!(matches!(eval("FACTDOUBLE(300)", &provider), Value::Number(n) if n.is_finite()));
+        assert!(matches!(
+            eval("FACTDOUBLE(301)", &provider),
+            Value::Error(FormulaError::NumError(_))
+        ));
+        assert_eq!(eval("LEN(FIXED(1,1000))", &provider), Value::Number(1002.0));
+        assert!(
+            matches!(eval("DDB(100,0,1e12,10000)", &provider), Value::Number(n) if n.is_finite() && n > 0.0)
+        );
+    }
+
+    #[test]
+    fn combinatorial_fast_paths_and_repetition_counts_are_correct() {
+        let provider = SimpleProvider::new();
+        for (formula, expected) in [
+            ("COMBIN(1e12,1e12)", 1.0),
+            ("COMBIN(1e12,1)", 1e12),
+            ("MULTINOMIAL(1e12)", 1.0),
+            ("MULTINOMIAL(1e12,1)", 1e12 + 1.0),
+            ("MULTINOMIAL(2,3,4)", 1260.0),
+            ("COMBINA(1,1e12)", 1.0),
+            ("COMBINA(4,3)", 20.0),
+            ("PERMUTA(3,2)", 9.0),
+            ("PERMUTATIONA(3,2)", 9.0),
+            ("PERMUTATIONA(2,2)", 4.0),
+            ("PERMUTATIONA(3.9,2.9)", 9.0),
+            ("PERMUTATIONA(1,10000)", 1.0),
+        ] {
+            assert_eq!(
+                eval(formula, &provider),
+                Value::Number(expected),
+                "{formula}"
+            );
+        }
+    }
+
+    #[test]
+    fn date_resource_bounds_cover_all_conversion_entry_points() {
+        let provider = SimpleProvider::new();
+        for formula in [
+            "DATE(1e12,1,1)",
+            "DATE(9999,13,1)",
+            "DATE(9999,12,32)",
+            "DATE(2024,1e12,1)",
+            "DATEVALUE(\"2147483647-1-1\")",
+            "YEAR(1e12)",
+            "MONTH(1e12)",
+            "DAY(1e12)",
+            "WEEKNUM(1e12)",
+            "ISOWEEKNUM(1e12)",
+            "EDATE(1e12,1)",
+            "EOMONTH(1e12,1)",
+            "EDATE(45000,1e12)",
+            "EOMONTH(45000,1e12)",
+            "DATEDIF(1,1e12,\"Y\")",
+            "TEXT(1e308,\"yyyy-mm-dd\")",
+        ] {
+            assert!(
+                matches!(
+                    eval(formula, &provider),
+                    Value::Error(FormulaError::NumError(_))
+                ),
+                "{formula}"
+            );
+        }
+        assert_eq!(
+            eval("DATE(9999,12,31)", &provider),
+            Value::Number(MAX_DATE_SERIAL)
+        );
+        assert_eq!(
+            eval("YEAR(DATE(9999,12,31))", &provider),
+            Value::Number(9999.0)
+        );
+        assert_eq!(
+            eval("DAY(DATE(9999,12,31))", &provider),
+            Value::Number(31.0)
+        );
+        assert_eq!(
+            eval("YEAR(DATE(1900,1,1))", &provider),
+            Value::Number(1900.0)
+        );
     }
 
     #[test]

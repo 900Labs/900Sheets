@@ -26,6 +26,7 @@
   import { APP_LOCALES, isAppLocale, translate, type AppLocale } from './lib/utils/locale'
   import { MutationQueue } from './lib/utils/mutationQueue.js'
   import { RecoveryAutosave } from './lib/utils/recoveryAutosave.js'
+  import { rebaseCopiedFormula, structuralMetadataBlockers } from './lib/utils/clipboard.js'
   import {
     STARTER_TEMPLATES,
     FIRST_RUN_STEPS,
@@ -51,6 +52,7 @@
   let activeSheetStableId: string = $state('')
   let cellContents: Record<string, string> = $state({})
   let cellDisplays: Record<string, string> = $state({})
+  let cellNumericValues: Record<string, { source: string; value: number | null }> = $state({})
   let selectedRow: number = $state(0)
   let selectedCol: number = $state(0)
   let selectionStart: { row: number; col: number } = $state({ row: 0, col: 0 })
@@ -61,7 +63,7 @@
   let formulaBarValue: string = $state('')
   let formulaBarDraftDirty: boolean = $state(false)
   let isSelecting: boolean = $state(false)
-  let clipboard: ClipboardData | null = null
+  let clipboard: (ClipboardData & { sheetStableId: string; sessionGeneration: number; text: string }) | null = null
   let renamingSheetId: number | null = $state(null)
   let renameValue: string = $state('')
   let canUndo: boolean = $state(false)
@@ -113,6 +115,25 @@
     return globalThis.crypto?.randomUUID?.() ?? `session-${Date.now()}-${Math.random().toString(36).slice(2)}`
   }
   let cellFormats: CellFormatMap = $state({})
+  const selectedFormat = $derived(cellFormats[cellKey(selectedRow, selectedCol)] ?? {})
+  const numberFormats = [
+    { value: '', label: 'General' },
+    { value: '#,##0', label: 'Number' },
+    { value: '#,##0.00', label: 'Number · 2 decimals' },
+    { value: '$#,##0.00', label: 'Currency · USD ($)' },
+    { value: '0%', label: 'Percentage' },
+    { value: '0.00%', label: 'Percentage · 2 decimals' },
+    { value: 'yyyy-mm-dd', label: 'Date · YYYY-MM-DD' },
+    { value: 'mm/dd/yyyy', label: 'Date · MM/DD/YYYY' },
+    { value: 'hh:mm', label: 'Time · HH:MM' },
+  ]
+  const hasUnsavedDraft = $derived(
+    (editingCell !== null && editValue !== (cellContents[editingCell] ?? ''))
+    || (formulaBarDraftDirty && formulaBarValue !== (cellContents[cellKey(selectedRow, selectedCol)] ?? ''))
+  )
+  const documentSaveLabel = $derived(saveInProgress ? 'Saving…'
+    : isDirty || hasUnsavedDraft ? 'Unsaved changes'
+      : currentFilePath ? 'Saved to this computer' : 'Not saved yet')
   type MenuKey = 'file' | 'edit' | 'view' | 'insert' | 'format' | 'data' | 'tools' | 'help'
   type ToolbarMenuKey = 'data' | 'analyze' | 'output'
   type PanelKey =
@@ -440,7 +461,7 @@
   let locale: AppLocale = $state('en')
 
   const FORMULA_FUNCTIONS: Record<string, string[]> = {
-    Math: ['SUM', 'AVERAGE', 'MIN', 'MAX', 'COUNT', 'COUNTA', 'PRODUCT', 'ABS', 'ROUND', 'ROUNDUP', 'ROUNDDOWN', 'FLOOR', 'CEILING', 'MOD', 'POWER', 'SQRT', 'SQRTPI', 'INT', 'EXP', 'LN', 'LOG10', 'LOG', 'LOG2', 'PI', 'RAND', 'RANDBETWEEN', 'SIGN', 'TRUNC', 'QUOTIENT', 'GCD', 'LCM', 'COMBIN', 'COMBINA', 'PERMUT', 'PERMUTA', 'FACT', 'FACTDOUBLE', 'MROUND', 'MULTINOMIAL', 'SERIESSUM'],
+    Math: ['SUM', 'AVERAGE', 'MIN', 'MAX', 'COUNT', 'COUNTA', 'PRODUCT', 'ABS', 'ROUND', 'ROUNDUP', 'ROUNDDOWN', 'FLOOR', 'CEILING', 'MOD', 'POWER', 'SQRT', 'SQRTPI', 'INT', 'EXP', 'LN', 'LOG10', 'LOG', 'LOG2', 'PI', 'RAND', 'RANDBETWEEN', 'SIGN', 'TRUNC', 'QUOTIENT', 'GCD', 'LCM', 'COMBIN', 'COMBINA', 'PERMUT', 'PERMUTA', 'PERMUTATIONA', 'FACT', 'FACTDOUBLE', 'MROUND', 'MULTINOMIAL', 'SERIESSUM'],
     Trig: ['SIN', 'COS', 'TAN', 'ASIN', 'ACOS', 'ATAN', 'ATAN2', 'DEGREES', 'RADIANS', 'SINH', 'COSH', 'TANH', 'ASINH', 'ACOSH', 'ATANH'],
     Statistical: ['MEDIAN', 'MODE', 'STDEV', 'STDEVP', 'VAR', 'VARP', 'LARGE', 'SMALL', 'RANK', 'PERCENTILE', 'QUARTILE', 'PERCENTRANK', 'FORECAST', 'SLOPE', 'INTERCEPT', 'CORREL', 'COVAR', 'AVERAGEIF'],
     Logical: ['IF', 'AND', 'OR', 'NOT', 'TRUE', 'FALSE', 'IFERROR', 'IFNA', 'XOR'],
@@ -723,7 +744,7 @@
     let max = Number.NEGATIVE_INFINITY
     if (r.startRow === r.endRow && r.startCol === r.endCol) {
       const raw = cellContents[cellKey(r.startRow, r.startCol)]
-      const value = raw == null || raw === '' ? Number.NaN : Number(raw)
+      const value = cellNumericValue(cellKey(r.startRow, r.startCol))
       return {
         count: raw == null || raw === '' ? 0 : 1,
         numericCount: Number.isFinite(value) ? 1 : 0,
@@ -738,7 +759,7 @@
       const { row, col } = parseCellKey(key)
       if (!rangeContains(r, row, col)) continue
       count += 1
-      const value = Number(raw)
+      const value = cellNumericValue(key)
       if (Number.isFinite(value)) {
         numericCount += 1
         sum += value
@@ -1100,6 +1121,7 @@
       activeSheetId = 0
       cellContents = {}
       cellDisplays = {}
+      cellNumericValues = {}
     }
   }
 
@@ -1118,6 +1140,7 @@
     changes: Array<{ row: number; col: number; value: string }>,
     context: string,
     successMessage?: string,
+    moveSource?: { cells: Array<{ row: number; col: number; value: string }>; stableSheetId: string },
   ): Promise<boolean> {
     const byKey = new Map<string, { row: number; col: number; value: string }>()
     for (const change of changes) {
@@ -1152,8 +1175,11 @@
     markDirty()
 
     try {
+      const sheetId = activeSheetId
       await runWorkbookTransaction(() =>
-        invoke('batch_set_cells', { sheetId: activeSheetId, changes: backendChanges })
+        moveSource
+          ? invoke('move_cells', { sheetId, source: moveSource.cells, sourceStableSheetId: moveSource.stableSheetId, changes: backendChanges })
+          : invoke('batch_set_cells', { sheetId, changes: backendChanges })
       )
       await refreshSheetData()
       if (successMessage) setStatus(successMessage)
@@ -1198,6 +1224,27 @@
     return cellDisplays[cellKey(row, col)] ?? ''
   }
 
+  function cellNumericValue(key: string): number {
+    const source = cellContents[key] ?? ''
+    const evaluated = cellNumericValues[key]
+    if (evaluated && evaluated.source === source) return evaluated.value ?? Number.NaN
+    if (source.trim() === '' || source.startsWith('=')) return Number.NaN
+    const value = Number(source)
+    return Number.isFinite(value) ? value : Number.NaN
+  }
+
+  function numericValuesFromCells(data: CellData[]): Record<string, { source: string; value: number | null }> {
+    const values: Record<string, { source: string; value: number | null }> = {}
+    for (const cell of data) {
+      if (cell.numeric_value === undefined) continue
+      values[cellKey(cell.row, cell.col)] = {
+        source: cell.value,
+        value: typeof cell.numeric_value === 'number' && Number.isFinite(cell.numeric_value) ? cell.numeric_value : null,
+      }
+    }
+    return values
+  }
+
   function cellAccessibleName(row: number, col: number): string {
     const state = selectedRow === row && selectedCol === col ? translate(locale, 'selected') : translate(locale, 'notSelected')
     return `${cellKey(row, col)}, ${getCellDisplay(row, col) || translate(locale, 'blank')}, ${state}`
@@ -1231,7 +1278,9 @@
     if (fmt.font_size) styles.push(`font-size: ${fmt.font_size}px`)
     if (fmt.font_color) styles.push(`color: ${fmt.font_color}`)
     if (fmt.bg_color) styles.push(`background: ${fmt.bg_color}`)
-    if (fmt.h_align) styles.push(`text-align: ${fmt.h_align === 'general' ? 'left' : fmt.h_align}`)
+    const alignment = fmt.h_align && fmt.h_align !== 'general' ? fmt.h_align
+      : Number.isFinite(cellNumericValue(cellKey(row, col))) ? 'right' : 'left'
+    styles.push(`text-align: ${alignment}`)
     return cssDecls([...styles, getFreezeStyle(row, col)])
   }
 
@@ -1289,6 +1338,7 @@
       await runWorkbookTransaction(() =>
         invoke('batch_set_formats', { sheetId: activeSheetId, changes })
       )
+      await refreshSheetData()
       markDirty()
     } catch (e) {
       setError(e, 'Failed to apply format')
@@ -1324,6 +1374,17 @@
     applyFormatToSelection({ number_format: format })
   }
 
+  function setSelectedFontSize(event: Event) {
+    const input = event.currentTarget as HTMLInputElement
+    const size = Number(input.value)
+    if (!Number.isFinite(size) || size < 8 || size > 72) {
+      input.value = String(selectedFormat.font_size ?? 13)
+      setStatus('Choose a font size from 8 to 72 pixels')
+      return
+    }
+    void applyFormatToSelection({ font_size: size })
+  }
+
   function increaseFontSize() {
     const fmt = getCellFormat(selectedRow, selectedCol)
     const size = fmt.font_size ?? 13
@@ -1337,10 +1398,16 @@
   }
 
   async function handleSort(ascending: boolean) {
+    if (!commitActiveDrafts()) return
     const r = normalizeRange(currentRange)
+    const sheetId = activeSheetId
+    const stableId = activeSheetStableId
+    const generation = sessionGeneration
     try {
+      await flushPendingMutations()
+      if (stableId !== activeSheetStableId || generation !== sessionGeneration) return
       await runWorkbookTransaction(() => invoke('sort_data', {
-        sheetId: activeSheetId,
+        sheetId,
         range: {
           sort_col: r.startCol,
           start_row: r.startRow,
@@ -1590,24 +1657,17 @@
     showGridlines = state?.showGridlines ?? true
   }
 
-  function clearActiveCoordinateMetadata() {
-    validationRules = []
-    conditionalRules = []
-    namedRanges = []
-    tables = []
-    charts = []
-    conditionalMatches = []
-    validationResults = []
-    frozenRowCount = 0
-    frozenColCount = 0
-    hiddenRows = {}
-    activeFilterLabel = ''
-    chartSvg = ''
-    resetCommentPanelState()
-    saveActiveSheetFeatureState()
+  function assertStructuralMetadataSupported() {
+    const blockers = structuralMetadataBlockers(currentSheetFeatureState())
+    if (blockers.length > 0) {
+      throw new Error(`This sheet uses ${blockers.join(', ')}. Row and column edits cannot preserve these features yet. Remove the affected features explicitly, or work in a separate sheet.`)
+    }
   }
 
   function resetWorkbookSessionState(options: { clearComments?: boolean } = {}) {
+    canUndo = false
+    canRedo = false
+    clipboard = null
     hiddenRows = {}
     activeFilterLabel = ''
     namedRanges = []
@@ -1747,6 +1807,7 @@
       cellContents = contents
       cellDisplays = displays
       cellFormats = formats
+      cellNumericValues = numericValuesFromCells(data)
     } catch (e) {
       console.error('Failed to refresh sheet data:', e)
     }
@@ -1790,9 +1851,19 @@
     }
   }
 
-  function copySelection(isCut: boolean = false) {
+  async function copySelection(isCut: boolean = false) {
+    if (!commitActiveDrafts()) return
     const r = normalizeRange(currentRange)
     if (!allowDenseRange(r, isCut ? 'Cut selection' : 'Copy selection')) return
+    const sourceStableId = activeSheetStableId
+    const sourceGeneration = sessionGeneration
+    try {
+      await flushPendingMutations()
+    } catch (error) {
+      setError(error, 'Unable to copy cells')
+      return
+    }
+    if (sourceStableId !== activeSheetStableId || sourceGeneration !== sessionGeneration) return
     const size = rangeSize(r)
     const cells: string[][] = []
     for (let row = 0; row < size.rows; row++) {
@@ -1802,87 +1873,94 @@
       }
       cells.push(rowData)
     }
-    clipboard = { range: r, cells, isCut }
-
     const tsv = cells.map((row) => row.join('\t')).join('\n')
-    navigator.clipboard.writeText(tsv).catch(() => {})
-
-    if (isCut) {
-      const changes = Object.keys(cellContents).flatMap((key) => {
-        const { row, col } = parseCellKey(key)
-        return rangeContains(r, row, col) ? [{ row, col, value: '' }] : []
-      })
-      void applyCellValueChanges(changes, 'Unable to cut cells', `Cut ${changes.length} cell${changes.length === 1 ? '' : 's'}`)
-    }
+    clipboard = { range: r, cells, isCut, sheetStableId: sourceStableId, sessionGeneration: sourceGeneration, text: tsv }
+    void navigator.clipboard?.writeText(tsv).catch(() => {})
+    setStatus(isCut ? 'Cut ready. Source cells stay in place until a successful paste in this sheet.' : `Copied ${rangeLabel(r)}`)
   }
 
-  function pasteFromClipboard() {
-    if (!clipboard) return
-    const clipboardArea = clipboard.cells.reduce((total, row) => total + row.length, 0)
+  async function pasteCells(cells: string[][], destination: CellRange, source: typeof clipboard = null) {
+    const clipboardArea = cells.reduce((total, row) => total + row.length, 0)
     if (clipboardArea > MAX_DENSE_SELECTION_CELLS) {
       setError(`Paste is limited to ${MAX_DENSE_SELECTION_CELLS.toLocaleString()} cells at a time.`, 'Paste unavailable')
       return
     }
-    const r = normalizeRange(currentRange)
+    const r = normalizeRange(destination)
+    const destinationStableId = activeSheetStableId
+    const destinationGeneration = sessionGeneration
     const changes: Array<{ row: number; col: number; value: string }> = []
-    for (let row = 0; row < clipboard.cells.length; row++) {
-      for (let col = 0; col < clipboard.cells[row].length; col++) {
-        const targetRow = r.startRow + row
-        const targetCol = r.startCol + col
-        if (targetRow >= ROWS || targetCol >= COLS) continue
-        const key = cellKey(targetRow, targetCol)
-        const oldValue = cellContents[key] ?? ''
-        const newValue = clipboard.cells[row][col]
-        const validationError = validationMessageForValue(targetRow, targetCol, newValue)
-        if (validationError) {
-          setError(validationError, 'Paste skipped invalid cell')
-          continue
-        }
-        if (oldValue !== newValue) {
-          changes.push({ row: targetRow, col: targetCol, value: newValue })
-        }
-      }
-    }
-    void applyCellValueChanges(changes, 'Unable to paste cells', `Pasted ${changes.length} cell${changes.length === 1 ? '' : 's'}`)
-  }
-
-  async function pasteFromSystemClipboard() {
     try {
-      const text = await navigator.clipboard.readText()
-      if (!text) return
-      const rows = text.split('\n')
-      if (rows.length > 0 && rows[rows.length - 1] === '') {
-        rows.pop()
+      if (source?.isCut) {
+        if (source.sheetStableId !== destinationStableId || source.sessionGeneration !== destinationGeneration) {
+          throw new Error('Cut can move cells only within the original sheet and workbook. Use Copy to transfer cells between sheets.')
+        }
+        if (await invoke<boolean>('workbook_has_formulas')) {
+          throw new Error('Cut cannot preserve formula dependencies yet. This workbook contains formulas; use Copy instead. Source cells have been kept.')
+        }
+        if (destinationStableId !== activeSheetStableId || destinationGeneration !== sessionGeneration) return
+        for (let row = 0; row < cells.length; row++) {
+          for (let col = 0; col < cells[row].length; col++) {
+            const sourceRow = source.range.startRow + row
+            const sourceCol = source.range.startCol + col
+            if (getCellValue(sourceRow, sourceCol) !== cells[row][col]) {
+              throw new Error('The cut source changed. Cut the selection again before pasting; source cells have been kept.')
+            }
+            const validationError = validationMessageForValue(sourceRow, sourceCol, '')
+            if (validationError) throw new Error(validationError)
+            changes.push({ row: sourceRow, col: sourceCol, value: '' })
+          }
+        }
       }
-      const cells = rows.map((r) => r.split('\t'))
-      const clipboardArea = cells.reduce((total, row) => total + row.length, 0)
-      if (clipboardArea > MAX_DENSE_SELECTION_CELLS) {
-        setError(`Paste is limited to ${MAX_DENSE_SELECTION_CELLS.toLocaleString()} cells at a time.`, 'Paste unavailable')
-        return
-      }
-      const r = normalizeRange(currentRange)
-      const changes: Array<{ row: number; col: number; value: string }> = []
       for (let row = 0; row < cells.length; row++) {
         for (let col = 0; col < cells[row].length; col++) {
           const targetRow = r.startRow + row
           const targetCol = r.startCol + col
-          if (targetRow >= ROWS || targetCol >= COLS) continue
-          const key = cellKey(targetRow, targetCol)
-          const oldValue = cellContents[key] ?? ''
-          const newValue = cells[row][col]
+          if (targetRow >= ROWS || targetCol >= COLS) {
+            throw new Error('The complete paste must fit inside the sheet. Choose an earlier destination cell.')
+          }
+          const newValue = source && !source.isCut
+            ? rebaseCopiedFormula(cells[row][col], r.startRow - source.range.startRow, r.startCol - source.range.startCol)
+            : cells[row][col]
           const validationError = validationMessageForValue(targetRow, targetCol, newValue)
-          if (validationError) {
-            setError(validationError, 'Paste skipped invalid cell')
-            continue
-          }
-          if (oldValue !== newValue) {
-            changes.push({ row: targetRow, col: targetCol, value: newValue })
-          }
+          if (validationError) throw new Error(validationError)
+          // Destination writes follow source clears so overlapping moves are safe.
+          changes.push({ row: targetRow, col: targetCol, value: newValue })
         }
       }
-      await applyCellValueChanges(changes, 'Unable to paste cells', `Pasted ${changes.length} cell${changes.length === 1 ? '' : 's'}`)
-    } catch {
-      pasteFromClipboard()
+      const moveSource = source?.isCut
+        ? { cells: cells.flatMap((values, row) => values.map((value, col) => ({ row: source.range.startRow + row, col: source.range.startCol + col, value }))), stableSheetId: source.sheetStableId }
+        : undefined
+      const pasted = await applyCellValueChanges(changes, 'Unable to paste cells', `${source?.isCut ? 'Moved' : 'Pasted'} ${clipboardArea} cell${clipboardArea === 1 ? '' : 's'}`, moveSource)
+      if (pasted && source?.isCut && clipboard === source) clipboard = null
+    } catch (error) {
+      setError(error, 'Paste unavailable; no cells changed')
+    }
+  }
+
+  async function pasteFromSystemClipboard() {
+    if (!commitActiveDrafts()) return
+    const destination = normalizeRange(currentRange)
+    const destinationStableId = activeSheetStableId
+    const destinationGeneration = sessionGeneration
+    try {
+      await flushPendingMutations()
+      let text: string | null = null
+      try {
+        text = await navigator.clipboard.readText()
+      } catch {
+        // Desktop WebViews may deny system clipboard access; retain local copy semantics.
+      }
+      if (destinationStableId !== activeSheetStableId || destinationGeneration !== sessionGeneration) return
+      if (clipboard && (text === null || text === clipboard.text)) {
+        await pasteCells(clipboard.cells, destination, clipboard)
+        return
+      }
+      if (!text) return
+      const rows = text.replace(/\r\n/g, '\n').split('\n')
+      if (rows[rows.length - 1] === '') rows.pop()
+      await pasteCells(rows.map((row) => row.split('\t')), destination)
+    } catch (error) {
+      setError(error, 'Unable to paste cells')
     }
   }
 
@@ -2236,6 +2314,7 @@
     cellContents = {}
     cellDisplays = {}
     cellFormats = {}
+    cellNumericValues = {}
     try {
       const data = await invoke<CellData[]>('get_sheet_data', { sheetId: id })
       if (generation !== sheetSelectionGeneration) return
@@ -2251,6 +2330,7 @@
       cellContents = contents
       cellDisplays = displays
       cellFormats = formats
+      cellNumericValues = numericValuesFromCells(data)
     } catch (e) {
       console.error('Failed to load sheet data:', e)
     }
@@ -2271,9 +2351,13 @@
 
   async function handleDeleteSheet(id: number) {
     if (sheets.length <= 1) return
+    if (!commitActiveDrafts()) return
     const previousActiveSheetId = activeSheetId
     const previousActiveStableId = activeSheetStableId
+    const generation = sessionGeneration
     try {
+      await flushPendingMutations()
+      if (previousActiveStableId !== activeSheetStableId || generation !== sessionGeneration) return
       saveActiveSheetFeatureState()
       const deletedStableId = String(sheets.find((sheet) => sheet.id === id)?.stable_id ?? '')
       const remaining = sheets.filter((sheet) => sheet.id !== id)
@@ -2400,6 +2484,10 @@
   }
 
   async function handleImportCsv() {
+    if (!commitActiveDrafts()) return
+    const sheetId = activeSheetId
+    const stableId = activeSheetStableId
+    const generation = sessionGeneration
     try {
       await recoveryAutosave.cancelAndWait()
       await flushPendingMutations()
@@ -2411,13 +2499,17 @@
         resumeRecoveryIfDirty()
         return
       }
+      if (stableId !== activeSheetStableId || generation !== sessionGeneration) {
+        resumeRecoveryIfDirty()
+        return
+      }
       const delimiter = path.toLowerCase().endsWith('.tsv') ? '\t' : ','
       const result = await runWorkbookTransaction(() => invoke<SheetInfo[]>('import_csv_file', {
         filePath: path,
         delimiter,
-        sheetId: activeSheetId,
+        sheetId,
       }))
-      await loadSheetList(result, activeSheetId)
+      await loadSheetList(result, sheetId)
       markDirty()
       setStatus(`Imported ${filename(path)}`)
     } catch (e) {
@@ -2847,9 +2939,15 @@
 
   async function runReplace() {
     if (!findQuery.trim()) return
+    if (!commitActiveDrafts()) return
+    const sheetId = activeSheetId
+    const stableId = activeSheetStableId
+    const generation = sessionGeneration
     try {
+      await flushPendingMutations()
+      if (stableId !== activeSheetStableId || generation !== sessionGeneration) return
       const count = await runWorkbookTransaction(() => invoke<number>('replace_in_sheet_cmd', {
-        sheetId: activeSheetId,
+        sheetId,
         find: findQuery,
         replace: replaceValue,
         matchCase: findMatchCase,
@@ -3054,13 +3152,23 @@
   }
 
   async function removeDuplicateRows() {
+    if (!commitActiveDrafts()) return
     const r = normalizeRange(currentRange)
+    const stableId = activeSheetStableId
+    const generation = sessionGeneration
     if (!allowDenseRange(r, 'Remove duplicates')) return
     if (r.endRow <= r.startRow) {
       setError('Select at least two rows before removing duplicates', 'Remove duplicates failed')
       return
     }
 
+    try {
+      await flushPendingMutations()
+      if (stableId !== activeSheetStableId || generation !== sessionGeneration) return
+    } catch (error) {
+      setError(error, 'Remove duplicates failed')
+      return
+    }
     const seen = new Set<string>()
     const keptRows: string[][] = []
     let duplicateCount = 0
@@ -3207,11 +3315,19 @@
 
   async function insertRowAbove() {
     const rowIndex = selectedRow
+    const sheetId = activeSheetId
+    const stableId = activeSheetStableId
+    const generation = sessionGeneration
     try {
+      assertStructuralMetadataSupported()
+      if (!commitActiveDrafts()) return
+      await flushPendingMutations()
+      if (stableId !== activeSheetStableId || generation !== sessionGeneration) return
       await runWorkbookTransaction(async () => {
-        await invoke('edit_sheet_structure', { sheetId: activeSheetId, operation: 'insert_row', index: rowIndex })
-        clearActiveCoordinateMetadata()
+        assertStructuralMetadataSupported()
+        await invoke('edit_sheet_structure', { sheetId, operation: 'insert_row', index: rowIndex })
       })
+      closeCommentPanelForContextChange()
       await refreshSheetData()
       markDirty()
       setStatus(`Inserted row above ${rowIndex + 1}`)
@@ -3223,11 +3339,19 @@
 
   async function deleteSelectedRow() {
     const rowIndex = selectedRow
+    const sheetId = activeSheetId
+    const stableId = activeSheetStableId
+    const generation = sessionGeneration
     try {
+      assertStructuralMetadataSupported()
+      if (!commitActiveDrafts()) return
+      await flushPendingMutations()
+      if (stableId !== activeSheetStableId || generation !== sessionGeneration) return
       await runWorkbookTransaction(async () => {
-        await invoke('edit_sheet_structure', { sheetId: activeSheetId, operation: 'delete_row', index: rowIndex })
-        clearActiveCoordinateMetadata()
+        assertStructuralMetadataSupported()
+        await invoke('edit_sheet_structure', { sheetId, operation: 'delete_row', index: rowIndex })
       })
+      closeCommentPanelForContextChange()
       await refreshSheetData()
       markDirty()
       setStatus(`Deleted row ${rowIndex + 1}`)
@@ -3239,11 +3363,19 @@
 
   async function insertColumnLeft() {
     const colIndex = selectedCol
+    const sheetId = activeSheetId
+    const stableId = activeSheetStableId
+    const generation = sessionGeneration
     try {
+      assertStructuralMetadataSupported()
+      if (!commitActiveDrafts()) return
+      await flushPendingMutations()
+      if (stableId !== activeSheetStableId || generation !== sessionGeneration) return
       await runWorkbookTransaction(async () => {
-        await invoke('edit_sheet_structure', { sheetId: activeSheetId, operation: 'insert_column', index: colIndex })
-        clearActiveCoordinateMetadata()
+        assertStructuralMetadataSupported()
+        await invoke('edit_sheet_structure', { sheetId, operation: 'insert_column', index: colIndex })
       })
+      closeCommentPanelForContextChange()
       await refreshSheetData()
       markDirty()
       setStatus(`Inserted column before ${colLabel(colIndex)}`)
@@ -3255,11 +3387,19 @@
 
   async function deleteSelectedColumn() {
     const colIndex = selectedCol
+    const sheetId = activeSheetId
+    const stableId = activeSheetStableId
+    const generation = sessionGeneration
     try {
+      assertStructuralMetadataSupported()
+      if (!commitActiveDrafts()) return
+      await flushPendingMutations()
+      if (stableId !== activeSheetStableId || generation !== sessionGeneration) return
       await runWorkbookTransaction(async () => {
-        await invoke('edit_sheet_structure', { sheetId: activeSheetId, operation: 'delete_column', index: colIndex })
-        clearActiveCoordinateMetadata()
+        assertStructuralMetadataSupported()
+        await invoke('edit_sheet_structure', { sheetId, operation: 'delete_column', index: colIndex })
       })
+      closeCommentPanelForContextChange()
       await refreshSheetData()
       markDirty()
       setStatus(`Deleted column ${colLabel(colIndex)}`)
@@ -3480,7 +3620,7 @@
     const text = raw.trim()
     switch (rule.condition_type) {
       case 'CellValue':
-        return compareConditionalNumber(Number(raw), rule)
+        return compareConditionalNumber(cellNumericValue(cellKey(row, col)), rule)
       case 'TextContains':
         return text.toLowerCase().includes((rule.value1 ?? '').toLowerCase())
       case 'TextNotContains':
@@ -3792,18 +3932,18 @@
         for (let index = 0; index < recoveries.length; index++) {
           const entry = recoveries[index]
           const restore = window.confirm(
-            `Restore recovery ${index + 1} of ${recoveries.length} from ${new Date(entry.modified_millis).toLocaleString()}?\n\nCancel discards this recovery and shows the next one.`
+            `Restore recovery ${index + 1} of ${recoveries.length} from ${new Date(entry.modified_millis).toLocaleString()}?\n\nCancel keeps this recovery for later and shows the next one. Manage saved recoveries in Tools > Recovery and Backups.`
           )
           if (restore) {
             if (!await prepareWorkbookReplacement(false)) continue
             try {
-              recoveryId = entry.id
               const result = await invoke<NativeOpenResult>('restore_recovery_snapshot', {
                 recoveryId: entry.id,
               })
               resetWorkbookSessionState({ clearComments: true })
               restoreNativeMetadata(result.metadata)
               await loadSheetList(result.sheets)
+              recoveryId = entry.id
               canUndo = false
               canRedo = false
               markDirty()
@@ -3816,7 +3956,6 @@
               endWorkbookReplacement()
             }
           }
-          await invoke('discard_recovery_snapshot', { recoveryId: entry.id })
         }
       }
     } catch (error) {
@@ -3915,8 +4054,28 @@
       </div>
     </div>
   {/if}
+  <header class="workbook-header" inert={replacementInProgress || closeInProgress} aria-hidden={replacementInProgress || closeInProgress}>
+    <div class="brand-lockup">
+      <svg class="app-mark" viewBox="0 0 28 28" fill="none" aria-hidden="true"><rect width="28" height="28" rx="6" fill="currentColor"/><path d="M7 8.5h14M7 14h14M7 19.5h14M12 8.5v11M18 8.5v11" stroke="white" stroke-width="1.5"/></svg>
+      <span class="app-title">900Sheets{isDirty ? ' •' : ''}</span>
+    </div>
+    <div class="workbook-identity">
+      <span class="workbook-name" title={currentFilePath ?? 'Save this workbook to choose a filename'}>{currentFilePath ? filename(currentFilePath) : 'Untitled workbook'}</span>
+      <span class="save-state" class:unsaved={isDirty || hasUnsavedDraft} role="status" aria-live="polite">{documentSaveLabel}</span>
+    </div>
+    <div class="document-actions">
+      <span class="local-indicator" title="Workbook processing stays on this computer. No account or connection is required."><span aria-hidden="true"></span>Local workspace</span>
+      <button type="button" class="document-btn" onclick={() => executeMenuAction('openNative')} title="Open 900Sheets workbook (Ctrl+O)">
+        <svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M2.5 5.5h5l2-2h4.8a1.2 1.2 0 0 1 1.2 1.2V8M2.5 5.5v10h13l2-7.5h-12l-3 7.5" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>
+        Open
+      </button>
+      <button type="button" class="document-btn save-btn" onclick={() => executeMenuAction('saveNative')} disabled={saveInProgress} title="Save workbook (Ctrl+S)">
+        <svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M3.5 3.5h11l2 2v11h-13zM6 3.5v5h7v-5M6 16.5v-5h8v5" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>
+        {saveInProgress ? 'Saving…' : 'Save'}
+      </button>
+    </div>
+  </header>
   <div class="toolbar" inert={replacementInProgress || closeInProgress} aria-hidden={replacementInProgress || closeInProgress}>
-    <span class="app-title">900Sheets{isDirty ? ' •' : ''}</span>
     <nav class="menu-bar" aria-label="Application menus">
       {#each MENU_DEFINITIONS as menu}
         <div class="menu-wrapper">
@@ -3924,6 +4083,8 @@
             type="button"
             class="toolbar-btn text"
             class:active={openMenu === menu.key}
+            aria-haspopup="menu"
+            aria-expanded={openMenu === menu.key}
             onclick={(e) => { e.stopPropagation(); toggleMenu(menu.key) }}
           >
             {menu.label}
@@ -3956,8 +4117,8 @@
     <div class="toolbar-divider"></div>
     <button type="button" class="toolbar-btn" onclick={doUndo} disabled={!canUndo} title="Undo (Ctrl+Z)">↶</button>
     <button type="button" class="toolbar-btn" onclick={doRedo} disabled={!canRedo} title="Redo (Ctrl+Y)">↷</button>
-    <div class="toolbar-status" class:error={!!errorMessage}>
-      {errorMessage || statusMessage}
+    <div class="toolbar-status" class:error={!!errorMessage} title={errorMessage || statusMessage || 'Ready'} role="status" aria-live="polite">
+      {errorMessage || statusMessage || 'Ready'}
     </div>
   </div>
 
@@ -3966,49 +4127,47 @@
   {/if}
 
   <div class="format-toolbar" inert={replacementInProgress || closeInProgress} aria-hidden={replacementInProgress || closeInProgress}>
-    <div class="ribbon-group">
+    <div class="ribbon-group" role="group" aria-label="Functions">
       <button type="button" class="fmt-btn fx-btn" onclick={(e) => { e.stopPropagation(); toggleFormulaMenu(e) }} title="Insert function">fx ▾</button>
       <button type="button" class="fmt-btn" onclick={() => openPanel('functions')} title="Function browser">Functions</button>
     </div>
-    <div class="fmt-divider"></div>
-    <div class="ribbon-group">
+    <div class="fmt-divider clipboard-divider"></div>
+    <div class="ribbon-group clipboard-group" role="group" aria-label="Clipboard">
       <button type="button" class="fmt-btn" onclick={() => copySelection(false)} title="Copy (Ctrl+C)">Copy</button>
       <button type="button" class="fmt-btn" onclick={() => pasteFromSystemClipboard()} title="Paste (Ctrl+V)">Paste</button>
     </div>
     <div class="fmt-divider"></div>
-    <div class="ribbon-group">
-      <button type="button" class="fmt-btn" onclick={toggleBold} title="Bold (Ctrl+B)"><b>B</b></button>
-      <button type="button" class="fmt-btn" onclick={toggleItalic} title="Italic (Ctrl+I)"><i>I</i></button>
-      <button type="button" class="fmt-btn" onclick={toggleUnderline} title="Underline (Ctrl+U)"><u>U</u></button>
-      <button type="button" class="fmt-btn" onclick={toggleStrikethrough} title="Strikethrough"><s>S</s></button>
-      <button type="button" class="fmt-btn" onclick={() => applyFormatToSelection({ wrap_text: !getCellFormat(selectedRow, selectedCol).wrap_text })} title="Wrap text">Wrap</button>
+    <div class="ribbon-group" role="group" aria-label="Text style">
+      <button type="button" class="fmt-btn" class:active={!!selectedFormat.bold} aria-pressed={!!selectedFormat.bold} aria-label="Bold" onclick={toggleBold} title="Bold (Ctrl+B)"><b>B</b></button>
+      <button type="button" class="fmt-btn" class:active={!!selectedFormat.italic} aria-pressed={!!selectedFormat.italic} aria-label="Italic" onclick={toggleItalic} title="Italic (Ctrl+I)"><i>I</i></button>
+      <button type="button" class="fmt-btn" class:active={!!selectedFormat.underline} aria-pressed={!!selectedFormat.underline} aria-label="Underline" onclick={toggleUnderline} title="Underline (Ctrl+U)"><u>U</u></button>
+      <button type="button" class="fmt-btn" class:active={!!selectedFormat.strikethrough} aria-pressed={!!selectedFormat.strikethrough} aria-label="Strikethrough" onclick={toggleStrikethrough} title="Strikethrough"><s>S</s></button>
+      <button type="button" class="fmt-btn" class:active={!!selectedFormat.wrap_text} aria-pressed={!!selectedFormat.wrap_text} onclick={() => applyFormatToSelection({ wrap_text: !selectedFormat.wrap_text })} title="Wrap text">Wrap</button>
     </div>
     <div class="fmt-divider"></div>
-    <div class="ribbon-group">
-      <button type="button" class="fmt-btn" onclick={() => setAlignment('left')} title="Align left">⬅</button>
-      <button type="button" class="fmt-btn" onclick={() => setAlignment('center')} title="Align center">↔</button>
-      <button type="button" class="fmt-btn" onclick={() => setAlignment('right')} title="Align right">➡</button>
+    <div class="ribbon-group" role="group" aria-label="Alignment">
+      <button type="button" class="fmt-btn alignment-btn" class:active={selectedFormat.h_align === 'left'} aria-pressed={selectedFormat.h_align === 'left'} aria-label="Align left" onclick={() => setAlignment('left')} title="Align left"><svg viewBox="0 0 18 18" aria-hidden="true"><path d="M3 4h12M3 8h8M3 12h12M3 16h8"/></svg></button>
+      <button type="button" class="fmt-btn alignment-btn" class:active={selectedFormat.h_align === 'center'} aria-pressed={selectedFormat.h_align === 'center'} aria-label="Align center" onclick={() => setAlignment('center')} title="Align center"><svg viewBox="0 0 18 18" aria-hidden="true"><path d="M3 4h12M5 8h8M3 12h12M5 16h8"/></svg></button>
+      <button type="button" class="fmt-btn alignment-btn" class:active={selectedFormat.h_align === 'right'} aria-pressed={selectedFormat.h_align === 'right'} aria-label="Align right" onclick={() => setAlignment('right')} title="Align right"><svg viewBox="0 0 18 18" aria-hidden="true"><path d="M3 4h12M7 8h8M3 12h12M7 16h8"/></svg></button>
     </div>
     <div class="fmt-divider"></div>
-    <div class="ribbon-group">
-      <button type="button" class="fmt-btn" onclick={increaseFontSize} title="Increase font size">A+</button>
-      <button type="button" class="fmt-btn" onclick={decreaseFontSize} title="Decrease font size">A−</button>
+    <div class="ribbon-group" role="group" aria-label="Font size and fill">
+      <input class="fmt-select font-size-input" type="number" min="8" max="72" step="1" aria-label="Font size" title="Font size in pixels" value={selectedFormat.font_size ?? 13} onchange={setSelectedFontSize} />
+      <button type="button" class="fmt-btn font-step-btn" onclick={increaseFontSize} title="Increase font size">A+</button>
+      <button type="button" class="fmt-btn font-step-btn" onclick={decreaseFontSize} title="Decrease font size">A−</button>
       <button type="button" class="swatch-btn yellow" onclick={() => applyFormatToSelection({ bg_color: '#fef3c7' })} title="Yellow fill"></button>
       <button type="button" class="swatch-btn green" onclick={() => applyFormatToSelection({ bg_color: '#dcfce7' })} title="Green fill"></button>
       <button type="button" class="swatch-btn red" onclick={() => applyFormatToSelection({ bg_color: '#fee2e2' })} title="Red fill"></button>
     </div>
     <div class="fmt-divider"></div>
-    <div class="ribbon-group">
-      <select class="fmt-select" onchange={(e) => setNumberFormat((e.target as HTMLSelectElement).value)} title="Number format">
-        <option value="">General</option>
-        <option value="#,##0">Number</option>
-        <option value="$#,##0.00">Currency</option>
-        <option value="0%">Percentage</option>
-        <option value="0.00%">Percentage (2 dp)</option>
-        <option value="yyyy-mm-dd">Date (ISO)</option>
-        <option value="mm/dd/yyyy">Date (US)</option>
-        <option value="hh:mm">Time</option>
-        <option value="#,##0.00">Number (2 dp)</option>
+    <div class="ribbon-group" role="group" aria-label="Number format">
+      <select class="fmt-select number-format-select" value={selectedFormat.number_format ?? ''} onchange={(e) => setNumberFormat((e.target as HTMLSelectElement).value)} title="Number format" aria-label="Number format">
+        {#each numberFormats as format}
+          <option value={format.value}>{format.label}</option>
+        {/each}
+        {#if selectedFormat.number_format && !numberFormats.some((format) => format.value === selectedFormat.number_format)}
+          <option value={selectedFormat.number_format}>Custom · {selectedFormat.number_format}</option>
+        {/if}
       </select>
     </div>
     <div class="fmt-divider"></div>
@@ -4149,18 +4308,18 @@
     >
       <div class="corner-cell" aria-hidden="true"></div>
       {#each renderedFrozenCols as c}
-        <div class="col-header" role="columnheader" aria-colindex={c + 1} style={getColHeaderStyle(c)}>{colLabel(c)}</div>
+        <div class="col-header" class:header-selected={c >= currentRange.startCol && c <= currentRange.endCol} role="columnheader" aria-colindex={c + 1} style={getColHeaderStyle(c)}>{colLabel(c)}</div>
       {/each}
       <div class="col-window-spacer header-spacer" style="width: {leftColSpacerWidth}px;" aria-hidden="true"></div>
       {#each visibleCols as c}
-        <div class="col-header" role="columnheader" aria-colindex={c + 1}>{colLabel(c)}</div>
+        <div class="col-header" class:header-selected={c >= currentRange.startCol && c <= currentRange.endCol} role="columnheader" aria-colindex={c + 1}>{colLabel(c)}</div>
       {/each}
       <div class="col-window-spacer header-spacer" style="width: {rightColSpacerWidth}px;" aria-hidden="true"></div>
 
       <div class="grid-spacer" style="height: {visibleRowStart * SCROLL_ROW_PITCH}px;"></div>
 
       {#each visibleRows as r}
-        <div class="row-header" role="rowheader" aria-rowindex={r + 1} style={getRowHeaderStyle(r)}>{r + 1}</div>
+        <div class="row-header" class:header-selected={r >= currentRange.startRow && r <= currentRange.endRow} role="rowheader" aria-rowindex={r + 1} style={getRowHeaderStyle(r)}>{r + 1}</div>
         {#each renderedFrozenCols as c}
           <button
             id={cellDomId(r, c)}
@@ -4239,6 +4398,7 @@
   </div>
 
   <div class="sheet-tabs" inert={replacementInProgress || closeInProgress} aria-hidden={replacementInProgress || closeInProgress}>
+    <div class="sheet-tab-list" role="group" aria-label="Worksheets">
     {#each sheets as sheet}
       <div class="sheet-tab-wrapper">
         {#if renamingSheetId === sheet.id}
@@ -4254,6 +4414,8 @@
             type="button"
             class="sheet-tab"
             class:active={activeSheetId === sheet.id}
+            aria-pressed={activeSheetId === sheet.id}
+            title={`${sheet.name} · Double-click to rename`}
             onclick={() => selectSheet(sheet.id)}
             ondblclick={() => startRenameSheet(sheet.id, sheet.name)}
           >
@@ -4270,12 +4432,14 @@
         {/if}
       </div>
     {/each}
-    <button type="button" class="sheet-tab-add" onclick={handleAddSheet} title="Add sheet">+</button>
+    </div>
+    <button type="button" class="sheet-tab-add" onclick={handleAddSheet} title="Add sheet" aria-label="Add sheet">+</button>
+    <span class="sheet-count">{sheets.length} {sheets.length === 1 ? 'sheet' : 'sheets'}</span>
   </div>
 
   <div class="status-bar" inert={replacementInProgress || closeInProgress} aria-hidden={replacementInProgress || closeInProgress}>
-    <span>{activeSheetName()}</span>
-    <span>{rangeLabel(currentRange)}</span>
+    <span class="status-sheet-name" title={activeSheetName()}>{activeSheetName()}</span>
+    <span class="status-selection">{rangeLabel(currentRange)}</span>
     {#if activeFilterLabel}
       <span>Filter {activeFilterLabel}</span>
     {/if}
@@ -4286,11 +4450,15 @@
     {#if selectionStats.numericCount > 0}
       <span>Sum {formatStat(selectionStats.sum)}</span>
       <span>Avg {formatStat(selectionStats.average)}</span>
-      <span>Min {formatStat(selectionStats.min)}</span>
-      <span>Max {formatStat(selectionStats.max)}</span>
+      <span class="secondary-stat">Min {formatStat(selectionStats.min)}</span>
+      <span class="secondary-stat">Max {formatStat(selectionStats.max)}</span>
     {/if}
     <span class="status-spacer"></span>
-    <span>{zoomPercent}%</span>
+    <div class="zoom-controls" role="group" aria-label="Grid zoom">
+      <button type="button" class="zoom-btn" title="Zoom out" aria-label="Zoom out" disabled={zoomPercent <= 70} onclick={() => executeMenuAction('zoomOut')}>−</button>
+      <button type="button" class="zoom-btn zoom-value" title="Reset zoom to 100%" onclick={() => executeMenuAction('zoomReset')}>{zoomPercent}%</button>
+      <button type="button" class="zoom-btn" title="Zoom in" aria-label="Zoom in" disabled={zoomPercent >= 150} onclick={() => executeMenuAction('zoomIn')}>+</button>
+    </div>
   </div>
 
   {#if showFirstRun && !activePanel}
@@ -4383,7 +4551,7 @@
 
         {#if activePanel === 'functions'}
           <div class="panel-body">
-            <input class="panel-input" type="search" bind:value={functionSearch} placeholder="Search 174 functions by name or category" />
+            <input class="panel-input" type="search" bind:value={functionSearch} placeholder="Search functions by name or category" />
             <div class="function-list">
               {#each filteredFormulaFunctions as fn}
                 <button type="button" class="function-row" onclick={() => insertFunction(fn.name)}>

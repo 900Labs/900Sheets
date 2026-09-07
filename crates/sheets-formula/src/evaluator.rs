@@ -173,6 +173,12 @@ pub trait CellProvider {
     fn get_cell(&self, row: u32, col: u32) -> Value;
     fn get_raw(&self, row: u32, col: u32) -> String;
 
+    fn enter_evaluation(&self) -> Result<(), FormulaError> {
+        Ok(())
+    }
+
+    fn leave_evaluation(&self) {}
+
     fn get_cell_on_sheet(&self, sheet: &str, row: u32, col: u32) -> Value {
         let _ = (row, col);
         Value::Error(FormulaError::RefError(format!(
@@ -271,6 +277,20 @@ impl Evaluator {
     }
 
     fn eval_expr(
+        &self,
+        expr: &Expr,
+        provider: &dyn CellProvider,
+        visited: &mut HashSet<(u32, u32)>,
+    ) -> Value {
+        if let Err(error) = provider.enter_evaluation() {
+            return Value::Error(error);
+        }
+        let value = self.eval_expr_inner(expr, provider, visited);
+        provider.leave_evaluation();
+        value
+    }
+
+    fn eval_expr_inner(
         &self,
         expr: &Expr,
         provider: &dyn CellProvider,
@@ -477,6 +497,16 @@ impl Evaluator {
                     Ok(s) => s,
                     Err(e) => return Value::Error(e),
                 };
+                if ls
+                    .len()
+                    .checked_add(rs.len())
+                    .is_none_or(|bytes| bytes > crate::functions::MAX_FUNCTION_TEXT_BYTES)
+                {
+                    return Value::Error(FormulaError::ValueError(format!(
+                        "Concatenated text exceeds the {}-byte limit",
+                        crate::functions::MAX_FUNCTION_TEXT_BYTES
+                    )));
+                }
                 Value::String(format!("{}{}", ls, rs))
             }
             BinOp::Eq => Value::Boolean(compare_eq(&lv, &rv)),
@@ -603,6 +633,24 @@ mod tests {
         let expr = Parser::parse_formula("\"Hello\"&\" \"&\"World\"").unwrap();
         let result = evaluator.evaluate(&expr, &provider);
         assert_eq!(result, Value::String("Hello World".into()));
+    }
+
+    #[test]
+    fn concatenation_rejects_oversized_results_before_output_allocation() {
+        let evaluator = Evaluator::new();
+        let mut provider = SimpleProvider::new();
+        let half_limit = crate::functions::MAX_FUNCTION_TEXT_BYTES / 2;
+        provider.set_string(0, 0, &"x".repeat(half_limit));
+        provider.set_string(0, 1, &"y".repeat(half_limit));
+        let expr = Parser::parse_formula("A1&B1").unwrap();
+        assert!(
+            matches!(evaluator.evaluate(&expr, &provider), Value::String(text) if text.len() == crate::functions::MAX_FUNCTION_TEXT_BYTES)
+        );
+        provider.set_string(0, 1, &"y".repeat(half_limit + 1));
+        assert!(matches!(
+            evaluator.evaluate(&expr, &provider),
+            Value::Error(FormulaError::ValueError(_))
+        ));
     }
 
     #[test]

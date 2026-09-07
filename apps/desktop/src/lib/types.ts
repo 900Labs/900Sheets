@@ -46,6 +46,7 @@ export interface CellData {
   value: string
   display: string
   cell_type: string
+  numeric_value?: number | null
   format?: CellFormat | null
 }
 

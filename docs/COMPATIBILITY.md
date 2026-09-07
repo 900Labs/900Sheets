@@ -29,7 +29,11 @@ Sheet names containing spaces or punctuation must be enclosed in single quotes. 
 
 Formula parsing, dependency tracking, and evaluation allow at most 100,000 expanded cell references per formula. A larger range, such as a whole-sheet-scale range, returns an explicit reference-budget error before the engine materializes it. This limit protects memory and applies across local and cross-sheet references.
 
+The product-readiness fixes add parser budgets of 32,768 input bytes, 1,024 tokens and 128 expression/nesting levels. Desktop calculation uses a bounded evaluation session with cached formula results and limits of 128 nested evaluation levels, 1,000,000 work steps and 32 MiB cumulative string/array payload copies. Snapshot evaluation uses coordinate order, so budget outcomes do not depend on hash-map insertion order. A fresh session observes subsequent edits. These limits can reject deeply nested or dependency-heavy workbooks even when each range is small; they are safeguards, not Excel parity claims. Postfix percentage syntax such as `=200*10%` is supported; use `MOD` for remainder calculations.
+
 Cross-sheet dependencies use stable sheet identities. After a source edit, the desktop refreshes formula displays whose dependency chain includes that cell. Workbook imports and transaction commits rebuild and validate the complete workbook graph, including cross-sheet cycle detection. A missing sheet produces a reference error.
+
+Derived function text and `&` concatenation are limited to 1,048,576 UTF-8 bytes, with expanding operations checked before output allocation. Combinatorial iteration and DDB periods are limited to 10,000 work iterations, FACT inputs to 170, FACTDOUBLE to 300 and FIXED decimal places to 1,000. Normalized dates are limited to years 1900–9999 and serial values `0 <= n < 2,958,465` in the existing Gregorian model; Excel's fictitious 1900 leap day is not emulated. Invalid, non-finite and overflowing integer inputs return errors. `PERMUTATIONA(n,k)` returns `n^k` for the supported nonnegative truncated inputs; the historical `PERMUTA` name is retained as an alias.
 
 Named ranges remain interface bookmarks and are not formula identifiers. Imported functions outside the supported set may return a formula error. Structural row and column edits rewrite supported direct A1 references, including absolute markers; check complex imported formulas after a structural change.
 
@@ -52,6 +56,10 @@ User mutations run against a candidate workbook and commit only after dependency
 
 Opening a native workbook, XLSX, or JSON starts a new workbook session and clears history. Export operations do not change history.
 
+Copying within 900Sheets rebases supported direct A1 formula references, including absolute/mixed references and quoted sheet names, while retaining string literals. Unsupported external, structured, or whole-row/whole-column reference forms are rejected when translation is required. A cut leaves its source intact until a successful same-sheet paste commits. Cut is rejected across sheets/sessions, after source changes, outside the grid, or when the workbook contains formulas whose move dependencies cannot yet be preserved. Use Copy for those cases. Clipboard data transfers cell values/formulas; it is not complete feature-object relocation.
+
+Row/column structural edits are rejected before mutation when active-sheet validation, conditional formatting, named ranges, imported tables/charts, chart previews, frozen panes or filters cannot be safely shifted. Those features are retained. Supported simple-sheet structural edits commit active entry drafts before moving coordinates. Metadata-aware structural editing remains follow-up work.
+
 History is bounded to 100 transactions and 64 MiB in aggregate. A single transaction is limited to 32 MiB of serialized history and 200,000 changed coordinates. Older transactions are evicted when aggregate limits are reached. A transaction that exceeds a per-operation limit, creates a dependency cycle, or fails backend-state validation is rejected without partially changing the live workbook or moving undo history.
 
 ## Recovery and rotating backups
@@ -61,7 +69,7 @@ Recovery snapshots use the native workbook representation and are stored in the 
 - Recovery autosave defaults to 750 milliseconds after the latest successful edit. **Tools > Recovery and Backups** offers 0.75, 2, 5, and 15 second intervals without allowing an old timer to write stale state. Queued mutations still flush before every write.
 - Writes use a unique temporary file, file synchronization, and atomic replacement. Unix builds also synchronize the recovery directory. Windows uses `MoveFileExW` with replace and write-through flags.
 - A close request flushes pending work and writes a final snapshot if the workbook is dirty. If that fails, the app asks whether to close without the latest recovery.
-- Startup lists recoveries newest first. Restoring one leaves unselected snapshots untouched. The **Recovery and Backups** panel remains available after startup and can inspect sheet summaries, restore, or delete one retained snapshot.
+- Startup lists recoveries newest first. Restoring one leaves unselected snapshots untouched; Cancel defers a snapshot and retains it. The **Recovery and Backups** panel remains available after startup and can inspect sheet summaries, restore, or explicitly delete one retained snapshot.
 - Corrupt snapshots are quarantined and removed from discovery.
 - Cleanup first retires a snapshot from discovery. If deletion fails, Save Workbook presents a retryable error under the same recovery identity.
 - A successful native save removes the active recovery.
@@ -125,6 +133,7 @@ The v0.5.0 release workflow is configured to produce a macOS app archive and Win
 - With Apple release credentials, the macOS job can Developer ID sign, submit for notarization, staple the result, and record that provenance. Without them, it records ad hoc signing and no notarization, uploads the artifact for inspection, and refuses GitHub Release publication.
 - Automated publication requires the macOS provenance to report Developer ID signing and stapled notarization.
 - With configured Windows signing credentials, the Windows job can Authenticode sign and verify the installer. Without them, it records an unsigned installer, which may be published only with that explicit provenance. The job is also configured to perform a silent temporary install, check the installed application version, and uninstall it before upload.
+- Windows packaging explicitly selects the WebView2 offline installer payload. This increases installer size and removes the runtime-download prerequisite during installation; a clean disconnected Windows installation remains to be verified. Configuration alone is not an observed install result.
 - Linux source and backend gates remain available, but no Linux package is configured for v0.5.0.
 
 Workflow capability is not a verification result for a particular release. Release notes must state which credential path ran, which artifacts were published, and whether any clean-machine installation was performed. Source-tree documentation does not claim Microsoft Excel desktop verification, a successful Windows installation, Developer ID notarization, or hosted CI completion before that evidence exists.

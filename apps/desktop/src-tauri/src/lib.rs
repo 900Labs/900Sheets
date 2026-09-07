@@ -17,6 +17,7 @@ use sheets_i18n::{Locale, NavigationDirection, TranslationKey, TranslationProvid
 use sheets_pivot::{PivotConfig, PivotResult};
 use sheets_print::{PrintConfig, PrintPreview};
 use sheets_validation::{ConditionalFormat, DataValidation, ValidationRule};
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -199,13 +200,80 @@ impl SheetComments {
     }
 }
 
+const MAX_EVALUATION_DEPTH: usize = 128;
+const MAX_EVALUATION_STEPS: usize = 1_000_000;
+const MAX_EVALUATION_VALUE_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Default)]
+struct EvaluationSession {
+    cached: RefCell<HashMap<CellKey, CachedValue>>,
+    visiting: RefCell<HashSet<CellKey>>,
+    depth: Cell<usize>,
+    steps: Cell<usize>,
+    value_bytes: Cell<usize>,
+}
+
+struct CachedValue {
+    value: Value,
+    payload_bytes: usize,
+}
+
+impl EvaluationSession {
+    fn reserve_value_bytes(&self, bytes: usize) -> Result<(), sheets_formula::error::FormulaError> {
+        let total = self.value_bytes.get().saturating_add(bytes);
+        if total > MAX_EVALUATION_VALUE_BYTES {
+            return Err(sheets_formula::error::FormulaError::EvalError(format!(
+                "Formula calculation exceeds safe value-copy limit of {MAX_EVALUATION_VALUE_BYTES} bytes"
+            )));
+        }
+        self.value_bytes.set(total);
+        Ok(())
+    }
+
+    fn consume_step(&self) -> Result<(), sheets_formula::error::FormulaError> {
+        if self.steps.get() >= MAX_EVALUATION_STEPS {
+            return Err(sheets_formula::error::FormulaError::EvalError(format!(
+                "Formula calculation exceeds safe work limit of {MAX_EVALUATION_STEPS} steps"
+            )));
+        }
+        self.steps.set(self.steps.get() + 1);
+        Ok(())
+    }
+}
+
+fn value_payload_bytes(value: &Value) -> usize {
+    match value {
+        Value::String(text) => text.len(),
+        Value::Array(values) => values.iter().fold(
+            values.len().saturating_mul(std::mem::size_of::<Value>()),
+            |bytes, value| bytes.saturating_add(value_payload_bytes(value)),
+        ),
+        _ => 0,
+    }
+}
+
 struct TauriProvider<'a> {
     workbook: &'a Workbook,
     current_sheet_id: u64,
-    visited: &'a HashSet<CellKey>,
+    session: &'a EvaluationSession,
 }
 
 impl<'a> CellProvider for TauriProvider<'a> {
+    fn enter_evaluation(&self) -> Result<(), sheets_formula::error::FormulaError> {
+        self.session.consume_step()?;
+        if self.session.depth.get() >= MAX_EVALUATION_DEPTH {
+            return Err(sheets_formula::error::FormulaError::EvalError(format!(
+                "Formula calculation exceeds safe nesting limit of {MAX_EVALUATION_DEPTH}"
+            )));
+        }
+        self.session.depth.set(self.session.depth.get() + 1);
+        Ok(())
+    }
+
+    fn leave_evaluation(&self) {
+        self.session.depth.set(self.session.depth.get() - 1);
+    }
+
     fn get_cell(&self, row: u32, col: u32) -> Value {
         self.get_cell_by_sheet_id(self.current_sheet_id, row, col)
     }
@@ -241,7 +309,31 @@ impl<'a> CellProvider for TauriProvider<'a> {
 }
 
 impl TauriProvider<'_> {
+    fn cached_value(&self, key: CellKey) -> Option<Value> {
+        if let Some(cached) = self.session.cached.borrow().get(&key) {
+            if let Err(error) = self.session.reserve_value_bytes(cached.payload_bytes) {
+                return Some(Value::Error(error));
+            }
+            return Some(cached.value.clone());
+        }
+        None
+    }
+
+    fn snapshot_cell(&self, row: u32, col: u32) -> Value {
+        // Preserve already calculated results when the remaining calculation
+        // budget is exhausted. Nested formula reads still consume work below.
+        self.cached_value(CellKey::new(self.current_sheet_id, row, col))
+            .unwrap_or_else(|| self.get_cell(row, col))
+    }
+
     fn get_cell_by_sheet_id(&self, sheet_id: u64, row: u32, col: u32) -> Value {
+        if let Err(error) = self.session.consume_step() {
+            return Value::Error(error);
+        }
+        let key = CellKey::new(sheet_id, row, col);
+        if let Some(value) = self.cached_value(key) {
+            return value;
+        }
         let Some(sheet) = self.workbook.sheet_by_stable_id(sheet_id) else {
             return Value::Error(sheets_formula::error::FormulaError::RefError(
                 "Sheet was not found".into(),
@@ -252,32 +344,56 @@ impl TauriProvider<'_> {
                 sheets_core::cell::CellType::Number => {
                     Value::Number(cell.as_number().unwrap_or(0.0))
                 }
-                sheets_core::cell::CellType::Text => Value::String(cell.raw.clone()),
+                sheets_core::cell::CellType::Text => {
+                    if let Err(error) = self.session.reserve_value_bytes(cell.raw.len()) {
+                        return Value::Error(error);
+                    }
+                    Value::String(cell.raw.clone())
+                }
                 sheets_core::cell::CellType::Boolean => {
                     Value::Boolean(cell.raw.eq_ignore_ascii_case("true"))
                 }
                 sheets_core::cell::CellType::Formula => {
-                    let key = CellKey::new(sheet_id, row, col);
-                    if self.visited.contains(&key) {
+                    if !self.session.visiting.borrow_mut().insert(key) {
                         return Value::Error(
                             sheets_formula::error::FormulaError::CircularReference,
                         );
                     }
                     let evaluator = Evaluator::new();
-                    if let Ok(expr) = Parser::parse_formula(&cell.raw) {
-                        let mut new_visited = self.visited.clone();
-                        new_visited.insert(key);
+                    let value = if let Ok(expr) = Parser::parse_formula(&cell.raw) {
                         let provider = TauriProvider {
                             workbook: self.workbook,
                             current_sheet_id: sheet_id,
-                            visited: &new_visited,
+                            session: self.session,
                         };
                         evaluator.evaluate(&expr, &provider)
                     } else {
                         Value::Error(sheets_formula::error::FormulaError::ParseError(
                             "Invalid formula".into(),
                         ))
+                    };
+                    self.session.visiting.borrow_mut().remove(&key);
+                    // A budget failure can depend on the current call depth;
+                    // it must not poison another independently evaluated cell.
+                    if !value.is_error() {
+                        // Account for both the retained cache copy and the
+                        // returned payload before cloning large strings/arrays.
+                        let payload_bytes = value_payload_bytes(&value);
+                        if let Err(error) = self
+                            .session
+                            .reserve_value_bytes(payload_bytes.saturating_mul(2))
+                        {
+                            return Value::Error(error);
+                        }
+                        self.session.cached.borrow_mut().insert(
+                            key,
+                            CachedValue {
+                                value: value.clone(),
+                                payload_bytes,
+                            },
+                        );
                     }
+                    value
                 }
                 sheets_core::cell::CellType::Error => Value::Error(
                     sheets_formula::error::FormulaError::EvalError(cell.raw.clone()),
@@ -309,6 +425,7 @@ struct CellData {
     col: u32,
     value: String,
     display: String,
+    numeric_value: Option<f64>,
     cell_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     format: Option<CellFormat>,
@@ -1115,23 +1232,32 @@ impl NativeBackupStore {
 
 fn ensure_can_edit_cell(state: &AppState, sheet_id: u32, row: u32, col: u32) -> Result<(), String> {
     with_pending_mutation(state, |pending| {
-        if let Some(protection) = pending.protections.get(sheet_id as usize) {
-            if protection.protected {
-                let cell_locked = pending
-                    .cell_locks
-                    .get(sheet_id as usize)
-                    .map(|m| m.is_locked(row, col))
-                    .unwrap_or(true);
-                if !protection.can_edit_cell(cell_locked) {
-                    return Err(format!(
-                        "Cell ({}, {}) on sheet {} is locked",
-                        row, col, sheet_id
-                    ));
-                }
+        ensure_pending_cell_edit(pending, sheet_id, row, col)
+    })
+}
+
+fn ensure_pending_cell_edit(
+    pending: &PendingTransaction,
+    sheet_id: u32,
+    row: u32,
+    col: u32,
+) -> Result<(), String> {
+    if let Some(protection) = pending.protections.get(sheet_id as usize) {
+        if protection.protected {
+            let cell_locked = pending
+                .cell_locks
+                .get(sheet_id as usize)
+                .map(|m| m.is_locked(row, col))
+                .unwrap_or(true);
+            if !protection.can_edit_cell(cell_locked) {
+                return Err(format!(
+                    "Cell ({}, {}) on sheet {} is locked",
+                    row, col, sheet_id
+                ));
             }
         }
-        Ok(())
-    })
+    }
+    Ok(())
 }
 
 fn ensure_sheet_not_protected(state: &AppState, sheet_id: u32) -> Result<(), String> {
@@ -1859,24 +1985,107 @@ fn batch_set_cells(
     changes: Vec<CellChange>,
     state: State<AppState>,
 ) -> Result<(), String> {
-    for change in &changes {
-        ensure_can_edit_cell(state.inner(), sheet_id, change.row, change.col)?;
-    }
     with_pending_mutation(state.inner(), |pending| {
-        let mut candidate = pending.workbook.clone();
-        let sheet = candidate
-            .sheet_mut(sheet_id as usize)
-            .ok_or_else(|| format!("Sheet {sheet_id} not found"))?;
-        for change in changes {
-            if change.value.is_empty() {
-                sheet.clear_value(change.row, change.col);
-            } else {
-                sheet.set_cell_value(change.row, change.col, change.value);
-            }
+        apply_cell_changes(pending, sheet_id, &changes)
+    })
+}
+
+fn apply_cell_changes(
+    pending: &mut PendingTransaction,
+    sheet_id: u32,
+    changes: &[CellChange],
+) -> Result<(), String> {
+    if changes.len() > MAX_TRANSACTION_CELLS {
+        return Err(format!(
+            "Cell edit exceeds safe transaction limit of {MAX_TRANSACTION_CELLS} coordinates"
+        ));
+    }
+    let sheet = pending
+        .workbook
+        .sheet(sheet_id as usize)
+        .ok_or_else(|| format!("Sheet {sheet_id} not found"))?;
+    for change in changes {
+        if !sheet.in_bounds(change.row, change.col) {
+            return Err("Cell edit is outside workbook limits".into());
         }
-        pending.dep_graph = dependency_graphs_for_workbook(&candidate)?;
-        pending.workbook = candidate;
-        Ok(())
+        ensure_pending_cell_edit(pending, sheet_id, change.row, change.col)?;
+    }
+    let mut candidate = pending.workbook.clone();
+    let sheet = candidate
+        .sheet_mut(sheet_id as usize)
+        .ok_or_else(|| format!("Sheet {sheet_id} not found"))?;
+    for change in changes {
+        if change.value.is_empty() {
+            sheet.clear_value(change.row, change.col);
+        } else {
+            sheet.set_cell_value(change.row, change.col, change.value.clone());
+        }
+    }
+    pending.dep_graph = dependency_graphs_for_workbook(&candidate)?;
+    pending.workbook = candidate;
+    Ok(())
+}
+
+#[tauri::command]
+fn move_cells(
+    sheet_id: u32,
+    source_stable_sheet_id: String,
+    source: Vec<CellChange>,
+    changes: Vec<CellChange>,
+    state: State<AppState>,
+) -> Result<(), String> {
+    move_cells_in_workbook(
+        state.inner(),
+        sheet_id,
+        &source_stable_sheet_id,
+        &source,
+        &changes,
+    )
+}
+
+fn move_cells_in_workbook(
+    state: &AppState,
+    sheet_id: u32,
+    source_stable_sheet_id: &str,
+    source: &[CellChange],
+    changes: &[CellChange],
+) -> Result<(), String> {
+    with_pending_mutation(state, |pending| {
+        if has_workbook_formulas(&pending.workbook) {
+            return Err(
+                "Cut is unavailable while the workbook contains formulas. Copy the cells instead."
+                    .into(),
+            );
+        }
+        if source.is_empty() || source.len() > MAX_TRANSACTION_CELLS {
+            return Err("Cut source is empty or exceeds the safe coordinate limit".into());
+        }
+        let sheet = pending
+            .workbook
+            .sheet(sheet_id as usize)
+            .ok_or_else(|| format!("Sheet {sheet_id} not found"))?;
+        if sheet.stable_id().to_string() != source_stable_sheet_id {
+            return Err("The cut source sheet has changed. Cut the cells again.".into());
+        }
+        for expected in source {
+            if !sheet.in_bounds(expected.row, expected.col)
+                || sheet
+                    .cell(expected.row, expected.col)
+                    .map(|cell| cell.raw.as_str())
+                    .unwrap_or("")
+                    != expected.value
+            {
+                return Err("The cut source has changed. Cut the cells again.".into());
+            }
+            ensure_pending_cell_edit(pending, sheet_id, expected.row, expected.col)?;
+        }
+        if changes
+            .iter()
+            .any(|change| change.value.trim_start().starts_with('='))
+        {
+            return Err("Cut cannot convert text into formulas. Copy the cells instead.".into());
+        }
+        apply_cell_changes(pending, sheet_id, changes)
     })
 }
 
@@ -2115,40 +2324,46 @@ fn clear_cell(sheet_id: u32, row: u32, col: u32, state: State<AppState>) -> Resu
 #[tauri::command]
 fn get_sheet_data(sheet_id: u32, state: State<AppState>) -> Result<Vec<CellData>, String> {
     let wb = state.workbook.lock().map_err(|e| e.to_string())?;
-    let sheet = wb
+    sheet_data(&wb, sheet_id)
+}
+
+fn sheet_data(workbook: &Workbook, sheet_id: u32) -> Result<Vec<CellData>, String> {
+    let sheet = workbook
         .sheet(sheet_id as usize)
         .ok_or_else(|| format!("Sheet {} not found", sheet_id))?;
-    let evaluator = Evaluator::new();
     let current_sheet_id = sheet.stable_id();
-    Ok(sheet
-        .iter_cells()
+    let session = EvaluationSession::default();
+    let provider = TauriProvider {
+        workbook,
+        current_sheet_id,
+        session: &session,
+    };
+    // Resource-limit results must not depend on HashMap insertion order or
+    // the random hash seed assigned when reopening the same workbook.
+    let mut cells: Vec<_> = sheet.iter_cells().collect();
+    cells.sort_unstable_by_key(|(coordinate, _)| *coordinate);
+    let mut data: Vec<_> = cells
+        .into_iter()
         .map(|((row, col), cell)| {
+            let mut numeric_value = None;
             let display = if cell.cell_type == sheets_core::cell::CellType::Formula {
-                let visited = HashSet::from([CellKey::new(current_sheet_id, row, col)]);
-                let provider = TauriProvider {
-                    workbook: &wb,
-                    current_sheet_id,
-                    visited: &visited,
-                };
-                let expr_result = Parser::parse_formula(&cell.raw);
-                match expr_result {
-                    Ok(expr) => match evaluator.evaluate(&expr, &provider) {
-                        Value::Number(n) => {
-                            if let Some(fmt) = sheet.get_format(row, col) {
-                                if let Some(nf_str) = &fmt.number_format {
-                                    NumberFormat::from_pattern(nf_str).format(n)
-                                } else {
-                                    n.to_string()
-                                }
+                match provider.snapshot_cell(row, col) {
+                    Value::Number(n) => {
+                        numeric_value = n.is_finite().then_some(n);
+                        if let Some(fmt) = sheet.get_format(row, col) {
+                            if let Some(nf_str) = &fmt.number_format {
+                                NumberFormat::from_pattern(nf_str).format(n)
                             } else {
                                 n.to_string()
                             }
+                        } else {
+                            n.to_string()
                         }
-                        v => v.to_display(),
-                    },
-                    Err(_) => "#ERROR!".to_string(),
+                    }
+                    v => v.to_display(),
                 }
             } else if cell.cell_type == sheets_core::cell::CellType::Number {
+                numeric_value = cell.as_number().filter(|value| value.is_finite());
                 if let Some(fmt) = sheet.get_format(row, col) {
                     if let Some(nf_str) = &fmt.number_format {
                         NumberFormat::from_pattern(nf_str).format(cell.as_number().unwrap_or(0.0))
@@ -2166,11 +2381,41 @@ fn get_sheet_data(sheet_id: u32, state: State<AppState>) -> Result<Vec<CellData>
                 col,
                 value: cell.raw.clone(),
                 display,
+                numeric_value,
                 cell_type: format!("{:?}", cell.cell_type).to_lowercase(),
                 format: sheet.get_format(row, col).cloned(),
             }
         })
-        .collect())
+        .chain(
+            sheet
+                .iter_formats()
+                .filter(|((row, col), _)| sheet.cell(*row, *col).is_none())
+                .map(|((row, col), format)| CellData {
+                    row,
+                    col,
+                    value: String::new(),
+                    display: String::new(),
+                    numeric_value: None,
+                    cell_type: "empty".into(),
+                    format: Some(format.clone()),
+                }),
+        )
+        .collect();
+    data.sort_unstable_by_key(|cell| (cell.row, cell.col));
+    Ok(data)
+}
+
+fn has_workbook_formulas(workbook: &Workbook) -> bool {
+    workbook
+        .sheets()
+        .iter()
+        .any(|sheet| sheet.iter_cells().any(|(_, cell)| cell.is_formula()))
+}
+
+#[tauri::command]
+fn workbook_has_formulas(state: State<AppState>) -> Result<bool, String> {
+    let workbook = state.workbook.lock().map_err(|error| error.to_string())?;
+    Ok(has_workbook_formulas(&workbook))
 }
 
 #[tauri::command]
@@ -2185,11 +2430,11 @@ fn evaluate_formula(
         .ok_or_else(|| format!("Sheet {} not found", sheet_id))?;
     let expr = Parser::parse_formula(&formula).map_err(|e| format!("Parse error: {}", e))?;
     let evaluator = Evaluator::new();
-    let visited = HashSet::new();
+    let session = EvaluationSession::default();
     let provider = TauriProvider {
         workbook: &wb,
         current_sheet_id: sheet.stable_id(),
-        visited: &visited,
+        session: &session,
     };
     let result = evaluator.evaluate(&expr, &provider);
     Ok(match result {
@@ -3803,10 +4048,12 @@ pub fn run() {
             set_cell,
             clear_cell,
             batch_set_cells,
+            move_cells,
             batch_set_formats,
             replace_sheet_snapshot,
             edit_sheet_structure,
             get_sheet_data,
+            workbook_has_formulas,
             evaluate_formula,
             get_export_preflight,
             import_xlsx,
@@ -4348,6 +4595,363 @@ mod tests {
     }
 
     #[test]
+    fn sheet_snapshot_preserves_blank_formats_without_duplicate_cells() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.sheet_mut(0).unwrap();
+        let format = CellFormat::new().bold(true).bg_color("#ffeecc");
+        sheet.set_cell_value(0, 0, "12".into());
+        sheet.set_format(0, 0, format.clone());
+        sheet.set_format(999_999, 16_383, format.clone());
+
+        let snapshot = sheet_data(&workbook, 0).unwrap();
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot.iter().filter(|cell| cell.row == 0).count(), 1);
+        let blank = snapshot.iter().find(|cell| cell.row == 999_999).unwrap();
+        assert_eq!(blank.col, 16_383);
+        assert_eq!(blank.value, "");
+        assert_eq!(blank.display, "");
+        assert_eq!(blank.cell_type, "empty");
+        assert_eq!(blank.format, Some(format));
+    }
+
+    #[test]
+    fn formula_presence_checks_all_sheets_without_projecting_values() {
+        let mut workbook = Workbook::new();
+        workbook
+            .sheet_mut(0)
+            .unwrap()
+            .set_cell_value(0, 0, "42".into());
+        assert!(!has_workbook_formulas(&workbook));
+        let second = workbook.add_sheet("Other").unwrap();
+        workbook
+            .sheet_mut(second)
+            .unwrap()
+            .set_cell_value(0, 0, "=1+1".into());
+        assert!(has_workbook_formulas(&workbook));
+    }
+
+    #[test]
+    fn snapshot_numeric_values_use_calculated_numbers_before_display_formatting() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.sheet_mut(0).unwrap();
+        sheet.set_cell_value(0, 0, "1250".into());
+        sheet.set_cell_value(0, 1, "=A1*10%".into());
+        sheet.set_cell(0, 2, CellValue::text("1250"));
+        sheet.set_cell_value(0, 3, "=1/0".into());
+        sheet.set_cell_value(0, 4, "TRUE".into());
+        sheet.set_format(0, 0, CellFormat::new().number_format("#,##0.00"));
+        sheet.set_format(0, 1, CellFormat::new().number_format("$#,##0.00"));
+        let data = sheet_data(&workbook, 0).unwrap();
+        let get = |col| data.iter().find(|cell| cell.col == col).unwrap();
+        assert_eq!(get(0).numeric_value, Some(1250.0));
+        assert_eq!(get(1).numeric_value, Some(125.0));
+        assert_ne!(get(0).display, "1250");
+        assert_eq!(get(2).numeric_value, None);
+        assert_eq!(get(3).numeric_value, None);
+        assert_eq!(get(4).numeric_value, None);
+    }
+
+    #[test]
+    fn repeated_formula_dependencies_are_evaluated_once_per_read() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.sheet_mut(0).unwrap();
+        sheet.set_cell_value(0, 0, "1".into());
+        for row in 1..=40 {
+            sheet.set_cell_value(row, 0, format!("=A{row}+A{row}"));
+        }
+        let session = EvaluationSession::default();
+        let provider = TauriProvider {
+            workbook: &workbook,
+            current_sheet_id: workbook.sheet(0).unwrap().stable_id(),
+            session: &session,
+        };
+        assert_eq!(provider.get_cell(40, 0), Value::Number(2_f64.powi(40)));
+        assert_eq!(session.cached.borrow().len(), 40);
+        assert!(session.steps.get() < 300);
+        assert_eq!(session.depth.get(), 0);
+        assert!(session.visiting.borrow().is_empty());
+        let steps = session.steps.get();
+        assert_eq!(provider.get_cell(40, 0), Value::Number(2_f64.powi(40)));
+        assert_eq!(session.steps.get(), steps + 1);
+    }
+
+    #[test]
+    fn deep_formula_chains_and_work_budget_exhaustion_return_errors() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.sheet_mut(0).unwrap();
+        sheet.set_cell_value(0, 0, "1".into());
+        for row in 1..=200 {
+            sheet.set_cell_value(row, 0, format!("=A{row}"));
+        }
+        let session = EvaluationSession::default();
+        let provider = TauriProvider {
+            workbook: &workbook,
+            current_sheet_id: workbook.sheet(0).unwrap().stable_id(),
+            session: &session,
+        };
+        assert!(matches!(provider.get_cell(200, 0), Value::Error(_)));
+        assert_eq!(session.depth.get(), 0);
+        assert!(session.visiting.borrow().is_empty());
+        assert_eq!(provider.get_cell(1, 0), Value::Number(1.0));
+        session.steps.set(MAX_EVALUATION_STEPS);
+        assert_eq!(provider.snapshot_cell(1, 0), Value::Number(1.0));
+        assert!(matches!(provider.get_cell(1, 0), Value::Error(_)));
+        assert!(matches!(provider.get_cell(200, 0), Value::Error(_)));
+        assert_eq!(session.steps.get(), MAX_EVALUATION_STEPS);
+    }
+
+    #[test]
+    fn formula_snapshot_limits_are_deterministic_across_insertion_orders() {
+        let build = |reverse: bool| {
+            let mut workbook = Workbook::new();
+            let sheet = workbook.sheet_mut(0).unwrap();
+            for offset in 0..200 {
+                let row = if reverse { 199 - offset } else { offset };
+                sheet.set_cell_value(
+                    row,
+                    0,
+                    if row == 199 {
+                        "1".into()
+                    } else {
+                        format!("=A{}", row + 2)
+                    },
+                );
+            }
+            sheet.set_format(800, 1, CellFormat::new().bold(true));
+            workbook
+        };
+        let forward = sheet_data(&build(false), 0).unwrap();
+        let reverse = sheet_data(&build(true), 0).unwrap();
+        assert_eq!(
+            serde_json::to_value(forward).unwrap(),
+            serde_json::to_value(reverse).unwrap()
+        );
+    }
+
+    #[test]
+    fn formula_value_copy_budget_bounds_cached_arrays_and_text() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.sheet_mut(0).unwrap();
+        sheet.set_cell_value(0, 0, "text".into());
+        sheet.set_cell_value(0, 1, "=A1:A1".into());
+        let session = EvaluationSession::default();
+        let provider = TauriProvider {
+            workbook: &workbook,
+            current_sheet_id: workbook.sheet(0).unwrap().stable_id(),
+            session: &session,
+        };
+        assert_eq!(
+            provider.get_cell(0, 1),
+            Value::Array(vec![Value::String("text".into())])
+        );
+        session.value_bytes.set(MAX_EVALUATION_VALUE_BYTES - 3);
+        assert!(matches!(provider.get_cell(0, 1), Value::Error(_)));
+        assert!(matches!(provider.get_cell(0, 0), Value::Error(_)));
+        assert_eq!(session.value_bytes.get(), MAX_EVALUATION_VALUE_BYTES - 3);
+    }
+
+    #[test]
+    fn malformed_csv_leaves_pending_workbook_unchanged() {
+        let state = test_state();
+        let comments = Mutex::new(SheetComments::default());
+        begin_transaction(serde_json::json!({}), &state, &comments).unwrap();
+        set_cell_value_in_workbook(&state, 0, 0, 0, "original".into()).unwrap();
+        assert!(
+            import_csv_data_inner("replacement\n\"unterminated", ',', Some(0), &state).is_err()
+        );
+        commit_transaction(serde_json::json!({}), &state, &comments).unwrap();
+        assert_eq!(
+            state
+                .workbook
+                .lock()
+                .unwrap()
+                .sheet(0)
+                .unwrap()
+                .cell_value(0, 0),
+            Some("original".into())
+        );
+    }
+
+    #[test]
+    fn guarded_move_is_one_undoable_transaction_including_overlapping_cells() {
+        let state = test_state();
+        let comments = Mutex::new(SheetComments::default());
+        {
+            let mut workbook = state.workbook.lock().unwrap();
+            let sheet = workbook.sheet_mut(0).unwrap();
+            sheet.set_cell_value(0, 0, "first".into());
+            sheet.set_cell_value(1, 0, "second".into());
+        }
+        let source = [
+            CellChange {
+                row: 0,
+                col: 0,
+                value: "first".into(),
+            },
+            CellChange {
+                row: 1,
+                col: 0,
+                value: "second".into(),
+            },
+        ];
+        let changes = [
+            CellChange {
+                row: 0,
+                col: 0,
+                value: String::new(),
+            },
+            CellChange {
+                row: 1,
+                col: 0,
+                value: "first".into(),
+            },
+            CellChange {
+                row: 2,
+                col: 0,
+                value: "second".into(),
+            },
+        ];
+        begin_transaction(serde_json::json!({}), &state, &comments).unwrap();
+        move_cells_in_workbook(&state, 0, "1", &source, &changes).unwrap();
+        commit_transaction(serde_json::json!({}), &state, &comments).unwrap();
+        {
+            let workbook = state.workbook.lock().unwrap();
+            let sheet = workbook.sheet(0).unwrap();
+            assert_eq!(sheet.cell_value(0, 0), None);
+            assert_eq!(sheet.cell_value(1, 0), Some("first".into()));
+            assert_eq!(sheet.cell_value(2, 0), Some("second".into()));
+        }
+        assert_eq!(state.history.lock().unwrap().undo.len(), 1);
+        restore_history_transaction(&state, &comments, false).unwrap();
+        let workbook = state.workbook.lock().unwrap();
+        let sheet = workbook.sheet(0).unwrap();
+        assert_eq!(sheet.cell_value(0, 0), Some("first".into()));
+        assert_eq!(sheet.cell_value(1, 0), Some("second".into()));
+        assert_eq!(sheet.cell_value(2, 0), None);
+    }
+
+    #[test]
+    fn guarded_move_rechecks_formula_and_source_changes_inside_candidate() {
+        for add_formula in [false, true] {
+            let state = test_state();
+            let comments = Mutex::new(SheetComments::default());
+            state
+                .workbook
+                .lock()
+                .unwrap()
+                .sheet_mut(0)
+                .unwrap()
+                .set_cell_value(0, 0, "original".into());
+            begin_transaction(serde_json::json!({}), &state, &comments).unwrap();
+            if add_formula {
+                with_pending_mutation(&state, |pending| {
+                    let other = pending.workbook.add_sheet("Other").unwrap();
+                    pending
+                        .workbook
+                        .sheet_mut(other)
+                        .unwrap()
+                        .set_cell_value(0, 0, "=1+1".into());
+                    Ok(())
+                })
+                .unwrap();
+            } else {
+                set_cell_value_in_workbook(&state, 0, 0, 0, "new value".into()).unwrap();
+            }
+            let source = [CellChange {
+                row: 0,
+                col: 0,
+                value: "original".into(),
+            }];
+            let changes = [
+                CellChange {
+                    row: 0,
+                    col: 0,
+                    value: String::new(),
+                },
+                CellChange {
+                    row: 0,
+                    col: 1,
+                    value: "original".into(),
+                },
+            ];
+            assert!(move_cells_in_workbook(&state, 0, "1", &source, &changes).is_err());
+            commit_transaction(serde_json::json!({}), &state, &comments).unwrap();
+            let workbook = state.workbook.lock().unwrap();
+            let sheet = workbook.sheet(0).unwrap();
+            assert_eq!(
+                sheet.cell_value(0, 0),
+                Some(if add_formula { "original" } else { "new value" }.into())
+            );
+            assert_eq!(sheet.cell_value(0, 1), None);
+        }
+    }
+
+    #[test]
+    fn guarded_move_rejects_changed_sheet_locked_destinations_and_invalid_coordinates() {
+        for failure in ["sheet identity", "locked", "bounds"] {
+            let state = test_state();
+            let comments = Mutex::new(SheetComments::default());
+            state
+                .workbook
+                .lock()
+                .unwrap()
+                .sheet_mut(0)
+                .unwrap()
+                .set_cell_value(0, 0, "original".into());
+            begin_transaction(serde_json::json!({}), &state, &comments).unwrap();
+            if failure == "locked" {
+                with_pending_mutation(&state, |pending| {
+                    let mut protection = SheetProtection::default();
+                    protection.protect("");
+                    pending.protections.push(protection);
+                    let mut locks = CellLockManager::new();
+                    locks.set_locked(0, 0, false);
+                    pending.cell_locks.push(locks);
+                    Ok(())
+                })
+                .unwrap();
+            }
+            let source = [CellChange {
+                row: 0,
+                col: 0,
+                value: "original".into(),
+            }];
+            let changes = [
+                CellChange {
+                    row: 0,
+                    col: 0,
+                    value: String::new(),
+                },
+                CellChange {
+                    row: if failure == "bounds" { 1_000_000 } else { 0 },
+                    col: 1,
+                    value: "original".into(),
+                },
+            ];
+            assert!(move_cells_in_workbook(
+                &state,
+                0,
+                if failure == "sheet identity" {
+                    "2"
+                } else {
+                    "1"
+                },
+                &source,
+                &changes
+            )
+            .is_err());
+            with_pending_mutation(&state, |pending| {
+                let sheet = pending.workbook.sheet(0).unwrap();
+                assert_eq!(sheet.cell_value(0, 0), Some("original".into()));
+                assert_eq!(sheet.cell_value(0, 1), None);
+                Ok(())
+            })
+            .unwrap();
+            abort_transaction(&state).unwrap();
+        }
+    }
+
+    #[test]
     fn workbook_provider_evaluates_cross_sheet_chain_and_reflects_source_edits() {
         let mut workbook = Workbook::new();
         workbook.rename_sheet(0, "Annual Budget").unwrap();
@@ -4363,12 +4967,11 @@ mod tests {
 
         let evaluate = |workbook: &Workbook| {
             let report_sheet = workbook.sheet(report).unwrap();
-            let key = CellKey::new(report_sheet.stable_id(), 0, 0);
-            let visited = HashSet::from([key]);
+            let session = EvaluationSession::default();
             let provider = TauriProvider {
                 workbook,
                 current_sheet_id: report_sheet.stable_id(),
-                visited: &visited,
+                session: &session,
             };
             let expr = Parser::parse_formula(&report_sheet.cell(0, 0).unwrap().raw).unwrap();
             Evaluator::new().evaluate(&expr, &provider)

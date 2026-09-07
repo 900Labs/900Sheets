@@ -33,6 +33,8 @@ On Windows, create the supported NSIS installer with:
 npm run tauri:build --prefix apps/desktop -- --bundles nsis
 ```
 
+The Windows bundle selects `webviewInstallMode.type = offlineInstaller` so the installer includes WebView2 provisioning. Record the actual installer bytes, then test the exact artifact on a clean supported Windows machine with WebView2 absent and networking disconnected. Install, launch, create from a template, save, reboot, reopen and uninstall. An online hosted runner with an existing WebView2 runtime does not establish offline installation. Record OS/CPU/RAM and runtime versions alongside the result. The [product criteria](PRODUCT_CRITERIA.md) define separate physical older-hardware checks.
+
 On Linux, use `npm run build --prefix apps/desktop`, `cargo test -p sheets-desktop --lib`, and `cargo build --release -p sheets-desktop` as source checks. These commands do not create a supported Linux installer or distribution package.
 
 Check the macOS bundle version:
