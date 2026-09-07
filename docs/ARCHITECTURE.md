@@ -35,6 +35,10 @@ The workbook and desktop grid share the same zero-based bounds: 1,000,000 rows a
 
 Graph construction, formula replacement, transaction commit, and workbook replacement reject circular dependencies. Reference expansion is bounded to 100,000 cells per formula in reference collection, dependency construction, and evaluation.
 
+Dependency cycle detection walks iteratively with a visited set, so shared branches are not repeatedly traversed and long graphs do not consume the call stack. Formula parsing also bounds bytes, tokens and expression depth. Desktop reads use a fresh evaluation session with memoized formula values, active-reference detection and depth/work budgets. The cache is local to one read, so it does not retain results across workbook edits.
+
+Sheet projection includes populated cells and independently stored formatted blanks without duplicate coordinates. Each projected numeric result supplies a finite `numeric_value` separately from source text and formatted display text. The UI uses that value for selection statistics and numeric conditional rules, including formulas formatted as currencies or percentages. This remains a full sparse-sheet projection; viewport virtualization alone does not bound IPC payload or transaction cloning cost.
+
 ## Candidate transactions
 
 Every user mutation begins a workbook transaction. The backend clones the current workbook, dependency graph, protection state, cell locks, and comments into a pending candidate. Mutating commands operate only on that candidate.

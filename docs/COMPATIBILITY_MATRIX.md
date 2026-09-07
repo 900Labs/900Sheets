@@ -1,6 +1,29 @@
 # v0.5.0 compatibility matrix
 
-This matrix ties public compatibility claims to deterministic tests. Existing v0.4.0 rows retain their release evidence. Rows marked **Pass locally** were observed on 2026-07-11 in the complete integrated v0.5.0 local gate. Hosted workflow results remain release-time evidence and must be recorded for the tag before publication. Test IDs are Rust test names, Node test titles, or Playwright titles and can be selected directly with the commands shown.
+This matrix ties public compatibility claims to deterministic tests. Existing v0.4.0 rows retain their release evidence. The original rows marked **Pass locally** were observed on 2026-07-11. The [2026-09-07 audit](audits/2026-09-07-product-readiness.md) records current integration results; the new regression IDs are listed below. Hosted workflow results remain release-time evidence and must be recorded for the tag before publication. Test IDs are Rust test names, Node test titles, or Playwright titles and can be selected directly with the commands shown.
+
+## Product-readiness regression coverage
+
+| Area | Exact regression ID | Scope |
+| --- | --- | --- |
+| Shared/deep dependency graph | `cycle_check_visits_shared_dependency_subgraphs_once`, `cycle_check_handles_deep_chains_without_recursive_stack_growth` | Iterative traversal bounds graph work and call-stack use. |
+| Desktop calculation | `repeated_formula_dependencies_are_evaluated_once_per_read`, `deep_formula_chains_and_work_budget_exhaustion_return_errors` | Memoization, freshness and explicit calculation budgets. |
+| Calculation determinism and payload copies | `formula_snapshot_limits_are_deterministic_across_insertion_orders`, `formula_value_copy_budget_bounds_cached_arrays_and_text` | Coordinate-ordered snapshots and bounded cumulative string/array copies. |
+| Formula parser limits and percentage | `formula_size_and_token_limits_are_enforced_before_parsing`, `deeply_nested_grammar_and_expression_trees_are_rejected`, `percentages_work_as_postfix_values_in_arithmetic` | Safe parsing limits and spreadsheet postfix percent. |
+| Function resource boundaries | `oversized_text_functions_reject_before_allocating_output`, `text_function_boundaries_preserve_unicode_and_empty_results`, `numeric_work_limits_reject_huge_inputs`, `date_resource_bounds_cover_all_conversion_entry_points`, `concatenation_rejects_oversized_results_before_output_allocation` | Function-internal loops/output allocation and `&` cannot bypass expression limits. |
+| Ordinary calculations and overflow | `factorial_and_fixed_normal_boundaries_remain_supported`, `combinatorial_fast_paths_and_repetition_counts_are_correct`, `integer_function_extremes_return_errors_without_panics` | Common/boundary values, permutation-with-repetition semantics and checked integer arithmetic. |
+| Malformed CSV candidate safety | `malformed_quotes_are_rejected_instead_of_silently_changing_data`, `malformed_csv_leaves_pending_workbook_unchanged` | Invalid quoted input is rejected without partial live mutation. |
+| Blank cell formats | `sheet_snapshot_preserves_blank_formats_without_duplicate_cells`, `formatting an empty cell remains visible in controls before entering data` | Sparse style-only coordinates reach UI and retain formatting on save/reopen. |
+| Evaluated numeric results | `snapshot_numeric_values_use_calculated_numbers_before_display_formatting`, `selection statistics and numeric conditional rules use evaluated values before display formatting` | Raw numeric values are independent of formatted display; formula statistics/rules work. |
+| Recovery deferral/failure | `deferring a startup recovery preserves it while restoring another`, `a failed startup recovery remains available after opening a blank workbook` | Deferred or failed snapshots are retained for explicit manager actions. |
+| Replacement history controls | `successful workbook replacements clear undo and redo controls` | Successful native Open and New clear stale frontend Undo/Redo availability after backend history resets. |
+| Formula clipboard | `copies relative, absolute, and mixed references independently`, `formula copy rebases mixed references even when system clipboard reads succeed` | Supported A1 translation survives the system-clipboard read path. |
+| Atomic cut | `cut keeps the source until paste succeeds and the complete move undoes together`, `a cut paste backend failure restores source and destination and allows retry`, `cut revalidates dependencies inside the move when the preflight becomes stale` | Pending move, rollback/retry and stale preflight protection; unsupported formula moves reject. |
+| Backend cut preconditions | `guarded_move_is_one_undoable_transaction_including_overlapping_cells`, `guarded_move_rechecks_formula_and_source_changes_inside_candidate`, `guarded_move_rejects_changed_sheet_locked_destinations_and_invalid_coordinates` | Candidate-side checks enforce source identity/values, dependencies, bounds and protection atomically. |
+| Structural metadata and drafts | `structural edits reject named range metadata before dispatch and preserve it`, `structural commands flush the formula bar draft before changing coordinates`, `structure guard identifies every coordinate-bearing feature without changing it` | Unsupported coordinate metadata remains intact and active drafts commit before structural mutation. |
+| Small-screen controls | `workbook controls remain usable at 800x500`, `workbook controls remain usable at 1024x768`, `workbook controls remain usable at 1280x720` | Browser geometry and primary-control reachability; native accessibility remains separate. |
+| Offline UI | `local first-run template editing and save state work with browser networking offline` | Mocked-backend first-run/edit/save without outbound requests after local assets load; not installer proof. |
+| Resource guard | `scripts/check-resource-budgets.mjs` | Full frontend output size budgets and explicit Windows offline runtime setting. |
 
 ## File and application compatibility
 
@@ -58,7 +81,7 @@ cargo test -p sheets-desktop --lib
 | View and print metadata | Pass | `tests::view_and_print_metadata_roundtrip_through_undo_and_redo`, `view and print settings are dirty, undoable, and included in save and recovery metadata` | Gridlines, page size, and orientation mark the workbook dirty, move through undo and redo, and enter native save and recovery metadata. |
 | Recovery write and replacement | Pass | `tests::recovery_store_discovers_restores_discards_and_never_touches_source`, `tests::failed_recovery_write_retains_last_good_snapshot`, `tests::overlapping_recovery_writes_are_complete_and_leave_no_temp_files` | Recovery files stay separate, failed writes preserve the prior snapshot, and overlapping writes serialize cleanly. |
 | Recovery hardening | Pass | `tests::recovery_store_rejects_symlink_root_and_target`, `tests::corrupt_recovery_is_quarantined_from_discovery`, `tests::failed_cleanup_retires_snapshot_from_discovery_and_is_retryable` | Symlink targets are rejected, corrupt snapshots are quarantined, and failed cleanup cannot reappear as a current recovery. |
-| Multiple startup recoveries | Pass | `restoring one recovery preserves every unselected snapshot`, `explicit recovery discard removes only the selected snapshot` | Restore preserves unselected snapshots and cancel discards only the selected one. |
+| Multiple startup recoveries | Updated coverage | `restoring one recovery preserves every unselected snapshot`, `deferring a startup recovery preserves it while restoring another` | Restore preserves unselected snapshots; Cancel retains a snapshot for later. |
 | Cleanup retry identity | Pass | `replacement cleanup failure retains identity and Save retries cleanup`, `save cleanup failure is visible and retryable under the same recovery identity` | Cleanup failures remain visible and retry under the same recovery identity. |
 | Configurable recovery timing | Pass locally | `changing the delay reschedules a pending write without duplicating it`, `changing the delay preserves serialization with an in-flight write`, `rejects invalid configurable delays` | A timing change invalidates pending work safely, preserves serialized writes, and rejects invalid settings. |
 | Edit during native save | Pass locally | `an edit committed during a slow save remains dirty and recoverable` | A primary save cannot clear the dirty state for a newer edit committed while that save is in flight. |
@@ -97,7 +120,7 @@ npm run test:e2e --prefix apps/desktop
 | Windows package smoke | Hosted release gate pending | `windows-installer`, step `Smoke install and uninstall package` | The hosted job is configured to install the NSIS package silently, check its version, and uninstall it before upload. The source tree alone does not prove the hosted run succeeded. |
 | Microsoft Excel desktop | Not automated | [XLSX compatibility check](XLSX_COMPATIBILITY_CHECK.md) | Manual observations use an invented fixture and remain scoped to the recorded Excel version and platform. |
 
-## Release-prep totals
+## Historical release-prep totals
 
 | Suite | Result |
 | --- | --- |

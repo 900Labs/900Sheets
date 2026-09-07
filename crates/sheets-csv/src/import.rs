@@ -49,14 +49,13 @@ fn import_csv_with_name_and_limits(
     }
     let mut sheet = Sheet::new(name);
 
-    let rows = parse_csv_data(data, delimiter, limits)?;
-    for (row, fields) in rows.iter().enumerate() {
-        for (col, field) in fields.iter().enumerate() {
+    parse_csv_data(data, delimiter, limits, |row, fields| {
+        for (col, field) in fields.into_iter().enumerate() {
             if !field.is_empty() {
-                sheet.set_cell_value(row as u32, col as u32, field.clone());
+                sheet.set_cell_value(row as u32, col as u32, field);
             }
         }
-    }
+    })?;
 
     Ok(sheet)
 }
@@ -80,15 +79,17 @@ fn push_field(
 }
 
 fn push_row(
-    rows: &mut Vec<Vec<String>>,
+    row_count: &mut usize,
     current_row: &mut Vec<String>,
     limits: ImportLimits,
+    consume_row: &mut impl FnMut(usize, Vec<String>),
 ) -> Result<(), CsvError> {
-    let next_row_count = rows.len() + 1;
+    let next_row_count = *row_count + 1;
     if next_row_count > limits.max_rows {
         return Err(CsvError::TooManyRows(next_row_count, limits.max_rows));
     }
-    rows.push(std::mem::take(current_row));
+    consume_row(*row_count, std::mem::take(current_row));
+    *row_count = next_row_count;
     Ok(())
 }
 
@@ -96,13 +97,25 @@ fn parse_csv_data(
     data: &str,
     delimiter: char,
     limits: ImportLimits,
-) -> Result<Vec<Vec<String>>, CsvError> {
-    let mut rows = Vec::new();
+    mut consume_row: impl FnMut(usize, Vec<String>),
+) -> Result<(), CsvError> {
+    if matches!(delimiter, '"' | '\r' | '\n') {
+        return Err(CsvError::InvalidFormat(
+            "delimiter must not be a quote or line break".into(),
+        ));
+    }
+    let mut row_count = 0;
     let mut current_row = Vec::new();
     let mut current_field = String::new();
     let mut budget = ImportBudget::default();
     let mut in_quotes = false;
-    let mut chars = data.chars().peekable();
+    let mut closed_quote = false;
+    let mut record_started = false;
+    let mut chars = data
+        .strip_prefix('\u{feff}')
+        .unwrap_or(data)
+        .chars()
+        .peekable();
 
     while let Some(ch) = chars.next() {
         if in_quotes {
@@ -112,35 +125,60 @@ fn parse_csv_data(
                     chars.next();
                 } else {
                     in_quotes = false;
+                    closed_quote = true;
                 }
             } else {
                 current_field.push(ch);
             }
         } else if ch == '"' {
+            if closed_quote || !current_field.is_empty() {
+                return Err(CsvError::InvalidFormat(format!(
+                    "unexpected quote in row {}, column {}",
+                    row_count + 1,
+                    current_row.len() + 1
+                )));
+            }
             in_quotes = true;
+            record_started = true;
         } else if ch == delimiter {
             push_field(&mut current_row, &mut current_field, &mut budget, limits)?;
-        } else if ch == '\n' {
-            push_field(&mut current_row, &mut current_field, &mut budget, limits)?;
-            push_row(&mut rows, &mut current_row, limits)?;
-        } else if ch == '\r' {
-            // Skip \r; handle \r\n and bare \r.
-            if chars.peek() != Some(&'\n') {
-                push_field(&mut current_row, &mut current_field, &mut budget, limits)?;
-                push_row(&mut rows, &mut current_row, limits)?;
+            closed_quote = false;
+            record_started = true;
+        } else if ch == '\n' || ch == '\r' {
+            if ch == '\r' && chars.peek() == Some(&'\n') {
+                chars.next();
             }
+            push_field(&mut current_row, &mut current_field, &mut budget, limits)?;
+            push_row(&mut row_count, &mut current_row, limits, &mut consume_row)?;
+            closed_quote = false;
+            record_started = false;
         } else {
+            if closed_quote {
+                return Err(CsvError::InvalidFormat(format!(
+                    "unexpected character after closing quote in row {}, column {}",
+                    row_count + 1,
+                    current_row.len() + 1
+                )));
+            }
             current_field.push(ch);
+            record_started = true;
         }
     }
 
-    // Flush last field/row if there's remaining data
-    if !current_field.is_empty() || !current_row.is_empty() {
+    if in_quotes {
+        return Err(CsvError::InvalidFormat(format!(
+            "unterminated quoted field in row {}, column {}",
+            row_count + 1,
+            current_row.len() + 1
+        )));
+    }
+    // An empty quoted field still consumes a coordinate and row budget.
+    if record_started {
         push_field(&mut current_row, &mut current_field, &mut budget, limits)?;
-        push_row(&mut rows, &mut current_row, limits)?;
+        push_row(&mut row_count, &mut current_row, limits, &mut consume_row)?;
     }
 
-    Ok(rows)
+    Ok(())
 }
 
 pub fn detect_delimiter(data: &str) -> char {
@@ -309,5 +347,52 @@ mod tests {
         };
         let result = import_csv_with_name_and_limits("a,b,c", ',', "Sheet1", limits);
         assert!(matches!(result, Err(CsvError::FileTooLarge(5, 4))));
+    }
+
+    #[test]
+    fn malformed_quotes_are_rejected_instead_of_silently_changing_data() {
+        for data in ["name,value\n\"unfinished,42", "a\"b,c", "\"a\"tail,b"] {
+            assert!(matches!(
+                import_csv(data, ','),
+                Err(CsvError::InvalidFormat(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn empty_quoted_final_record_counts_toward_import_limits() {
+        let limits = ImportLimits {
+            max_rows: 1,
+            ..ImportLimits::default()
+        };
+        assert!(matches!(
+            import_csv_with_name_and_limits("value\n\"\"", ',', "Sheet1", limits),
+            Err(CsvError::TooManyRows(2, 1))
+        ));
+        let limits = ImportLimits {
+            max_cells: 0,
+            ..ImportLimits::default()
+        };
+        assert!(matches!(
+            import_csv_with_name_and_limits("\"\"", ',', "Sheet1", limits),
+            Err(CsvError::TooManyCells(1, 0))
+        ));
+    }
+
+    #[test]
+    fn utf8_bom_does_not_become_part_of_the_first_header() {
+        let sheet = import_csv("\u{feff}\"Name\",Value\rAda,42", ',').unwrap();
+        assert_eq!(sheet.cell_value(0, 0), Some("Name".into()));
+        assert_eq!(sheet.cell_value(1, 1), Some("42".into()));
+    }
+
+    #[test]
+    fn quote_and_line_break_delimiters_are_rejected() {
+        for delimiter in ['"', '\r', '\n'] {
+            assert!(matches!(
+                import_csv("a,b", delimiter),
+                Err(CsvError::InvalidFormat(_))
+            ));
+        }
     }
 }

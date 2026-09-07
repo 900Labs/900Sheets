@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Clear workbook identity, save state and primary Open/Save controls; selection-aware formatting, direct font size, accessible alignment controls, sheet-tab scrolling and compact-screen zoom controls.
+- Product acceptance criteria, a primary-source comparison of six spreadsheet alternatives, and a dated audit/verification record.
+- Enforced frontend payload budgets in the local quality gate and CI; explicit Windows offline WebView2 installer configuration.
+
+### Fixed
+
+- Startup recovery cancellation retains snapshots for later inspection and restore.
+- Successful workbook replacement clears stale Undo/Redo availability in the editor.
+- Cut retains source values until a successful atomic paste; copied formulas rebase supported relative/absolute references. Unsupported move dependencies and structural metadata changes are rejected before losing work.
+- Active entry drafts commit before structural edits and sheet deletion.
+- Dependency cycle traversal and desktop formula evaluation avoid repeated exponential work; parser and calculation budgets bound unsafe inputs.
+- Text allocation, concatenation, numeric loops and integer arithmetic have explicit resource/overflow checks; `PERMUTATIONA` and its legacy `PERMUTA` alias now calculate permutations with repetition correctly.
+- Percentage formulas use spreadsheet postfix semantics; malformed CSV quotes are rejected and parsed rows stream into the isolated import candidate.
+- Formatted blanks remain visible after refresh; number-format displays refresh immediately; numeric formula results drive selection statistics and conditional formatting.
+- Updated the locked transitive development dependency `nanoid` within its existing compatible range to resolve the reported advisory.
+
+### Known remaining gates
+
+- Physical older-computer performance, clean offline Windows installation, Linux distribution packaging, native screen-reader verification and a Microsoft Excel manual round trip remain unverified. See [product criteria](docs/PRODUCT_CRITERIA.md).
+- Cut in formula-containing workbooks and structural edits with coordinate-bound feature metadata remain explicitly limited pending reference/metadata-aware move support.
+- Upstream Tauri Linux dependency maintenance advisories are tracked in the audit; no unsupported major dependency override is applied.
+
 ## v0.5.0
 
 ### Added
@@ -29,7 +55,7 @@
 
 - Developer ID signing, notarization, Authenticode signing, hosted artifact publication, and clean-machine installation are release-time results, not properties guaranteed by the source tree.
 - Microsoft Excel desktop is not an automated test dependency. Deterministic OOXML tests and the LibreOffice round trip cover the documented XLSX subset.
-- Native Excel tables, slicers, charts, pivot caches, macros, external links, images, shapes, and embedded objects remain unsupported.
+- Slicers, pivot caches, macros, external links, images, shapes, and embedded objects remain unsupported. Subsequent changes preserve the documented Excel table and chart subset through XLSX round trips; local table authoring and full chart fidelity remain outside that subset.
 - The interface translations cover grid navigation and core accessibility labels, not the complete application.
 - Frozen panes are limited to the first 20 rows and first 20 columns even though the virtualized grid reaches row 1,000,000 and column `XFD`.
 - Recovery and rotating native backups are local safeguards, not cloud sync or a complete external backup strategy.

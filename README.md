@@ -20,9 +20,15 @@ Version 0.5.0 focuses on practical community use and safer distribution:
 - XLSX import and export for the supported validation and conditional-formatting subset
 - A release workflow capable of producing macOS and Windows artifacts, with platform signing when maintainers provide release credentials
 
-The v0.4.0 workbook-safety work remains in place: cross-sheet formulas, workbook-wide cycle checks, bounded atomic undo and redo, stable sheet identities, native recovery, and LibreOffice-backed XLSX checks. The editor also includes 174 formula functions, formatting, find and replace, filters, pivots, chart previews, validation, conditional formatting, named ranges, frozen panes, comments, protection, print settings, and PDF output.
+The v0.4.0 workbook-safety work remains in place: cross-sheet formulas, workbook-wide cycle checks, bounded atomic undo and redo, stable sheet identities, native recovery, and LibreOffice-backed XLSX checks. The editor also includes a formula library, formatting, find and replace, filters, pivots, chart previews, validation, conditional formatting, named ranges, frozen panes, comments, protection, print settings, and PDF output.
 
 Read [Compatibility and known limitations](docs/COMPATIBILITY.md) before using 900Sheets for important work. Release provenance files state whether a macOS artifact was Developer ID signed and notarized or ad hoc signed, and whether a Windows installer was Authenticode signed or unsigned. Do not infer signing from the filename alone.
+
+The ongoing product-readiness work is tracked in the [audit and validation record](docs/audits/2026-09-07-product-readiness.md), [acceptance criteria](docs/PRODUCT_CRITERIA.md), and [commercial/open-source comparison](docs/COMPETITOR_RESEARCH.md). Older-computer usability is an explicit test target; it is not yet a verified hardware-support claim.
+
+![900Sheets workbook controls and grid at 1024 by 768](docs/images/editor-1024.png)
+
+Editor layout at 1024 × 768, captured from the browser UI regression fixture with an empty workbook and mocked Tauri commands. For a practical first task, insert **School Budget**, change the planned and actual amounts, review the remaining funds, then save as `.900sheets`.
 
 ## Install and run
 
@@ -134,7 +140,7 @@ Run the complete local gate before opening a pull request:
 ./scripts/verify-local.sh
 ```
 
-The current v0.5.0 release-prep tree completed 501 Rust tests, including the LibreOffice round trip, 21 frontend unit tests, and frontend checks with 0 Svelte or TypeScript findings. The browser suite now contains 32 Playwright Chromium tests; its final release run is still required before tagging. CI requires LibreOffice for the external round trip; local systems without `soffice` report a skip. Hosted platform and packaging results remain separate release-time evidence.
+The gate includes Rust formatting, clippy and workspace tests, frontend checks/build/unit/browser tests, and enforced frontend asset budgets. Current run evidence is recorded in the [audit](docs/audits/2026-09-07-product-readiness.md). Browser tests exercise the UI through mocked Tauri commands; Rust tests cover backend behavior. CI requires LibreOffice for the external round trip; local systems without `soffice` report a skip. Hosted platform, native application and packaging results remain separate evidence.
 
 See the [versioned compatibility matrix](docs/COMPATIBILITY_MATRIX.md) for exact fixture and regression IDs.
 

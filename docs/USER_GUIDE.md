@@ -6,6 +6,8 @@ This guide describes 900Sheets v0.5.0.
 
 Open 900Sheets and select a cell. Type text, a number, `TRUE`, `FALSE`, or a formula beginning with `=`. Press Enter to commit the value and move down one row.
 
+The workbook header shows the document name and save state. Use the visible **Open** and **Save** controls for native workbooks; other formats remain in the File menu. Unsaved changes and saving progress are shown separately from the filename. The bottom zoom controls change the view without changing your data.
+
 Useful shortcuts:
 
 | Action | Shortcut |
@@ -31,11 +33,14 @@ Enter formulas in a cell or in the formula bar. Examples:
 =Data!A1*2
 =SUM('Annual Budget'!$A$1:$A$12)
 =IF(C2>0,"Yes","No")
+=B2*10%
 ```
 
 Use a simple sheet name directly before `!`. Put a name containing spaces or punctuation in single quotes. Write an embedded single quote twice, as in `'Sam''s Data'!A1`.
 
 If a referenced sheet does not exist, the formula returns a reference error. Cross-sheet circular references are rejected. A formula can expand at most 100,000 references, so very large ranges return a budget error instead of consuming unbounded memory.
+
+Percentage is a postfix operator: `=10%` is `0.1` and `=200*10%` is `20`. Use `MOD(number, divisor)` for a remainder. Formulas are also bounded by input size, tokens, expression depth and calculation work; see [Compatibility](COMPATIBILITY.md) for the exact limits.
 
 ## Start from a template
 
@@ -52,7 +57,7 @@ Every sample uses invented data. A template is inserted at the selected cell, an
 
 Select one cell or drag across a range. Use the toolbar to change font emphasis, size, colors, alignment, wrapping, borders, and number formats. A range format is committed as one transaction.
 
-Use the tabs at the bottom to add, rename, select, or delete sheets. The Insert menu adds or removes rows and columns. Structural changes move stored cells and formats and rewrite supported A1 references. They also remove coordinate-bound state that cannot be moved safely.
+Use the tabs at the bottom to add, rename, select, or delete sheets. The Insert menu adds or removes rows and columns. Structural changes move stored cells and formats and rewrite supported A1 references. If the sheet has coordinate-bound features that cannot be moved safely, the app rejects the structural edit and keeps those features. Review the reported features before explicitly removing them or editing a simpler sheet.
 
 Sheet and structural changes participate in undo and redo. If an operation is too large for the bounded history, the app rejects it without leaving a partial change.
 
@@ -112,7 +117,7 @@ After a successful edit, the app waits for the configured interval, flushes pend
 On startup, the app lists available recoveries newest first. For each prompt:
 
 1. Choose **OK** to restore that recovery.
-2. Choose **Cancel** to discard only that recovery and see the next one.
+2. Choose **Cancel** to keep that recovery for later and see the next one. Deferred snapshots remain available in **Tools > Recovery and Backups**.
 3. After restoring, choose **Save Workbook** to keep it as a normal `.900sheets` file.
 
 The **Recovery and Backups** panel remains available after startup. It shows each snapshot's time and size. Select its record to inspect sheet names without replacing the workbook. **Restore** asks before discarding unsaved changes, loads the snapshot as an unsaved replacement, and leaves retained recoveries in place until an explicit save or delete. **Delete** asks for confirmation and affects only the selected snapshot.

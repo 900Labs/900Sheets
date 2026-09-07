@@ -148,21 +148,31 @@ impl DependencyGraph {
     }
 
     pub fn has_circular_ref_key(&self, cell: CellKey) -> bool {
-        self.detect_cycle(cell, &mut HashSet::new())
-    }
-
-    fn detect_cycle(&self, cell: CellKey, visiting: &mut HashSet<CellKey>) -> bool {
-        if !visiting.insert(cell) {
-            return true;
-        }
-        if let Some(deps) = self.deps.get(&cell) {
-            for dep in deps {
-                if self.detect_cycle(*dep, visiting) {
-                    return true;
+        // Keep the DFS on the heap and visit each completed subgraph only once.
+        // Formula chains can be deep, and shared dependencies otherwise turn a
+        // cycle check into exponential work even when there is no cycle.
+        let mut visiting = HashSet::new();
+        let mut complete = HashSet::new();
+        let mut pending = vec![(cell, false)];
+        while let Some((cell, exiting)) = pending.pop() {
+            if exiting {
+                visiting.remove(&cell);
+                complete.insert(cell);
+                continue;
+            }
+            if complete.contains(&cell) {
+                continue;
+            }
+            if !visiting.insert(cell) {
+                return true;
+            }
+            pending.push((cell, true));
+            if let Some(deps) = self.deps.get(&cell) {
+                for dep in deps {
+                    pending.push((*dep, false));
                 }
             }
         }
-        visiting.remove(&cell);
         false
     }
 
@@ -277,5 +287,40 @@ mod tests {
         let error = graph.set_formula(0, 0, "SUM(A1:XFD1000000)").unwrap_err();
         assert!(error.contains("safe reference limit"));
         assert!(graph.get_dependencies(0, 0).is_none());
+    }
+
+    #[test]
+    fn cycle_check_handles_deep_chains_without_recursive_stack_growth() {
+        let mut graph = DependencyGraph::new();
+        for row in 0..50_000 {
+            graph.insert_formula_edges(
+                CellKey::new(0, row, 0),
+                HashSet::from([CellKey::new(0, row + 1, 0)]),
+            );
+        }
+        assert!(!graph.has_circular_ref(0, 0));
+        graph.insert_formula_edges(
+            CellKey::new(0, 50_000, 0),
+            HashSet::from([CellKey::new(0, 0, 0)]),
+        );
+        assert!(graph.has_circular_ref(0, 0));
+    }
+
+    #[test]
+    fn cycle_check_visits_shared_dependency_subgraphs_once() {
+        let mut graph = DependencyGraph::new();
+        // Only 82 cells, but rewalking every path would require 2^40 visits.
+        for row in 0..40 {
+            for col in 0..2 {
+                graph.insert_formula_edges(
+                    CellKey::new(0, row, col),
+                    HashSet::from([CellKey::new(0, row + 1, 0), CellKey::new(0, row + 1, 1)]),
+                );
+            }
+        }
+        assert!(!graph.has_circular_ref(0, 0));
+        assert!(graph.set_formula(40, 0, "A1").is_err());
+        assert!(graph.get_dependencies(40, 0).is_none());
+        assert!(!graph.has_circular_ref(0, 0));
     }
 }

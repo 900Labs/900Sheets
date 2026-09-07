@@ -70,6 +70,8 @@ jobs:
         run: npm run test:unit --prefix apps/desktop
       - name: Build
         run: npm run build --prefix apps/desktop
+      - name: Frontend resource budgets
+        run: node scripts/check-resource-budgets.mjs
       - name: Install Playwright browsers
         run: npx --prefix apps/desktop playwright install --with-deps chromium
       - name: E2E smoke tests
